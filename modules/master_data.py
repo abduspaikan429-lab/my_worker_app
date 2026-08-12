@@ -14,7 +14,7 @@ from typing import Any
 
 import pandas as pd
 
-from repositories.worker_repository import JsonWorkerRepository
+from services.worker_service import WorkerService
 
 
 MASTER_DIR = Path("data/master")
@@ -22,7 +22,7 @@ STATE_FILE = Path("data/master_state.json")
 HISTORY_DIR = Path("data/master_history")
 ID_COL = "身份证号"
 
-repo = JsonWorkerRepository()
+worker_service = WorkerService()
 
 
 def clean_value(value: Any) -> str:
@@ -105,7 +105,7 @@ def _read_state() -> dict[str, Any]:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         state = _empty_state()
         state.update(data)
-        state["rows"] = repo.get_all_workers()
+        state["rows"] = worker_service.get_workers()
         state["last_changes"] = {
             **_empty_state()["last_changes"],
             **(data.get("last_changes") or {}),
@@ -117,7 +117,7 @@ def _read_state() -> dict[str, Any]:
 
 def load_master_df() -> pd.DataFrame:
     """加载当前项目主表；首次使用时从 data/master 下的现有 Excel 初始化。"""
-    rows = repo.get_all_workers()
+    rows = worker_service.get_workers()
     if rows:
         return normalize_df(pd.DataFrame(rows))
 
@@ -237,7 +237,7 @@ def commit_update(incoming_df: pd.DataFrame, source_files: list[str] | None = No
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    repo.save_workers(workers)
+    worker_service.save_workers(workers)
     (HISTORY_DIR / f"{version}.json").write_text(
         json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -246,4 +246,5 @@ def commit_update(incoming_df: pd.DataFrame, source_files: list[str] | None = No
     preview["updated_at"] = now.isoformat(timespec="seconds")
     preview["changes"] = changes
     return preview
+
 
