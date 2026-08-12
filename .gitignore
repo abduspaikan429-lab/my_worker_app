@@ -1,0 +1,84 @@
+# =====================================================================
+# Git Ignore Rules for my_worker_app
+# Privacy Data, Local Files, Cache & Build Artifacts
+# =====================================================================
+
+# ---------------------------------------------------------------------
+# 1. Sensitive Personnel Data & Local Application Databases
+# ---------------------------------------------------------------------
+# Exclude sensitive employee data (rosters, ID numbers, bank info, wage records)
+data/*
+!data/.gitkeep
+data/master/*
+!data/master/.gitkeep
+data/master_history/*
+!data/master_history/.gitkeep
+
+# Exclude local user-uploaded data files
+load-data/*
+!load-data/.gitkeep
+!load-data/muban/
+
+# General Excel & CSV files (prevent accidental commit of employee spreadsheets)
+*.xlsx
+*.xls
+*.csv
+
+# Exceptions: Preserve form template Excel files in load-data/muban
+!load-data/muban/*.xlsx
+!load-data/muban/**/*.xlsx
+!load-data/muban/*.xls
+!load-data/muban/**/*.xls
+
+# Scratch & local analysis outputs
+scratch.txt
+excel_analysis.json
+
+# ---------------------------------------------------------------------
+# 2. Python Byte-code, Caches & Environments
+# ---------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+
+# Python Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+
+# Distribution & Build Outputs
+build/
+dist/
+*.egg-info/
+*.spec
+*.exe
+
+# ---------------------------------------------------------------------
+# 3. Logs, Temporary Files & Editor Configs
+# ---------------------------------------------------------------------
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+
+# IDE & AI Assistant Caches
+.vscode/
+.trae/
+.workbuddy/
+.idea/
+
+# OS Metadata
+.DS_Store
+Thumbs.db
+ehthumbs.db
