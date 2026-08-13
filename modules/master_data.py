@@ -14,6 +14,7 @@ from typing import Any
 
 import pandas as pd
 
+from repositories.worker_repository import JsonWorkerRepository
 from services.worker_service import WorkerService
 
 
@@ -22,7 +23,8 @@ STATE_FILE = Path("data/master_state.json")
 HISTORY_DIR = Path("data/master_history")
 ID_COL = "身份证号"
 
-worker_service = WorkerService()
+json_repository = JsonWorkerRepository(file_path=STATE_FILE)
+worker_service = WorkerService(repository=json_repository)
 
 
 def clean_value(value: Any) -> str:
@@ -105,7 +107,10 @@ def _read_state() -> dict[str, Any]:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         state = _empty_state()
         state.update(data)
-        state["rows"] = worker_service.get_workers()
+        if "rows" not in data or data["rows"] is None:
+            state["rows"] = json_repository.get_all_workers()
+        else:
+            state["rows"] = data.get("rows", [])
         state["last_changes"] = {
             **_empty_state()["last_changes"],
             **(data.get("last_changes") or {}),
@@ -117,10 +122,6 @@ def _read_state() -> dict[str, Any]:
 
 def load_master_df() -> pd.DataFrame:
     """加载当前项目主表；首次使用时从 data/master 下的现有 Excel 初始化。"""
-    rows = worker_service.get_workers()
-    if rows:
-        return normalize_df(pd.DataFrame(rows))
-
     state = _read_state()
     if state.get("version") or state.get("rows"):
         return normalize_df(pd.DataFrame(state.get("rows") or []))

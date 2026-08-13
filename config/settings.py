@@ -1,8 +1,7 @@
 """Global application settings and configuration."""
 
 # Worker data storage mode: "json" or "sqlite"
-# Configured for SQLite production mode (Step 10)
-WORKER_STORAGE = "sqlite"
+WORKER_STORAGE = "json"
 
 # Enable automatic JSON backup for rollback safety
 ENABLE_JSON_BACKUP = True
