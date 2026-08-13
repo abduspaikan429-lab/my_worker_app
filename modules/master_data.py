@@ -14,11 +14,17 @@ from typing import Any
 
 import pandas as pd
 
+from repositories.worker_repository import JsonWorkerRepository
+from services.worker_service import WorkerService
+
 
 MASTER_DIR = Path("data/master")
 STATE_FILE = Path("data/master_state.json")
 HISTORY_DIR = Path("data/master_history")
 ID_COL = "身份证号"
+
+json_repository = JsonWorkerRepository(file_path=STATE_FILE)
+worker_service = WorkerService(repository=json_repository)
 
 
 def clean_value(value: Any) -> str:
@@ -101,6 +107,10 @@ def _read_state() -> dict[str, Any]:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         state = _empty_state()
         state.update(data)
+        if "rows" not in data or data["rows"] is None:
+            state["rows"] = json_repository.get_all_workers()
+        else:
+            state["rows"] = data.get("rows", [])
         state["last_changes"] = {
             **_empty_state()["last_changes"],
             **(data.get("last_changes") or {}),
@@ -217,16 +227,18 @@ def commit_update(incoming_df: pd.DataFrame, source_files: list[str] | None = No
         "missing_from_import": preview["missing_from_import"].to_dict(orient="records"),
         "source_files": source_files or [],
     }
+    workers = current_df.to_dict(orient="records")
     state = {
         "version": version,
         "updated_at": now.isoformat(timespec="seconds"),
-        "rows": current_df.to_dict(orient="records"),
+        "rows": workers,
         "last_changes": changes,
     }
 
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    worker_service.save_workers(workers)
     (HISTORY_DIR / f"{version}.json").write_text(
         json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -235,3 +247,5 @@ def commit_update(incoming_df: pd.DataFrame, source_files: list[str] | None = No
     preview["updated_at"] = now.isoformat(timespec="seconds")
     preview["changes"] = changes
     return preview
+
+

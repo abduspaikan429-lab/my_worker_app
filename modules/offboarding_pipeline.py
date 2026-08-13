@@ -8,62 +8,30 @@ import time
 from datetime import date
 from modules.master_data import load_master_df
 
+from services.offboarding_service import OffboardingService
+
 DATA_FILE = "data/offboarding_data.json"
 HISTORY_FILE = "data/offboarding_history.json"
+offboarding_service = OffboardingService()
 
 
 def load_offboarding_history() -> list[dict]:
     """加载历史离场归档记录列表。"""
-    if os.path.exists(HISTORY_FILE):
-        try:
-            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return []
+    return offboarding_service.load_history()
 
 
 def archive_offboarding(worker_id: str, data: dict) -> None:
     """将已完成离场手续的人员追加写入离场归档文件，记录离场日期。"""
-    history = load_offboarding_history()
-    info = data.get("info", {})
-    record = {
-        "姓名": info.get("姓名", ""),
-        "班组": info.get("班组", ""),
-        "身份证号": info.get("身份证号", ""),
-        "离场日期": str(date.today()),
-    }
-    # 避免同一人重复归档（以身份证号或姓名+班组去重）
-    key = record["身份证号"] or f"{record['姓名']}_{record['班组']}"
-    existing_keys = {
-        r.get("身份证号") or f"{r.get('姓名','')}_{r.get('班组','')}" for r in history
-    }
-    if key not in existing_keys:
-        history.append(record)
-        os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(history, f, ensure_ascii=False, indent=2)
+    offboarding_service.archive_offboarding(worker_id, data)
+
 
 def load_data():
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                # 自动过滤掉已经 100% 完成的人员
-                filtered = {}
-                for k, v in data.items():
-                    c, t = get_progress(v)
-                    if c < t:
-                        filtered[k] = v
-                return filtered
-        except Exception:
-            pass
-    return {}
+    return offboarding_service.get_pending_workers()
+
 
 def save_data():
-    os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(st.session_state.offboarding_data, f, ensure_ascii=False, indent=2)
+    if "offboarding_data" in st.session_state:
+        offboarding_service.save_records(st.session_state.offboarding_data)
 
 def save_data_if_changed():
     """

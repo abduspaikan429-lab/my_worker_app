@@ -7,28 +7,17 @@ import os
 import hashlib
 import time
 
+from services.onboarding_service import OnboardingService
+
 DATA_FILE = "data/onboarding_data.json"
+onboarding_service = OnboardingService()
 
 def load_data():
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                # 自动过滤掉已经 100% 完成的人员
-                filtered = {}
-                for k, v in data.items():
-                    c, t = get_progress(v)
-                    if c < t:
-                        filtered[k] = v
-                return filtered
-        except Exception:
-            pass
-    return {}
+    return onboarding_service.get_pending_workers()
 
 def save_data():
-    os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(st.session_state.onboarding_data, f, ensure_ascii=False, indent=2)
+    if "onboarding_data" in st.session_state:
+        onboarding_service.save_records(st.session_state.onboarding_data)
 
 def save_data_if_changed():
     """
