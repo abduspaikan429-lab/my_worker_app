@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 DEFAULT_STATE_FILE = Path("data/master_state.json")
 
@@ -21,8 +21,17 @@ class WorkerRepository:
 class JsonWorkerRepository(WorkerRepository):
     """JSON implementation of WorkerRepository using master_state.json."""
 
-    def __init__(self, file_path: Union[str, Path] = DEFAULT_STATE_FILE):
-        self.file_path = Path(file_path)
+    def __init__(
+        self,
+        file_path: Union[str, Path, Callable[[], Union[str, Path]]] = DEFAULT_STATE_FILE,
+    ):
+        self._file_path_src = file_path
+
+    @property
+    def file_path(self) -> Path:
+        if callable(self._file_path_src):
+            return Path(self._file_path_src())
+        return Path(self._file_path_src)
 
     def get_all_workers(self) -> List[Dict[str, Any]]:
         """Read workers list from JSON file. Returns empty list if file does not exist."""

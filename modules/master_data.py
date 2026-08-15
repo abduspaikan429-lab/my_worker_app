@@ -23,7 +23,7 @@ STATE_FILE = Path("data/master_state.json")
 HISTORY_DIR = Path("data/master_history")
 ID_COL = "身份证号"
 
-json_repository = JsonWorkerRepository(file_path=STATE_FILE)
+json_repository = JsonWorkerRepository(file_path=lambda: STATE_FILE)
 worker_service = WorkerService(repository=json_repository)
 
 
