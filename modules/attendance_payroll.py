@@ -372,6 +372,79 @@ def build_diff_table(df_a, df_b, df_paper, company=''):
         result.insert(0, '分包/所属企业', company)
     return result
 
+def parse_watermark_attendance(df, company=''):
+    """
+    单源水印签到表解析。
+    基于 _safe_read 的结果，优先通过识别每日考勤计算出勤天数，
+    如果未找到每日明细，则尝试读取总天数列。
+    """
+    if df.empty:
+        return __import__('pandas').DataFrame()
+    
+    days_col = _resolve_col(df, _DAYS_CANDS)
+    records = _extract_daily_source(df, '水印签到表')
+    
+    rows = []
+    if records:
+        for key, item in records.items():
+            name = item.get('姓名', '')
+            identity = item.get('身份证号', '')
+            days_dict = item.get('days', {})
+            
+            actual_days = 0
+            has_daily_records = len(days_dict) > 0
+            
+            if has_daily_records:
+                for day, val in days_dict.items():
+                    state = _attendance_state(val)
+                    if state == '有考勤':
+                        actual_days += 1
+            
+            if not has_daily_records and days_col:
+                name_col = _resolve_col(df, _NAME_CANDS)
+                mask = (df[name_col] == name)
+                if identity:
+                    id_c = _resolve_col(df, _ID_CANDS)
+                    if id_c:
+                        mask = mask & (df[id_c].apply(_clean_identity) == identity)
+                match = df[mask]
+                if not match.empty:
+                    val = _to_float(match.iloc[0][days_col])
+                    actual_days = val if not __import__('pandas').isna(val) else 0
+                    
+            rows.append({
+                '分包/所属企业': company,
+                '姓名': name,
+                '身份证号': identity,
+                '解析出勤天数': float(actual_days),
+                '最终核定天数': float(actual_days)
+            })
+    else:
+        name_col = _resolve_col(df, _NAME_CANDS)
+        id_col = _resolve_col(df, _ID_CANDS)
+        for _, row in df.iterrows():
+            name = _raw_attendance_value(row.get(name_col, ''))
+            identity = _clean_identity(row.get(id_col, '')) if id_col else ''
+            if not _looks_like_person_name(name) and not _is_valid_identity(identity):
+                continue
+            actual_days = _to_float(row.get(days_col)) if days_col else 0
+            if __import__('pandas').isna(actual_days):
+                actual_days = 0
+            rows.append({
+                '分包/所属企业': company,
+                '姓名': name,
+                '身份证号': identity,
+                '解析出勤天数': float(actual_days),
+                '最终核定天数': float(actual_days)
+            })
+
+    res_df = __import__('pandas').DataFrame(rows)
+    if not res_df.empty:
+        res_df['__key__'] = res_df.apply(lambda r: r['身份证号'] if _is_valid_identity(r['身份证号']) else f"姓名:{r['姓名']}", axis=1)
+        res_df.drop_duplicates(subset='__key__', keep='first', inplace=True)
+        res_df.drop(columns=['__key__'], inplace=True)
+    return res_df
+
 
 # ================================================================
 # 导出层
@@ -779,343 +852,141 @@ def render():
     """, unsafe_allow_html=True)
 
     tab_check, tab_export = st.tabs([
-        ':material/fact_check: 考勤对账与在线定稿',
+        ':material/fact_check: 考勤解析与定稿',
         ':material/payments: 考勤表与工资表导出',
     ])
 
     with tab_check:
-        diff_df   = st.session_state.get('_att_diff_df')
-        daily_df  = st.session_state.get('_att_daily_df')
-        confirmed = st.session_state.get('_att_leader_confirmed', False)
+        att_status = st.session_state.get('_att_status', None) # None, 'draft', 'finalized'
+        parsed_df = st.session_state.get('_att_parsed_df')
         final_df  = st.session_state.get('final_attendance')
 
-        # ── Step A：生成差异对比报告 ────────────────────────────
+        # ── Step 1：上传与解析 ────────────────────────────
         with st.container(border=True):
             st.markdown("""
             <div class="step-indicator">
-                <span class="step-num">A</span>
-                <span>生成三方差异对比报告 → 发给领导确认</span>
+                <span class="step-num">1</span>
+                <span>上传水印签到表并解析</span>
             </div>
             """, unsafe_allow_html=True)
 
-            st.caption('每家公司分别上传三份考勤，系统不会跨公司合并同名人员。')
-            company_inputs = {}
+            st.caption('请上传考勤水印签到表（系统将自动识别 √ 及时间格式计算出勤天数）')
+            
             company_names = ['江苏旭之升建筑工程有限公司', '青海久昌建筑装饰工程有限公司']
-            for company in company_names:
-                with st.container(border=True):
-                    st.markdown(f'**{company}**')
-                    c1, c2, c3 = st.columns(3)
-                    with c1:
-                        file_a = st.file_uploader('三局系统考勤', type=['xlsx', 'xls'], key=f'att_{company}_a')
-                    with c2:
-                        file_b = st.file_uploader('智慧护薪考勤', type=['xlsx', 'xls'], key=f'att_{company}_b')
-                    with c3:
-                        file_paper = st.file_uploader('纸质/水印考勤', type=['xlsx', 'xls'], key=f'att_{company}_paper')
-                    company_inputs[company] = (file_a, file_b, file_paper)
+            company = st.selectbox('选择分包/所属企业', company_names)
+            file_watermark = st.file_uploader('水印签到表 (Excel)', type=['xlsx', 'xls'], key='att_watermark')
 
-            if st.button(':material/compare_arrows: 生成三方差异对比报告', type='primary', key='btn_gen_diff'):
-                results = []
-                daily_results = []
-                missing_companies = []
-                for company, (file_a, file_b, file_paper) in company_inputs.items():
-                    if not all([file_a, file_b, file_paper]):
-                        missing_companies.append(company)
-                        continue
-                    df_a = _safe_read(file_a, f'{company}-三局系统')
-                    df_b = _safe_read(file_b, f'{company}-护薪系统')
-                    df_p = _safe_read(file_paper, f'{company}-纸质核对')
-                    results.append(build_diff_table(df_a, df_b, df_p, company=company))
-                    daily_results.append(build_daily_diff_table(df_a, df_b, df_p, company=company))
-                if missing_companies or len(results) != len(company_inputs):
-                    st.warning(f':material/info: 请为以下公司各上传三份考勤后再执行：{"、".join(missing_companies)}')
+            if st.button(':material/document_scanner: 解析签到表', type='primary', key='btn_parse_watermark'):
+                if not file_watermark:
+                    st.warning(':material/info: 请上传水印签到表')
                 else:
-                    with st.spinner('正在生成差异对比报告……'):
-                        result = pd.concat(results, ignore_index=True)
-                        daily_result = pd.concat(daily_results, ignore_index=True) if daily_results else pd.DataFrame()
-                    st.session_state['_att_diff_df']            = result
-                    st.session_state['_att_daily_df']           = daily_result
-                    st.session_state['_att_missing_companies']   = missing_companies
-                    st.session_state['_att_leader_confirmed']   = False
-                    st.session_state.pop('final_attendance', None)
-                    st.session_state.pop('_att_quickfill', None)
-                    st.session_state.pop('att_data_editor', None)
-                    st.rerun()
+                    with st.spinner('正在解析签到表……'):
+                        df_raw = _safe_read(file_watermark, '水印签到表')
+                        res_df = parse_watermark_attendance(df_raw, company=company)
+                        
+                        if res_df.empty:
+                            st.error('未能识别到有效人员或考勤数据，请检查表格格式。')
+                        else:
+                            st.session_state['_att_parsed_df'] = res_df
+                            st.session_state['_att_status'] = 'draft'
+                            st.session_state.pop('final_attendance', None)
+                            st.session_state.pop('att_data_editor', None)
+                            st.success(f'解析成功！共识别到 {len(res_df)} 名人员。')
+                            st.rerun()
 
-        # ── 差异报告展示（只读） ─────────────────────────────────
-        if diff_df is not None and not diff_df.empty:
-            n_ok   = (diff_df['差异状态'] == '✔ 一致').sum()
-            n_warn = diff_df['差异状态'].str.startswith('⚠').sum()
-            n_miss = (diff_df['差异状态'] == '— 数据缺失').sum()
-
-            st.markdown(
-                f'''
-                <div class="metric-container">
-                    <div class="metric-card">
-                        <div class="metric-title">三方一致</div>
-                        <div class="metric-value" style="color:#059669">{n_ok}</div>
-                    </div>
-                    <div class="metric-card">
-                        <div class="metric-title">存在差异</div>
-                        <div class="metric-value" style="color:#D97706">{n_warn}</div>
-                    </div>
-                    <div class="metric-card">
-                        <div class="metric-title">数据缺失</div>
-                        <div class="metric-value" style="color:#94A3B8">{n_miss}</div>
-                    </div>
-                    <div class="metric-card">
-                        <div class="metric-title">合计人数</div>
-                        <div class="metric-value">{len(diff_df)}</div>
-                    </div>
+        # ── Step 2：在线确认与定稿 ─────────────────────────────────
+        if att_status in ['draft', 'finalized'] and parsed_df is not None and not parsed_df.empty:
+            st.markdown('---')
+            with st.container(border=True):
+                st.markdown("""
+                <div class="step-indicator">
+                    <span class="step-num">2</span>
+                    <span>核对考勤明细与定稿</span>
                 </div>
-                ''',
-                unsafe_allow_html=True,
-            )
+                """, unsafe_allow_html=True)
 
-            st.markdown('##### :material/table_view: 三方考勤对比一览（只读）')
-
-            def _highlight_row(row):
-                status = row['差异状态']
-                if status == '✔ 一致':
-                    bg = 'background-color:#D1FAE5;color:#065F46'
-                elif status.startswith('⚠'):
-                    bg = 'background-color:#FEF3C7;color:#92400E;font-weight:600'
-                else:
-                    bg = 'background-color:#F1F5F9;color:#94A3B8;font-style:italic'
-                return [bg] * len(row)
-
-            display_df = diff_df.copy()
-            # 保持考勤天数列为纯数值类型；不要用 '' 混入 float 列，避免 Arrow 序列化失败。
-            for col in ['三局天数', '护薪天数', '纸质天数']:
-                if col in display_df.columns:
-                    display_df[col] = pd.to_numeric(display_df[col], errors='coerce')
-            styled = display_df.style.apply(_highlight_row, axis=1)
-            st.dataframe(styled, use_container_width=True, hide_index=True)
-
-            if daily_df is not None and not daily_df.empty:
-                st.markdown('##### :material/calendar_month: 每日考勤原始明细（暂不决定最终输出格式）')
-                st.caption('系统保留三份表格中每天的原始内容，并只做“有考勤/缺勤/待确认”识别。领导确认最终使用√还是时间段后，再接入最终输出。')
-                daily_view = st.radio(
-                    '每日明细查看范围',
-                    ['仅看差异', '查看全部'],
-                    horizontal=True,
-                    key='att_daily_view_mode',
-                )
-                daily_view_df = daily_df
-                if daily_view == '仅看差异':
-                    daily_view_df = daily_df[daily_df['日差异状态'].str.startswith('⚠')]
-                st.dataframe(daily_view_df, use_container_width=True, hide_index=True, height=420)
-
-            st.markdown(
-                '<div class="hint-box">'
-                ':material/info: 下载彩色差异报告发给领导审阅。领导确认后点击下方按钮进入定稿环节。'
-                '</div>',
-                unsafe_allow_html=True,
-            )
-
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M')
-            col_dl, col_confirm, _ = st.columns([2, 2, 3])
-
-            with col_dl:
-                if OPENPYXL_OK:
-                    st.download_button(
-                        label=':material/download: 下载差异对比报告 (Excel)',
-                        data=build_diff_report_xlsx(diff_df),
-                        file_name=f'三方考勤差异报告_{timestamp}.xlsx',
-                        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                        key='dl_diff_report', use_container_width=True,
+                if att_status == 'draft':
+                    st.markdown(
+                        '<div class="hint-box">'
+                        ':material/info: 当前为 <b>草稿 (draft)</b> 状态。<br>'
+                        '请在下方双击 <b>✏ 最终核定天数</b> 逐行人工确认和微调，确认无误后点击“考勤定稿”。'
+                        '</div>',
+                        unsafe_allow_html=True,
                     )
-
-            with col_confirm:
-                if not confirmed:
-                    if st.button(':material/how_to_reg: 领导已确认，进入定稿', key='btn_leader_confirm', type='primary', use_container_width=True):
-                        st.session_state['_att_leader_confirmed'] = True
-                        st.rerun()
                 else:
                     st.markdown(
                         '<div class="celebrate-banner" style="margin:0;">'
                         '<span class="celebrate-icon">✅</span>'
-                        '领导已确认，可在下方录入定稿天数。'
+                        '考勤已定稿 (finalized)。可进入下一步计算工资或重新修改后再次定稿。'
                         '</div>',
                         unsafe_allow_html=True,
                     )
 
-            # ── Step B：定稿录入（门控） ─────────────────────────
-            if confirmed:
-                st.markdown('---')
-                with st.container(border=True):
-                    st.markdown("""
-                    <div class="step-indicator">
-                        <span class="step-num">B</span>
-                        <span>定稿录入 — 根据领导批示填写最终核定天数</span>
-                    </div>
-                    """, unsafe_allow_html=True)
+                # ── 构建基础 DataFrame ─────────────────────────
+                edit_base = parsed_df.copy()
+                for extra in ['工种', '班组', '联系电话', '开户银行', '银行卡号', '性别', '手机号']:
+                    if extra not in edit_base.columns:
+                        edit_base[extra] = ''
 
-                    st.markdown(
-                        '<div class="hint-box">'
-                        '可先用下方<b>快速填充</b>按钮批量填入，再手动微调个别差异行；'
-                        '或直接双击 <b>✏ 最终核定天数</b> 逐行编辑。'
-                        '</div>',
-                        unsafe_allow_html=True,
+                # 优先加载已保存的定稿数据
+                def _row_key(row):
+                    return f"{row.get('分包/所属企业', '')}|{row.get('身份证号', '')}|{row.get('姓名', '')}"
+
+                if final_df is not None and '最终核定天数' in final_df.columns:
+                    saved_map = {_row_key(r): r.get('最终核定天数') for _, r in final_df.iterrows()}
+                    edit_base['最终核定天数'] = edit_base.apply(
+                        lambda r: saved_map.get(_row_key(r), r.get('最终核定天数')), axis=1
                     )
 
-                    # ── 构建基础 DataFrame ─────────────────────────
-                    edit_base = diff_df.copy()
-                    for extra in ['工种', '班组', '身份证号', '联系电话', '开户银行', '银行卡号', '性别', '手机号', '分包/所属企业']:
-                        if extra not in edit_base.columns:
-                            edit_base[extra] = ''
+                # ── 在线编辑器 ─────────────────────────────────
+                display_edit_cols = [
+                    '分包/所属企业', '姓名', '身份证号', '解析出勤天数', '最终核定天数',
+                    '工种', '班组', '联系电话', '开户银行', '银行卡号',
+                ]
+                display_edit_cols = [c for c in display_edit_cols if c in edit_base.columns]
 
-                    def _default_final(row):
-                        if row['差异状态'] == '✔ 一致':
-                            for col in ['三局天数', '护薪天数', '纸质天数']:
-                                v = row[col]
-                                if not (isinstance(v, float) and np.isnan(v)):
-                                    return v
-                        return None
+                col_cfg = {
+                    '姓名':         st.column_config.TextColumn('姓名', disabled=True),
+                    '分包/所属企业': st.column_config.TextColumn('公司', disabled=True),
+                    '解析出勤天数': st.column_config.NumberColumn('系统解析天数', disabled=True, format='%.1f'),
+                    '最终核定天数': st.column_config.NumberColumn(
+                        '✏ 最终核定天数',
+                        min_value=0, max_value=31, step=0.5, format='%.1f',
+                        help='双击单行进行人工确认/修改',
+                    ),
+                    '工种':     st.column_config.TextColumn('工种'),
+                    '班组':     st.column_config.TextColumn('班组'),
+                    '身份证号': st.column_config.TextColumn('身份证号'),
+                    '联系电话': st.column_config.TextColumn('联系电话'),
+                    '开户银行': st.column_config.TextColumn('开户银行'),
+                    '银行卡号': st.column_config.TextColumn('银行卡号'),
+                }
 
-                    if '最终核定天数' not in edit_base.columns:
-                        edit_base['最终核定天数'] = edit_base.apply(_default_final, axis=1)
+                edited = st.data_editor(
+                    edit_base[display_edit_cols],
+                    column_config=col_cfg,
+                    use_container_width=True,
+                    num_rows='fixed',
+                    hide_index=True,
+                    key='att_data_editor',
+                )
 
-                    # 优先加载已保存的定稿数据
-                    def _row_key(row):
-                        return f"{row.get('分包/所属企业', '')}|{row.get('身份证号', '')}|{row.get('姓名', '')}"
-
-                    if final_df is not None and '最终核定天数' in final_df.columns:
-                        saved_map = {_row_key(r): r.get('最终核定天数') for _, r in final_df.iterrows()}
-                        edit_base['最终核定天数'] = edit_base.apply(
-                            lambda r: saved_map.get(_row_key(r), r.get('最终核定天数')), axis=1
-                        )
-
-                    # 若有快速填充覆盖，使用 session 中存储的结果
-                    if '_att_quickfill' in st.session_state:
-                        qf = st.session_state['_att_quickfill']
-                        edit_base['最终核定天数'] = edit_base.apply(
-                            lambda r: qf.get(_row_key(r), r.get('最终核定天数')), axis=1
-                        )
-
-                    # ── 批量快速填充按钮区 ─────────────────────────
-                    st.markdown('**:material/bolt: 批量快速填充核定天数：**')
-
-                    def _do_fill(rule: str):
-                        """根据规则批量填充，存入 session 并刷新。"""
-                        result = {}
-                        for _, r in edit_base.iterrows():
-                            name = _row_key(r)
-                            vals = {
-                                '三局': r.get('三局天数'),
-                                '护薪': r.get('护薪天数'),
-                                '纸质': r.get('纸质天数'),
-                            }
-                            valid_vals = {
-                                k: v for k, v in vals.items()
-                                if v is not None and not (isinstance(v, float) and np.isnan(v))
-                            }
-                            if rule == '最大值':
-                                result[name] = max(valid_vals.values()) if valid_vals else np.nan
-                            elif rule in valid_vals:
-                                result[name] = valid_vals[rule]
-                            else:
-                                # 该来源无数据，保留原值
-                                orig = r.get('最终核定天数')
-                                result[name] = orig if orig is not None else np.nan
-                        st.session_state['_att_quickfill'] = result
-                        # 清除编辑器缓存，确保 Streamlit 用新数据重绘
-                        st.session_state.pop('att_data_editor', None)
+                c_save, c_info = st.columns([2, 5])
+                with c_save:
+                    if st.button(':material/check_circle: 考勤定稿', type='primary', key='btn_save_final', use_container_width=True):
+                        st.session_state['final_attendance'] = enrich_with_master(edited)
+                        st.session_state['_att_status'] = 'finalized'
+                        st.success(':material/check_circle: 定稿成功 (finalized)！请切换至【考勤表与工资表导出】标签页进行工资计算。')
                         st.rerun()
+                with c_info:
+                    if att_status == 'finalized':
+                        st.markdown('<div class="hint-box" style="margin:0;">:material/info: 已定稿。若重新修改并保存，将更新定稿数据。</div>', unsafe_allow_html=True)
 
-                    qcols = st.columns(4)
-                    with qcols[0]:
-                        if st.button(
-                            ':material/trending_up: 按最大值填入',
-                            key='qf_max', use_container_width=True,
-                            help='哪个系统天数最多就填哪个（取三方最大值）',
-                        ):
-                            _do_fill('最大值')
-                    with qcols[1]:
-                        if st.button(
-                            ':material/domain: 按三局系统填入',
-                            key='qf_a', use_container_width=True,
-                            help='全部按三局智慧工地平台的天数填入',
-                        ):
-                            _do_fill('三局')
-                    with qcols[2]:
-                        if st.button(
-                            ':material/shield_person: 按护薪系统填入',
-                            key='qf_b', use_container_width=True,
-                            help='全部按智慧护薪平台的天数填入',
-                        ):
-                            _do_fill('护薪')
-                    with qcols[3]:
-                        if st.button(
-                            ':material/description: 按纸质核对填入',
-                            key='qf_paper', use_container_width=True,
-                            help='全部按纸质核对表的天数填入',
-                        ):
-                            _do_fill('纸质')
-
-                    st.markdown('<div class="soft-divider"></div>', unsafe_allow_html=True)
-
-                    # ── 在线编辑器 ─────────────────────────────────
-                    display_edit_cols = [
-                        '分包/所属企业', '姓名', '身份证号', '三局天数', '护薪天数', '纸质天数',
-                        '差异状态', '最终核定天数',
-                        '工种', '班组', '联系电话', '开户银行', '银行卡号',
-                    ]
-                    display_edit_cols = [c for c in display_edit_cols if c in edit_base.columns]
-
-                    col_cfg = {
-                        '姓名':         st.column_config.TextColumn('姓名', disabled=True),
-                        '分包/所属企业': st.column_config.TextColumn('公司', disabled=True),
-                        '三局天数':     st.column_config.NumberColumn('三局系统天数', disabled=True, format='%.1f'),
-                        '护薪天数':     st.column_config.NumberColumn('护薪系统天数', disabled=True, format='%.1f'),
-                        '纸质天数':     st.column_config.NumberColumn('纸质天数',     disabled=True, format='%.1f'),
-                        '差异状态':     st.column_config.TextColumn('差异状态',       disabled=True),
-                        '最终核定天数': st.column_config.NumberColumn(
-                            '✏ 最终核定天数',
-                            min_value=0, max_value=31, step=0.5, format='%.1f',
-                            help='批量填充后可双击单行微调',
-                        ),
-                        '工种':     st.column_config.TextColumn('工种'),
-                        '班组':     st.column_config.TextColumn('班组'),
-                        '身份证号': st.column_config.TextColumn('身份证号'),
-                        '联系电话': st.column_config.TextColumn('联系电话'),
-                        '开户银行': st.column_config.TextColumn('开户银行'),
-                        '银行卡号': st.column_config.TextColumn('银行卡号'),
-                    }
-
-                    edited = st.data_editor(
-                        edit_base[display_edit_cols],
-                        column_config=col_cfg,
-                        use_container_width=True,
-                        num_rows='fixed',
-                        hide_index=True,
-                        key='att_data_editor',
-                    )
-
-                    c_save, c_info = st.columns([2, 5])
-                    with c_save:
-                        if st.button(':material/save: 保存定稿数据', type='primary', key='btn_save_final', use_container_width=True):
-                            missing = edited[
-                                edited['最终核定天数'].isna() &
-                                (edited['差异状态'].str.startswith('⚠') | (edited['差异状态'] == '— 数据缺失'))
-                            ]
-                            if not missing.empty:
-                                names = '、'.join(missing['姓名'].tolist())
-                                st.warning(f':material/warning: 以下差异人员尚未填写核定天数：**{names}**')
-                            else:
-                                st.session_state['final_attendance'] = enrich_with_master(edited)
-                                st.success(':material/check_circle: 定稿已保存！请切换至【考勤表与工资表导出】标签页。')
-                    with c_info:
-                        if final_df is not None:
-                            st.markdown('<div class="hint-box" style="margin:0;">:material/info: 已有上次保存的定稿数据，重新保存将覆盖。</div>', unsafe_allow_html=True)
-
-        elif diff_df is None:
-            st.markdown('<div class="hint-box" style="margin-top:16px;">:material/arrow_upward: 请上传文件后点击【生成三方差异对比报告】。</div>', unsafe_allow_html=True)
-
-        if diff_df is not None or final_df is not None:
-            with st.expander(':material/refresh: 重置本期对账（开始新一期）'):
-                st.warning('将清除当前所有对账及定稿数据，无法撤销。')
-                if st.button(':material/delete_forever: 确认重置', key='btn_reset_tab1', type='secondary'):
-                    for k in ['_att_diff_df', '_att_daily_df', '_att_leader_confirmed', 'final_attendance']:
+        if att_status is not None:
+            with st.expander(':material/refresh: 重新上传 (清空当前数据)'):
+                st.warning('将清除当前的草稿和定稿数据，返回初始状态。')
+                if st.button(':material/delete_forever: 确认清空', key='btn_reset_tab1', type='secondary'):
+                    for k in ['_att_status', '_att_parsed_df', 'final_attendance']:
                         st.session_state.pop(k, None)
                     st.rerun()
 
@@ -1123,12 +994,13 @@ def render():
     # Tab 2 — 导出
     # ============================================================
     with tab_export:
+        att_status = st.session_state.get('_att_status')
         final_df = st.session_state.get('final_attendance')
 
-        if final_df is None or final_df.empty:
+        if att_status != 'finalized' or final_df is None or final_df.empty:
             st.markdown(
                 '<div class="alert-box alert-danger" style="margin-top:20px;">'
-                ':material/warning: 尚未完成考勤定稿。请先在【考勤对账与在线定稿】标签页完成 Step B 并保存。'
+                ':material/warning: 必须先完成【考勤定稿】(状态: finalized) 才能进行工资计算和导出。'
                 '</div>',
                 unsafe_allow_html=True,
             )
