@@ -1125,90 +1125,87 @@ def _workbook_bytes(wb):
 
 
 def build_all_exports_zip(salary_df):
-    """将所有公司/月份合并为四个 Excel 工作簿，而不是每家公司四个文件。"""
+    """将每个公司/月份批次分别生成四个 Excel 工作簿，并打包为 ZIP。"""
     if not OPENPYXL_OK:
         return b''
     batches = _export_batches(salary_df)
     if not batches:
         return b''
     
-    comp_names = []
-    for b in batches:
-        c_name = _short_company(b['company'], attendance=False)
-        if c_name not in comp_names:
-            comp_names.append(c_name)
-    company_str_gongsi = "-".join(comp_names) if comp_names else "未知公司"
-    company_str_zongbao = "_".join(comp_names) if comp_names else "未知公司"
-
-    p_names = []
-    for b in batches:
-        p = b['period']
-        if p and p not in p_names:
-            p_names.append(p)
-    period_str_gongsi = "-".join(p_names) if p_names else "未知月份"
-    period_str_zongbao = "_".join(p_names) if p_names else "未知月份"
-
     zip_buf = io.BytesIO()
     errors = []
     with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-        try:
-            wb, outputs = _copy_template_sheets(
-                'load-data/muban/gongsi/附件7：务工人员（含队长、班组长、弄民工）考勤表.xlsx',
-                batches,
-                lambda batch: f"{batch['period']}{_short_company(batch['company'], attendance=True)}",
-                company_specific=True,
-            )
-            for batch, ws in outputs:
-                _populate_company_attendance_sheet(ws, batch)
-            filename = f'{company_str_gongsi}-{period_str_gongsi}-考勤表.xlsx'
-            zf.writestr(filename, _workbook_bytes(wb))
-        except Exception as exc:
-            errors.append(f'公司标准考勤表：{exc}')
+        for batch in batches:
+            c_name = _short_company(batch['company'], attendance=False)
+            p_name = batch['period'] or "未知月份"
+            
+            company_str_gongsi = c_name
+            period_str_gongsi = p_name
+            company_str_zongbao = c_name.replace('-', '_').replace('+', '_')
+            period_str_zongbao = p_name.replace('-', '_').replace('+', '_')
 
-        try:
-            wb, outputs = _copy_template_sheets(
-                'load-data/muban/gongsi/副本工资发放表.xlsx',
-                batches,
-                lambda batch: f"{_short_company(batch['company'])}{batch['period']}",
-                company_specific=True,
-            )
-            details = []
-            for batch, ws in outputs:
-                result = _populate_company_wage_sheet(ws, batch)
-                details.append({'batch': batch, 'sheet': ws, **result})
-            _add_company_wage_summary(wb, details)
-            filename = f'{company_str_gongsi}-{period_str_gongsi}-工资确认表.xlsx'
-            zf.writestr(filename, _workbook_bytes(wb))
-        except Exception as exc:
-            errors.append(f'公司标准工资确认表：{exc}')
+            # 公司标准 考勤表
+            try:
+                wb, outputs = _copy_template_sheets(
+                    'load-data/muban/gongsi/附件7：务工人员（含队长、班组长、弄民工）考勤表.xlsx',
+                    [batch],
+                    lambda b: f"{b['period']}{_short_company(b['company'], attendance=True)}",
+                    company_specific=True,
+                )
+                for b, ws in outputs:
+                    _populate_company_attendance_sheet(ws, b)
+                filename = f'{company_str_gongsi}-{period_str_gongsi}-考勤表.xlsx'
+                zf.writestr(filename, _workbook_bytes(wb))
+            except Exception as exc:
+                errors.append(f'{c_name} 公司标准考勤表：{exc}')
 
-        try:
-            wb, outputs = _copy_template_sheets(
-                'load-data/muban/zongbao/考勤表（一式两份本人签字摁手印）.xlsx',
-                batches,
-                lambda batch: f"{batch['period']}{_short_company(batch['company'])}",
-                company_specific=False,
-            )
-            for batch, ws in outputs:
-                _populate_zongbao_attendance_sheet(ws, batch)
-            filename = f'{company_str_zongbao}_{period_str_zongbao}_考勤表.xlsx'
-            zf.writestr(filename, _workbook_bytes(wb))
-        except Exception as exc:
-            errors.append(f'总包标准考勤表：{exc}')
+            # 公司标准 工资确认表
+            try:
+                wb, outputs = _copy_template_sheets(
+                    'load-data/muban/gongsi/副本工资发放表.xlsx',
+                    [batch],
+                    lambda b: f"{_short_company(b['company'])}{b['period']}",
+                    company_specific=True,
+                )
+                details = []
+                for b, ws in outputs:
+                    result = _populate_company_wage_sheet(ws, b)
+                    details.append({'batch': b, 'sheet': ws, **result})
+                _add_company_wage_summary(wb, details)
+                filename = f'{company_str_gongsi}-{period_str_gongsi}-工资确认表.xlsx'
+                zf.writestr(filename, _workbook_bytes(wb))
+            except Exception as exc:
+                errors.append(f'{c_name} 公司标准工资确认表：{exc}')
 
-        try:
-            wb, outputs = _copy_template_sheets(
-                'load-data/muban/zongbao/附件3：农民工资发放确认表(一式两份本人签字摁手印).xlsx',
-                batches,
-                lambda batch: f"{batch['period']}{_short_company(batch['company'])}",
-                company_specific=False,
-            )
-            for batch, ws in outputs:
-                _populate_zongbao_wage_sheet(ws, batch)
-            filename = f'{company_str_zongbao}_{period_str_zongbao}_工资确认表.xlsx'
-            zf.writestr(filename, _workbook_bytes(wb))
-        except Exception as exc:
-            errors.append(f'总包标准工资确认表：{exc}')
+            # 总包标准 考勤表
+            try:
+                wb, outputs = _copy_template_sheets(
+                    'load-data/muban/zongbao/考勤表（一式两份本人签字摁手印）.xlsx',
+                    [batch],
+                    lambda b: f"{b['period']}{_short_company(b['company'])}",
+                    company_specific=False,
+                )
+                for b, ws in outputs:
+                    _populate_zongbao_attendance_sheet(ws, b)
+                filename = f'{company_str_zongbao}_{period_str_zongbao}_考勤表.xlsx'
+                zf.writestr(filename, _workbook_bytes(wb))
+            except Exception as exc:
+                errors.append(f'{c_name} 总包标准考勤表：{exc}')
+
+            # 总包标准 工资确认表
+            try:
+                wb, outputs = _copy_template_sheets(
+                    'load-data/muban/zongbao/附件3：农民工资发放确认表(一式两份本人签字摁手印).xlsx',
+                    [batch],
+                    lambda b: f"{b['period']}{_short_company(b['company'])}",
+                    company_specific=False,
+                )
+                for b, ws in outputs:
+                    _populate_zongbao_wage_sheet(ws, b)
+                filename = f'{company_str_zongbao}_{period_str_zongbao}_工资确认表.xlsx'
+                zf.writestr(filename, _workbook_bytes(wb))
+            except Exception as exc:
+                errors.append(f'{c_name} 总包标准工资确认表：{exc}')
 
     for error in errors:
         st.error(f'导出失败：{error}')
@@ -1253,28 +1250,54 @@ def render():
             st.caption('请上传考勤水印签到表（系统将自动识别 √ 及时间格式计算出勤天数）')
             
             company_names = ['江苏旭之升建筑工程有限公司', '青海久昌建筑装饰工程有限公司']
-            company = st.selectbox('选择分包/所属企业', company_names)
-            file_watermark = st.file_uploader('水印签到表 (Excel)', type=['xlsx', 'xls'], key='att_watermark')
+            company = st.selectbox('默认所属企业（如果文件内未写明公司）', company_names)
+            file_watermarks = st.file_uploader('水印签到表 (Excel) - 可多选', type=['xlsx', 'xls'], key='att_watermark', accept_multiple_files=True)
 
             if st.button(':material/document_scanner: 解析签到表', type='primary', key='btn_parse_watermark'):
-                if not file_watermark:
-                    st.warning(':material/info: 请上传水印签到表')
+                if not file_watermarks:
+                    st.warning(':material/info: 请至少上传一份水印签到表')
                 else:
                     with st.spinner('正在解析签到表……'):
-                        df_raw = _safe_read(file_watermark, '水印签到表')
-                        period = _infer_period(getattr(file_watermark, 'name', ''))
-                        res_df = parse_watermark_attendance(df_raw, company=company, period=period)
-                        
-                        if res_df.empty:
-                            st.error('未能识别到有效人员或考勤数据，请检查表格格式。')
-                        else:
-                            st.session_state['_att_parsed_df'] = res_df
-                            st.session_state['_att_status'] = 'draft'
-                            st.session_state.pop('final_attendance', None)
-                            st.session_state.pop('att_data_editor', None)
-                            st.success(f'解析成功！共识别到 {len(res_df)} 名人员。')
-                            st.rerun()
+                        all_res_dfs = []
+                        for fw in file_watermarks:
+                            df_raw = _safe_read(fw, '水印签到表')
+                            period = _infer_period(getattr(fw, 'name', ''))
+                            
+                            fname = getattr(fw, 'name', '')
+                            file_company = company
+                            if '旭之升' in fname or '江苏' in fname:
+                                file_company = '江苏旭之升建筑工程有限公司'
+                            elif '久昌' in fname or '青海' in fname:
+                                file_company = '青海久昌建筑装饰工程有限公司'
+                            else:
+                                try:
+                                    if hasattr(fw, 'seek'):
+                                        fw.seek(0)
+                                    head_df = __import__('pandas').read_excel(fw, header=None, nrows=10)
+                                    head_text = head_df.to_string(index=False, header=False)
+                                    if '旭之升' in head_text or '江苏' in head_text:
+                                        file_company = '江苏旭之升建筑工程有限公司'
+                                    elif '久昌' in head_text or '青海' in head_text:
+                                        file_company = '青海久昌建筑装饰工程有限公司'
+                                except Exception:
+                                    pass
 
+                            res_df = parse_watermark_attendance(df_raw, company=file_company, period=period)
+                            all_res_dfs.append(res_df)
+                        
+                        if not all_res_dfs:
+                            st.error('解析失败。')
+                        else:
+                            final_res_df = __import__('pandas').concat(all_res_dfs, ignore_index=True)
+                            if final_res_df.empty:
+                                st.error('未能识别到有效人员或考勤数据，请检查表格格式。')
+                            else:
+                                st.session_state['_att_parsed_df'] = final_res_df
+                                st.session_state['_att_status'] = 'draft'
+                                st.session_state.pop('final_attendance', None)
+                                st.session_state.pop('att_data_editor', None)
+                                st.success(f'解析成功！共识别到 {len(final_res_df)} 名人员。')
+                                st.rerun()
         # ── Step 2：在线确认与定稿 ─────────────────────────────────
         if att_status in ['draft', 'finalized'] and parsed_df is not None and not parsed_df.empty:
             st.markdown('---')
