@@ -1,6 +1,8 @@
 import pandas as pd
 import pytest
-from unittest.mock import patch, MagicMock
+from io import BytesIO
+from zipfile import ZipFile
+from openpyxl import load_workbook
 
 from modules.attendance_payroll import (
     parse_watermark_attendance,
@@ -24,6 +26,9 @@ def test_watermark_attendance_parsing_and_days_calculation():
     zhang_san = res[res['姓名'] == '张三'].iloc[0]
     assert zhang_san['解析出勤天数'] == 2.0
     assert zhang_san['最终核定天数'] == 2.0
+    assert zhang_san['月份'] == ''
+    assert zhang_san['__考勤明细__'][1] == '√'
+    assert zhang_san['__考勤明细__'][2] == '√'
     
     # 李四 should have 2 days ("08:00-18:00", "出勤")
     li_si = res[res['姓名'] == '李四'].iloc[0]
@@ -92,16 +97,15 @@ def test_workflow_status_concept():
     assert can_calculate_payroll(state)
 
 
-@patch("modules.attendance_payroll.load_workbook")
-@patch("modules.attendance_payroll.OPENPYXL_OK", True)
-def test_export_attendance_and_payroll(mock_load_workbook):
-    """Test that the export function runs and generates a zip file without crashing."""
-    # Create mock final salary data
+def test_export_attendance_and_payroll():
+    """Two companies are consolidated into four workbooks with daily marks preserved."""
     salary_df = pd.DataFrame([
         {
-            "分包/所属企业": "测试公司",
+            "分包/所属企业": "江苏旭之升建筑工程有限公司",
             "姓名": "张三",
             "身份证号": "110101199001011234",
+            "月份": "6月",
+            "__考勤明细__": {1: "✓", 2: "✓"},
             "最终核定天数": 20,
             "日薪": 300,
             "应发工资": 6000,
@@ -110,19 +114,59 @@ def test_export_attendance_and_payroll(mock_load_workbook):
             "开户银行": "工商银行",
             "银行卡号": "6222020000000000000",
             "性别": "男",
-        }
+        },
+        {
+            "分包/所属企业": "青海久昌建筑装饰工程有限公司",
+            "姓名": "李四",
+            "身份证号": "110101199505054321",
+            "月份": "6月",
+            "__考勤明细__": {1: "8", 3: "出勤"},
+            "最终核定天数": 18,
+            "日薪": 400,
+            "应发工资": 7200,
+            "工种": "焊工",
+            "联系电话": "13900000000",
+            "开户银行": "农业银行",
+            "银行卡号": "6222020000000000001",
+            "性别": "男",
+        },
     ])
-    
-    mock_wb = MagicMock()
-    mock_ws = MagicMock()
-    mock_wb.active = mock_ws
-    mock_wb.worksheets = [mock_ws]
-    mock_ws.title = "测试公司"
-    mock_load_workbook.return_value = mock_wb
-    
+
     zip_data = build_all_exports_zip(salary_df)
-    
+
     assert isinstance(zip_data, bytes)
     assert len(zip_data) > 0
-    # ensure save was called (simulating writing to the zip)
-    assert mock_wb.save.called
+    with ZipFile(BytesIO(zip_data)) as archive:
+        names = archive.namelist()
+        assert len(names) == 4
+        assert all(name.endswith('.xlsx') and '/' not in name for name in names)
+        assert any('公司标准_考勤表' in name for name in names)
+        assert any('公司标准_工资确认表' in name for name in names)
+        assert any('总包标准_考勤表' in name for name in names)
+        assert any('总包标准_工资确认表' in name for name in names)
+
+        company_attendance = load_workbook(
+            BytesIO(archive.read(next(name for name in names if '公司标准_考勤表' in name))),
+            data_only=False,
+        )
+        assert len(company_attendance.sheetnames) == 2
+        assert company_attendance[company_attendance.sheetnames[0]]['D6'].value == '✓'
+        assert company_attendance[company_attendance.sheetnames[0]]['AI6'].value == 20
+
+        zongbao_attendance = load_workbook(
+            BytesIO(archive.read(next(name for name in names if '总包标准_考勤表' in name))),
+            data_only=False,
+        )
+        assert len(zongbao_attendance.sheetnames) == 2
+        assert zongbao_attendance[zongbao_attendance.sheetnames[0]]['D5'].value == 8
+
+        company_wage = load_workbook(
+            BytesIO(archive.read(next(name for name in names if '公司标准_工资确认表' in name))),
+            data_only=False,
+        )
+        assert company_wage.sheetnames[0] == '总计'
+        assert len(company_wage.sheetnames) == 3
+        detail = company_wage[company_wage.sheetnames[1]]
+        card_col = next(cell.column for cell in detail[3] if cell.value == '银行卡号')
+        assert detail.cell(row=5, column=card_col).data_type == 's'
+        assert detail.cell(row=5, column=card_col).value == '6222020000000000000'

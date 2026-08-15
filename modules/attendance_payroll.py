@@ -372,7 +372,7 @@ def build_diff_table(df_a, df_b, df_paper, company=''):
         result.insert(0, '分包/所属企业', company)
     return result
 
-def parse_watermark_attendance(df, company=''):
+def parse_watermark_attendance(df, company='', period=''):
     """
     单源水印签到表解析。
     基于 _safe_read 的结果，优先通过识别每日考勤计算出勤天数，
@@ -416,6 +416,8 @@ def parse_watermark_attendance(df, company=''):
                 '分包/所属企业': company,
                 '姓名': name,
                 '身份证号': identity,
+                '月份': period,
+                '__考勤明细__': dict(days_dict),
                 '解析出勤天数': float(actual_days),
                 '最终核定天数': float(actual_days)
             })
@@ -434,6 +436,8 @@ def parse_watermark_attendance(df, company=''):
                 '分包/所属企业': company,
                 '姓名': name,
                 '身份证号': identity,
+                '月份': period,
+                '__考勤明细__': {},
                 '解析出勤天数': float(actual_days),
                 '最终核定天数': float(actual_days)
             })
@@ -548,31 +552,6 @@ def _keep_only_sheet(wb, ws):
             wb.remove(other)
     wb.active = 0
     return ws
-
-
-def _set_wage_sheet_header(ws, comp_df, company):
-    """更新新版公司工资模板的合并表头，保留模板原有月份文本。"""
-    project = ''
-    for col in ['项目全称', '项目简称']:
-        if col in comp_df.columns:
-            values = comp_df[col].dropna().astype(str).str.strip()
-            values = values[values.ne('')]
-            if not values.empty:
-                project = values.iloc[0]
-                break
-    if not project:
-        project = '科技文化中心—国际体育中心（足球场项目）'
-
-    team = ''
-    if '班组' in comp_df.columns:
-        teams = comp_df['班组'].dropna().astype(str).str.strip()
-        teams = teams[teams.ne('')].drop_duplicates().tolist()
-        team = '、'.join(teams[:3]) if teams else '各班组'
-
-    original = str(ws['A2'].value or '')
-    month_match = re.search(r'\d{4}\s*年[^\n]*?月', original)
-    month_text = month_match.group(0) if month_match else '年  月'
-    ws['A2'] = f'项目名称（全称）：{project}             班组名称：{team}                    {month_text}'
 
 
 def build_diff_report_xlsx(diff_df):
@@ -727,111 +706,492 @@ def enrich_with_master(final_df):
 import zipfile
 from openpyxl import load_workbook
 
+def _excel_value(row, *names):
+    """按候选字段读取值；身份证、卡号等字段由调用方再按文本写入。"""
+    for name in names:
+        value = row.get(name, '')
+        if value is None:
+            continue
+        try:
+            if pd.isna(value):
+                continue
+        except (TypeError, ValueError):
+            pass
+        return value
+    return ''
+
+
+def _excel_text(value):
+    if value is None:
+        return ''
+    try:
+        if pd.isna(value):
+            return ''
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip()
+
+
+def _period_label(value):
+    text = _excel_text(value)
+    if not text:
+        return ''
+    match = re.search(r'(\d{1,2})\s*月', text)
+    if match:
+        return f'{int(match.group(1))}月'
+    match = re.search(r'(?<!\d)(\d{1,2})(?!\d)', text)
+    return f'{int(match.group(1))}月' if match else text
+
+
+def _period_number(value):
+    match = re.search(r'(\d{1,2})\s*月', _excel_text(value))
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _infer_period(value):
+    """从上传文件名或标题提取月份，缺失时保留空值而不擅自改变业务月份。"""
+    match = re.search(r'(\d{1,2})\s*月', _excel_text(value))
+    return f'{int(match.group(1))}月' if match else ''
+
+
+def _short_company(company, attendance=False):
+    text = _excel_text(company)
+    if '江苏旭之升' in text:
+        return '旭之升' if attendance else '江苏旭之升'
+    if '青海久昌' in text:
+        return '青海久昌'
+    return text or '未知公司'
+
+
+def _first_nonempty(df, columns, fallback=''):
+    for column in columns:
+        if column not in df.columns:
+            continue
+        values = df[column].dropna().map(_excel_text)
+        values = values[values.ne('')]
+        if not values.empty:
+            return values.iloc[0]
+    return fallback
+
+
+def _export_batches(salary_df):
+    """按公司+月份组织批次；一个批次最终对应一个明细 sheet。"""
+    if salary_df is None or salary_df.empty:
+        return []
+    data = salary_df.copy()
+    if '分包/所属企业' not in data.columns:
+        data['分包/所属企业'] = '未知公司'
+    if '月份' not in data.columns:
+        data['月份'] = ''
+    data['分包/所属企业'] = data['分包/所属企业'].map(_excel_text).replace('', '未知公司')
+    data['月份'] = data['月份'].map(_period_label)
+    batches = []
+    for (company, period), group in data.groupby(['分包/所属企业', '月份'], sort=False, dropna=False):
+        batches.append({
+            'company': _excel_text(company) or '未知公司',
+            'period': _period_label(period),
+            'df': group.reset_index(drop=True),
+        })
+    return batches
+
+
+def _safe_sheet_title(title, used_titles):
+    title = re.sub(r'[\\/*?:\[\]]', '', _excel_text(title)) or '明细'
+    title = title[:31]
+    base = title
+    suffix = 2
+    while title in used_titles:
+        tail = f'_{suffix}'
+        title = f'{base[:31-len(tail)]}{tail}'
+        suffix += 1
+    used_titles.add(title)
+    return title
+
+
+def _copy_template_sheets(template_path, batches, name_builder, company_specific=True):
+    wb = load_workbook(template_path)
+    source_pairs = []
+    for batch in batches:
+        source = _select_company_sheet(wb, batch['company']) if company_specific else wb.active
+        source_pairs.append((batch, source))
+    # 先把模板原 sheet 改成临时名，避免 openpyxl 在复制后因同名自动追加“1”。
+    for index, source in enumerate(list(wb.worksheets)):
+        source.title = f'__模板_{index}'
+    outputs = []
+    used_titles = set()
+    for batch, source in source_pairs:
+        sheet = wb.copy_worksheet(source)
+        sheet.title = _safe_sheet_title(name_builder(batch), used_titles)
+        outputs.append((batch, sheet))
+    output_sheets = {sheet for _, sheet in outputs}
+    for sheet in list(wb.worksheets):
+        if sheet not in output_sheets:
+            wb.remove(sheet)
+    if wb.worksheets:
+        wb.active = 0
+    return wb, outputs
+
+
+def _clear_rows(ws, start_row, end_row, start_col=1, end_col=None):
+    if end_row < start_row:
+        return
+    end_col = end_col or ws.max_column
+    for row_idx in range(start_row, end_row + 1):
+        for col_idx in range(start_col, end_col + 1):
+            cell = ws.cell(row=row_idx, column=col_idx)
+            try:
+                cell.value = None
+            except AttributeError:
+                pass
+
+
+def _find_attendance_footer_row(ws, start_row):
+    keywords = ('分包项目负责人', '分包班组长', '制表人', '总包负责人', '申明', '声明', '第  1  页', '第1页')
+    for row_idx in range(start_row, ws.max_row + 1):
+        values = [ws.cell(row_idx, col_idx).value for col_idx in range(1, ws.max_column + 1)]
+        text = ' '.join(_excel_text(value) for value in values if value is not None)
+        if any(keyword in text for keyword in keywords):
+            return row_idx
+    return ws.max_row + 1
+
+
+def _prepare_data_area(ws, start_row, count, footer_finder):
+    footer_row = footer_finder(ws, start_row)
+    _ensure_data_rows(ws, start_row, count, footer_row=footer_row)
+    footer_row = footer_finder(ws, start_row)
+    _clear_rows(ws, start_row, footer_row - 1)
+    return footer_row
+
+
+def _header_row(ws, required='姓名'):
+    for row_idx in range(1, min(ws.max_row, 12) + 1):
+        labels = [_normalize_header(ws.cell(row_idx, col_idx).value) for col_idx in range(1, ws.max_column + 1)]
+        if any(required in label for label in labels):
+            return row_idx
+    return 1
+
+
+def _header_col(ws, row_idx, labels):
+    normalized_labels = [_normalize_header(label) for label in labels]
+    for col_idx in range(1, ws.max_column + 1):
+        current = _normalize_header(ws.cell(row_idx, col_idx).value)
+        if any(label == current or label in current for label in normalized_labels):
+            return col_idx
+    return None
+
+
+def _write_text_cell(ws, row_idx, col_idx, value):
+    if not col_idx:
+        return
+    cell = ws.cell(row=row_idx, column=col_idx)
+    cell.value = _excel_text(value)
+    cell.number_format = '@'
+
+
+def _write_number_cell(ws, row_idx, col_idx, value):
+    if not col_idx:
+        return
+    text = _excel_text(value)
+    if not text:
+        ws.cell(row=row_idx, column=col_idx).value = None
+        return
+    number = _to_float(text)
+    if pd.isna(number):
+        ws.cell(row=row_idx, column=col_idx).value = value
+    else:
+        ws.cell(row=row_idx, column=col_idx).value = int(number) if float(number).is_integer() else number
+
+
+def _daily_marks(row):
+    marks = _excel_value(row, '__考勤明细__')
+    return marks if isinstance(marks, dict) else {}
+
+
+def _write_daily_cells(ws, row_idx, row, marker, start_col=4, day_count=31):
+    marks = _daily_marks(row)
+    for day in range(1, day_count + 1):
+        value = marks.get(day, marks.get(str(day), ''))
+        cell = ws.cell(row=row_idx, column=start_col + day - 1)
+        cell.value = marker if _attendance_state(value) == '有考勤' else None
+
+
+def _batch_project(group):
+    return _first_nonempty(group, ['项目全称', '项目简称'], '科技文化中心—国际体育中心（足球场项目）')
+
+
+def _batch_team(group):
+    return _first_nonempty(group, ['班组'], '各班组')
+
+
+def _set_attendance_sheet_header(ws, batch, standard):
+    group = batch['df']
+    project = _batch_project(group)
+    team = _batch_team(group)
+    period = batch['period']
+    if not period:
+        return
+    year = datetime.now().year
+    month_number = _period_number(period)
+    month_text = f'{year}年{month_number}月' if month_number else period
+    if standard == 'zongbao':
+        ws['A1'] = f'{project}工程{period}考勤表'
+        ws['A2'] = batch['company']
+        ws['O2'] = f'班组：{team}'
+        ws['AE2'] = f'日期：{month_text}'
+    else:
+        ws['A4'] = f'项目名称（全称）：{project}                        班组名称：{team}                        {month_text}'
+
+
+def _normalize_company_attendance_grid(ws):
+    """将公司模板的“上月26-31+本月1-25”表头统一为参考表的1-31日列。"""
+    header_styles = {}
+    for col_idx in range(1, 36):
+        source = ws.cell(row=6, column=col_idx)
+        header_styles[col_idx] = copy(source._style)
+    for merged in list(ws.merged_cells.ranges):
+        if merged.min_row <= 6 and merged.max_row >= 5 and merged.min_col <= 35 and merged.max_col >= 1:
+            ws.unmerge_cells(str(merged))
+    ws['A5'] = '编号'
+    ws['B5'] = '姓名'
+    ws['C5'] = '工种'
+    for day in range(1, 32):
+        cell = ws.cell(row=5, column=3 + day)
+        cell.value = day
+        if header_styles[3 + day]:
+            cell._style = copy(header_styles[3 + day])
+    ws['AI5'] = '合计'
+    if header_styles[35]:
+        ws['AI5']._style = copy(header_styles[35])
+    return 6
+
+
+def _populate_company_attendance_sheet(ws, batch):
+    group = batch['df']
+    start_row = _normalize_company_attendance_grid(ws)
+    footer_row = _prepare_data_area(ws, start_row, len(group), _find_attendance_footer_row)
+    _set_attendance_sheet_header(ws, batch, 'company')
+    for row_idx, (_, row) in enumerate(group.iterrows(), start=start_row):
+        ws.cell(row=row_idx, column=1, value=row_idx - start_row + 1)
+        _write_text_cell(ws, row_idx, 2, _excel_value(row, '姓名'))
+        _write_text_cell(ws, row_idx, 3, _excel_value(row, '工种'))
+        _write_daily_cells(ws, row_idx, row, '✓')
+        _write_number_cell(ws, row_idx, 35, _excel_value(row, '最终核定天数'))
+    return {'start_row': start_row, 'footer_row': footer_row}
+
+
+def _populate_zongbao_attendance_sheet(ws, batch):
+    group = batch['df']
+    start_row = 5
+    footer_row = _prepare_data_area(ws, start_row, len(group), _find_attendance_footer_row)
+    _set_attendance_sheet_header(ws, batch, 'zongbao')
+    for row_idx, (_, row) in enumerate(group.iterrows(), start=start_row):
+        ws.cell(row=row_idx, column=1, value=row_idx - start_row + 1)
+        _write_text_cell(ws, row_idx, 2, _excel_value(row, '姓名'))
+        _write_text_cell(ws, row_idx, 3, _excel_value(row, '性别'))
+        _write_daily_cells(ws, row_idx, row, 8)
+        _write_number_cell(ws, row_idx, 35, _excel_value(row, '最终核定天数'))
+    return {'start_row': start_row, 'footer_row': footer_row}
+
+
+def _set_total_wage_header(ws, batch):
+    period = batch['period']
+    if not period:
+        return
+    ws['A2'] = f'项目名称：{_batch_project(batch["df"])}'
+    ws['D2'] = f'劳务单位：{batch["company"]}'
+    ws['H2'] = f'月度：{period}'
+
+
+def _populate_zongbao_wage_sheet(ws, batch):
+    group = batch['df']
+    start_row = 4
+    footer_row = _prepare_data_area(ws, start_row, len(group), lambda sheet, start: _find_footer_row(sheet, start))
+    _set_total_wage_header(ws, batch)
+    for row_idx, (_, row) in enumerate(group.iterrows(), start=start_row):
+        ws.cell(row=row_idx, column=1, value=row_idx - start_row + 1)
+        _write_text_cell(ws, row_idx, 2, _excel_value(row, '姓名'))
+        _write_text_cell(ws, row_idx, 3, _excel_value(row, '身份证号'))
+        _write_text_cell(ws, row_idx, 4, _excel_value(row, '联系电话', '手机号', '电话', '手机号码'))
+        _write_text_cell(ws, row_idx, 5, _excel_value(row, '开户银行'))
+        _write_text_cell(ws, row_idx, 6, _excel_value(row, '银行卡号', '工资卡号', '卡号'))
+        _write_number_cell(ws, row_idx, 7, _excel_value(row, '最终核定天数'))
+        _write_number_cell(ws, row_idx, 8, _excel_value(row, '应发工资'))
+    ws.column_dimensions['C'].width = max(ws.column_dimensions['C'].width or 0, 24)
+    ws.column_dimensions['D'].width = max(ws.column_dimensions['D'].width or 0, 16)
+    ws.column_dimensions['F'].width = max(ws.column_dimensions['F'].width or 0, 24)
+    return {'start_row': start_row, 'footer_row': footer_row, 'pay_col': 8}
+
+
+def _set_wage_sheet_header(ws, comp_df, company, period=''):
+    """更新新版公司工资模板的合并表头，按导出批次写入月份。"""
+    project = _first_nonempty(comp_df, ['项目全称', '项目简称'], '科技文化中心—国际体育中心（足球场项目）')
+    team = _first_nonempty(comp_df, ['班组'], '各班组')
+    original = str(ws['A2'].value or '')
+    month_match = re.search(r'\d{4}\s*年[^\n]*?月', original)
+    month_text = month_match.group(0) if month_match else '年  月'
+    if period:
+        month_number = _period_number(period)
+        month_text = f'{datetime.now().year}年{month_number}月' if month_number else period
+    ws['A2'] = f'项目名称（全称）：{project}             班组名称：{team}                    {month_text}'
+
+
+def _populate_company_wage_sheet(ws, batch):
+    group = batch['df']
+    start_row = 5
+    footer_row = _prepare_data_area(ws, start_row, len(group), lambda sheet, start: _find_footer_row(sheet, start))
+    _set_wage_sheet_header(ws, group, batch['company'], batch['period'])
+    header_row = _header_row(ws, '姓名')
+    name_col = _header_col(ws, header_row, ['姓名']) or 2
+    job_col = _header_col(ws, header_row, ['工种']) or 3
+    days_col = _header_col(ws, header_row, ['出勤工日', '考勤天数']) or 4
+    rate_col = _header_col(ws, header_row, ['工资标准', '日薪']) or 5
+    gross_col = _header_col(ws, header_row, ['工资总额', '应发工资']) or 6
+    pay_col = _header_col(ws, header_row, ['应支付', '实发工资']) or 11
+    card_col = _header_col(ws, header_row, ['银行卡号', '工资卡号', '卡号'])
+    for row_idx, (_, row) in enumerate(group.iterrows(), start=start_row):
+        ws.cell(row=row_idx, column=1, value=row_idx - start_row + 1)
+        _write_text_cell(ws, row_idx, name_col, _excel_value(row, '姓名'))
+        _write_text_cell(ws, row_idx, job_col, _excel_value(row, '工种'))
+        _write_number_cell(ws, row_idx, days_col, _excel_value(row, '最终核定天数'))
+        _write_number_cell(ws, row_idx, rate_col, _excel_value(row, '日薪', '提取日薪'))
+        _write_number_cell(ws, row_idx, gross_col, _excel_value(row, '应发工资'))
+        _write_number_cell(ws, row_idx, pay_col, _excel_value(row, '应发工资'))
+        _write_text_cell(ws, row_idx, card_col, _excel_value(row, '银行卡号', '工资卡号', '卡号'))
+    return {'start_row': start_row, 'footer_row': footer_row, 'pay_col': pay_col}
+
+
+def _add_company_wage_summary(wb, details):
+    summary = wb.create_sheet('总计', 0)
+    summary.merge_cells('A1:E1')
+    summary['A1'] = '中建二局安装工程有限公司-工资发放表'
+    summary['A1'].font = Font(bold=True, size=16, name='宋体')
+    summary['A1'].alignment = Alignment(horizontal='center', vertical='center')
+    summary.merge_cells('A2:E2')
+    summary['A2'] = '项目名称（全称）：科技文化中心—国际体育中心（足球场项目）'
+    summary['A2'].alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    headers = ['序号', '月份', '劳务分包公司名称', '总额（元）', '合计']
+    for col_idx, header in enumerate(headers, start=1):
+        summary.cell(row=3, column=col_idx, value=header)
+    month_rows = {}
+    detail_rows = []
+    for idx, detail in enumerate(details, start=1):
+        batch = detail['batch']
+        row_idx = 3 + idx
+        month = _period_number(batch['period'])
+        summary.cell(row=row_idx, column=1, value=idx)
+        summary.cell(row=row_idx, column=2, value=month)
+        summary.cell(row=row_idx, column=3, value=_short_company(batch['company']))
+        sheet_name = detail['sheet'].title.replace("'", "''")
+        pay_letter = get_column_letter(detail['pay_col'])
+        start_row = detail['start_row']
+        end_row = start_row + len(batch['df']) - 1
+        summary.cell(row=row_idx, column=4, value=f"=SUM('{sheet_name}'!{pay_letter}{start_row}:{pay_letter}{end_row})")
+        detail_rows.append(row_idx)
+        month_rows.setdefault(month, []).append(row_idx)
+    for rows in month_rows.values():
+        first = rows[0]
+        summary.cell(row=first, column=5, value=f'=SUM(D{rows[0]}:D{rows[-1]})')
+        for row_idx in rows[1:]:
+            summary.cell(row=row_idx, column=2, value=None)
+            summary.cell(row=row_idx, column=5, value=None)
+    total_row = 4 + len(detail_rows)
+    summary.cell(row=total_row, column=1, value='合计')
+    if detail_rows:
+        summary.cell(row=total_row, column=4, value=f'=SUM(D{detail_rows[0]}:D{detail_rows[-1]})')
+        summary.cell(row=total_row, column=5, value=f'=SUM(E{detail_rows[0]}:E{detail_rows[-1]})')
+    summary.column_dimensions['A'].width = 10
+    summary.column_dimensions['B'].width = 10
+    summary.column_dimensions['C'].width = 24
+    summary.column_dimensions['D'].width = 16
+    summary.column_dimensions['E'].width = 16
+    for row_idx in range(1, total_row + 1):
+        for col_idx in range(1, 6):
+            summary.cell(row=row_idx, column=col_idx).border = _thin_border()
+            summary.cell(row=row_idx, column=col_idx).alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    try:
+        wb.calculation.fullCalcOnLoad = True
+        wb.calculation.forceFullCalc = True
+        wb.calculation.calcMode = 'auto'
+    except AttributeError:
+        pass
+
+
+def _workbook_bytes(wb):
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
+
+
 def build_all_exports_zip(salary_df):
+    """将所有公司/月份合并为四个 Excel 工作簿，而不是每家公司四个文件。"""
     if not OPENPYXL_OK:
         return b''
-    
+    batches = _export_batches(salary_df)
+    if not batches:
+        return b''
     timestamp = datetime.now().strftime('%Y%m%d_%H%M')
     zip_buf = io.BytesIO()
-    
-    def _value(row, *names):
-        for name in names:
-            value = row.get(name, '')
-            if value is None:
-                continue
-            try:
-                if pd.isna(value):
-                    continue
-            except (TypeError, ValueError):
-                pass
-            return value
-        return ''
-
+    errors = []
     with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-        companies = salary_df.get('分包/所属企业', pd.Series(dtype=str)).fillna('').astype(str).str.strip().unique()
-        companies = [c for c in companies if c] or ['未知公司']
+        try:
+            wb, outputs = _copy_template_sheets(
+                'load-data/muban/gongsi/附件7：务工人员（含队长、班组长、弄民工）考勤表.xlsx',
+                batches,
+                lambda batch: f"{batch['period']}{_short_company(batch['company'], attendance=True)}",
+                company_specific=True,
+            )
+            for batch, ws in outputs:
+                _populate_company_attendance_sheet(ws, batch)
+            zf.writestr(f'公司标准_考勤表_{timestamp}.xlsx', _workbook_bytes(wb))
+        except Exception as exc:
+            errors.append(f'公司标准考勤表：{exc}')
 
-        for comp in companies:
-            comp_df = salary_df[salary_df.get('分包/所属企业', '') == comp].copy() if '分包/所属企业' in salary_df.columns else salary_df.copy()
-            comp_df = comp_df.reset_index(drop=True)
-            
-            # --- 1. 公司标准_考勤表 ---
-            try:
-                wb = load_workbook('load-data/muban/gongsi/附件7：务工人员（含队长、班组长、弄民工）考勤表.xlsx')
-                ws = _select_company_sheet(wb, comp)
-                ws = _keep_only_sheet(wb, ws)
-                start_r = 7
-                for i, (_, row) in enumerate(comp_df.iterrows(), start=start_r):
-                    ws.cell(row=i, column=2, value=_value(row, '姓名'))
-                    ws.cell(row=i, column=3, value=_value(row, '工种'))
-                    ws.cell(row=i, column=35, value=_value(row, '最终核定天数'))
-                buf = io.BytesIO()
-                wb.save(buf)
-                zf.writestr(f'{comp}/公司标准_考勤表_{timestamp}.xlsx', buf.getvalue())
-            except Exception as e:
-                st.error(f'公司标准考勤表导出失败（{comp}）：{e}')
-                
-            # --- 2. 公司标准_工资表 ---
-            try:
-                wb = load_workbook('load-data/muban/gongsi/副本工资发放表.xlsx')
-                ws = _select_company_sheet(wb, comp)
-                ws = _keep_only_sheet(wb, ws)
-                start_r = 5
-                footer_row = _find_footer_row(ws, start_r)
-                _ensure_data_rows(ws, start_r, len(comp_df), footer_row=footer_row)
-                _set_wage_sheet_header(ws, comp_df, comp)
-                for i, (_, row) in enumerate(comp_df.iterrows(), start=start_r):
-                    ws.cell(row=i, column=1, value=i - start_r + 1)
-                    ws.cell(row=i, column=2, value=_value(row, '姓名'))
-                    ws.cell(row=i, column=3, value=_value(row, '工种'))
-                    ws.cell(row=i, column=4, value=_value(row, '最终核定天数'))
-                    ws.cell(row=i, column=5, value=_value(row, '日薪', '提取日薪'))
-                    ws.cell(row=i, column=6, value=_value(row, '应发工资'))
-                    ws.cell(row=i, column=11, value=_value(row, '应发工资'))
-                    # L/M 为支付确认签字和领款签字，保持空白；N 为新版模板的银行卡号列。
-                    ws.cell(row=i, column=14, value=_value(row, '银行卡号', '工资卡号', '卡号'))
-                buf = io.BytesIO()
-                wb.save(buf)
-                zf.writestr(f'{comp}/公司标准_工资确认表_{timestamp}.xlsx', buf.getvalue())
-            except Exception as e:
-                st.error(f'公司标准工资表导出失败（{comp}）：{e}')
-                
-            # --- 3. 总包标准_考勤表 ---
-            try:
-                wb = load_workbook('load-data/muban/zongbao/考勤表（一式两份本人签字摁手印）.xlsx')
-                ws = wb.active
-                start_r = 5
-                for i, (_, row) in enumerate(comp_df.iterrows(), start=start_r):
-                    ws.cell(row=i, column=1, value=i-start_r+1)
-                    ws.cell(row=i, column=2, value=_value(row, '姓名'))
-                    ws.cell(row=i, column=3, value=_value(row, '性别'))
-                    ws.cell(row=i, column=35, value=_value(row, '最终核定天数'))
-                buf = io.BytesIO()
-                wb.save(buf)
-                zf.writestr(f'{comp}/总包标准_考勤表_{timestamp}.xlsx', buf.getvalue())
-            except Exception as e:
-                st.error(f'总包标准考勤表导出失败（{comp}）：{e}')
+        try:
+            wb, outputs = _copy_template_sheets(
+                'load-data/muban/gongsi/副本工资发放表.xlsx',
+                batches,
+                lambda batch: f"{_short_company(batch['company'])}{batch['period']}",
+                company_specific=True,
+            )
+            details = []
+            for batch, ws in outputs:
+                result = _populate_company_wage_sheet(ws, batch)
+                details.append({'batch': batch, 'sheet': ws, **result})
+            _add_company_wage_summary(wb, details)
+            zf.writestr(f'公司标准_工资确认表_{timestamp}.xlsx', _workbook_bytes(wb))
+        except Exception as exc:
+            errors.append(f'公司标准工资确认表：{exc}')
 
-            # --- 4. 总包标准_工资表 ---
-            try:
-                wb = load_workbook('load-data/muban/zongbao/附件3：农民工资发放确认表(一式两份本人签字摁手印).xlsx')
-                ws = wb.active
-                start_r = 4
-                for i, (_, row) in enumerate(comp_df.iterrows(), start=start_r):
-                    ws.cell(row=i, column=1, value=i-start_r+1)
-                    ws.cell(row=i, column=2, value=_value(row, '姓名'))
-                    ws.cell(row=i, column=3, value=_value(row, '身份证号'))
-                    ws.cell(row=i, column=4, value=_value(row, '联系电话', '手机号', '电话', '手机号码'))
-                    ws.cell(row=i, column=5, value=_value(row, '开户银行'))
-                    ws.cell(row=i, column=6, value=_value(row, '银行卡号', '工资卡号', '卡号'))
-                    ws.cell(row=i, column=7, value=_value(row, '最终核定天数'))
-                    ws.cell(row=i, column=8, value=_value(row, '应发工资'))
-                buf = io.BytesIO()
-                wb.save(buf)
-                zf.writestr(f'{comp}/总包标准_工资确认表_{timestamp}.xlsx', buf.getvalue())
-            except Exception as e:
-                st.error(f'总包标准工资表导出失败（{comp}）：{e}')
+        try:
+            wb, outputs = _copy_template_sheets(
+                'load-data/muban/zongbao/考勤表（一式两份本人签字摁手印）.xlsx',
+                batches,
+                lambda batch: f"{batch['period']}{_short_company(batch['company'])}",
+                company_specific=False,
+            )
+            for batch, ws in outputs:
+                _populate_zongbao_attendance_sheet(ws, batch)
+            zf.writestr(f'总包标准_考勤表_{timestamp}.xlsx', _workbook_bytes(wb))
+        except Exception as exc:
+            errors.append(f'总包标准考勤表：{exc}')
 
+        try:
+            wb, outputs = _copy_template_sheets(
+                'load-data/muban/zongbao/附件3：农民工资发放确认表(一式两份本人签字摁手印).xlsx',
+                batches,
+                lambda batch: f"{batch['period']}{_short_company(batch['company'])}",
+                company_specific=False,
+            )
+            for batch, ws in outputs:
+                _populate_zongbao_wage_sheet(ws, batch)
+            zf.writestr(f'总包标准_工资确认表_{timestamp}.xlsx', _workbook_bytes(wb))
+        except Exception as exc:
+            errors.append(f'总包标准工资确认表：{exc}')
+
+    for error in errors:
+        st.error(f'导出失败：{error}')
     return zip_buf.getvalue()
 
 
@@ -882,7 +1242,8 @@ def render():
                 else:
                     with st.spinner('正在解析签到表……'):
                         df_raw = _safe_read(file_watermark, '水印签到表')
-                        res_df = parse_watermark_attendance(df_raw, company=company)
+                        period = _infer_period(getattr(file_watermark, 'name', ''))
+                        res_df = parse_watermark_attendance(df_raw, company=company, period=period)
                         
                         if res_df.empty:
                             st.error('未能识别到有效人员或考勤数据，请检查表格格式。')
@@ -974,6 +1335,12 @@ def render():
                 c_save, c_info = st.columns([2, 5])
                 with c_save:
                     if st.button(':material/check_circle: 考勤定稿', type='primary', key='btn_save_final', use_container_width=True):
+                        # data_editor 只返回可见列；把每日明细、月份等隐藏元数据按行补回，
+                        # 确保定稿后的工资计算和四类导出仍能追溯原始考勤日格。
+                        edited = edited.copy()
+                        for hidden_col in edit_base.columns:
+                            if hidden_col not in edited.columns:
+                                edited[hidden_col] = edit_base[hidden_col].to_numpy()
                         st.session_state['final_attendance'] = enrich_with_master(edited)
                         st.session_state['_att_status'] = 'finalized'
                         st.success(':material/check_circle: 定稿成功 (finalized)！请切换至【考勤表与工资表导出】标签页进行工资计算。')
