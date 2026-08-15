@@ -1131,7 +1131,23 @@ def build_all_exports_zip(salary_df):
     batches = _export_batches(salary_df)
     if not batches:
         return b''
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M')
+    
+    comp_names = []
+    for b in batches:
+        c_name = _short_company(b['company'], attendance=False)
+        if c_name not in comp_names:
+            comp_names.append(c_name)
+    company_str_gongsi = "-".join(comp_names) if comp_names else "未知公司"
+    company_str_zongbao = "_".join(comp_names) if comp_names else "未知公司"
+
+    p_names = []
+    for b in batches:
+        p = b['period']
+        if p and p not in p_names:
+            p_names.append(p)
+    period_str_gongsi = "-".join(p_names) if p_names else "未知月份"
+    period_str_zongbao = "_".join(p_names) if p_names else "未知月份"
+
     zip_buf = io.BytesIO()
     errors = []
     with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
@@ -1144,7 +1160,8 @@ def build_all_exports_zip(salary_df):
             )
             for batch, ws in outputs:
                 _populate_company_attendance_sheet(ws, batch)
-            zf.writestr(f'公司标准_考勤表_{timestamp}.xlsx', _workbook_bytes(wb))
+            filename = f'{company_str_gongsi}-{period_str_gongsi}-考勤表.xlsx'
+            zf.writestr(filename, _workbook_bytes(wb))
         except Exception as exc:
             errors.append(f'公司标准考勤表：{exc}')
 
@@ -1160,7 +1177,8 @@ def build_all_exports_zip(salary_df):
                 result = _populate_company_wage_sheet(ws, batch)
                 details.append({'batch': batch, 'sheet': ws, **result})
             _add_company_wage_summary(wb, details)
-            zf.writestr(f'公司标准_工资确认表_{timestamp}.xlsx', _workbook_bytes(wb))
+            filename = f'{company_str_gongsi}-{period_str_gongsi}-工资确认表.xlsx'
+            zf.writestr(filename, _workbook_bytes(wb))
         except Exception as exc:
             errors.append(f'公司标准工资确认表：{exc}')
 
@@ -1173,7 +1191,8 @@ def build_all_exports_zip(salary_df):
             )
             for batch, ws in outputs:
                 _populate_zongbao_attendance_sheet(ws, batch)
-            zf.writestr(f'总包标准_考勤表_{timestamp}.xlsx', _workbook_bytes(wb))
+            filename = f'{company_str_zongbao}_{period_str_zongbao}_考勤表.xlsx'
+            zf.writestr(filename, _workbook_bytes(wb))
         except Exception as exc:
             errors.append(f'总包标准考勤表：{exc}')
 
@@ -1186,7 +1205,8 @@ def build_all_exports_zip(salary_df):
             )
             for batch, ws in outputs:
                 _populate_zongbao_wage_sheet(ws, batch)
-            zf.writestr(f'总包标准_工资确认表_{timestamp}.xlsx', _workbook_bytes(wb))
+            filename = f'{company_str_zongbao}_{period_str_zongbao}_工资确认表.xlsx'
+            zf.writestr(filename, _workbook_bytes(wb))
         except Exception as exc:
             errors.append(f'总包标准工资确认表：{exc}')
 
