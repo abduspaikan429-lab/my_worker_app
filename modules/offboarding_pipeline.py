@@ -7,6 +7,7 @@ import hashlib
 import time
 from datetime import date
 from modules.master_data import load_master_df
+from modules.onboarding_pipeline import onboarding_service
 
 from services.offboarding_service import OffboardingService
 
@@ -191,9 +192,10 @@ def render():
     tab_add, tab_track = st.tabs(["发起人员离场", "离场进度看板"])
 
     with tab_add:
-        # 加载主表并只保留当前在场人员（已进入离场结算或已归档人员不重复展示）
+        # 加载主表与进场流程人员，并只保留当前在场人员（已进入离场结算或已归档人员不重复展示）
         df = load_master_df()
-        onsite_df = offboarding_service.filter_onsite_df(df)
+        all_workers = onboarding_service.merge_with_master(df)
+        onsite_df = offboarding_service.filter_onsite_df(all_workers)
         
         st.markdown("#### 从花名册中选择人员发起离场")
         st.markdown("<p style='color: #64748B; font-size: 13px;'>在下方选择当前在场的工人，将其移入离场待办清单。</p>", unsafe_allow_html=True)

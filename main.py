@@ -21,17 +21,22 @@ today_onboarding = 0
 onsite_count = 0
 try:
     persisted_master = load_master_df()
+    today_onboarding = len(onboarding_pipeline.onboarding_service.get_records())
     if not persisted_master.empty:
         cached_count = len(persisted_master)
-        # 在场 = 档案总数 - 已离场归档 - 正在办理离场结算
-        onsite_df = offboarding_pipeline.offboarding_service.filter_onsite_df(persisted_master)
+        # 在场 = (主表 + 进场流程) - 已离场归档 - 正在办理离场结算
+        all_workers = onboarding_pipeline.onboarding_service.merge_with_master(persisted_master)
+        onsite_df = offboarding_pipeline.offboarding_service.filter_onsite_df(all_workers)
         onsite_count = len(onsite_df)
     elif 'merged_df' in st.session_state and isinstance(st.session_state.merged_df, pd.DataFrame):
         cached_count = len(st.session_state.merged_df)
-        onsite_df = offboarding_pipeline.offboarding_service.filter_onsite_df(st.session_state.merged_df)
+        all_workers = onboarding_pipeline.onboarding_service.merge_with_master(st.session_state.merged_df)
+        onsite_df = offboarding_pipeline.offboarding_service.filter_onsite_df(all_workers)
         onsite_count = len(onsite_df)
-    if 'pipeline_df' in st.session_state and isinstance(st.session_state.pipeline_df, pd.DataFrame):
-        today_onboarding = len(st.session_state.pipeline_df)
+    else:
+        onboarding_df = onboarding_pipeline.onboarding_service.get_onboarding_df()
+        onsite_df = offboarding_pipeline.offboarding_service.filter_onsite_df(onboarding_df)
+        onsite_count = len(onsite_df)
 except Exception:
     pass
 

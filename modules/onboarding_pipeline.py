@@ -4,6 +4,7 @@ import io
 import re
 import json
 import os
+from datetime import date
 import hashlib
 import time
 
@@ -58,11 +59,13 @@ def init_empty_worker(name, team=""):
                 "身份证号": "",
                 "手机号": "",
                 "工种": "",
-                "银行卡号": ""
+                "银行卡号": "",
+                "进场日期": str(date.today()),
             },
             "paper": {k: False for k in PAPER_ITEMS},
             "system": {k: False for k in SYSTEM_ITEMS},
             "access": {k: False for k in ACCESS_ITEMS},
+            "created_at": str(date.today()),
         }
         return True
     return False

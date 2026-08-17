@@ -6,6 +6,7 @@ from datetime import date, datetime
 import pandas as pd
 import streamlit as st
 from modules.master_data import load_master_df
+from modules.onboarding_pipeline import onboarding_service
 from modules.offboarding_pipeline import load_offboarding_history, offboarding_service
 
 ONBOARDING_FILE = "data/onboarding_data.json"
@@ -57,15 +58,19 @@ def compute_dashboard():
     offboarding = load_offboarding_active()
     history = load_offboarding_history()
     
+    # 只要人员进入进场流程，即视为已进场并纳入在场总览
+    all_workers = onboarding_service.merge_with_master(master)
+    
     # 只要人员进入离场结算板块或历史归档，即自动从在场人员中剔除
-    on_site_df = offboarding_service.filter_onsite_df(master)
+    on_site_df = offboarding_service.filter_onsite_df(all_workers)
     
     return {
         "on_site_count": len(on_site_df),
         "onboarding_in_progress": len(onboarding),
         "offboarding_in_progress": len(offboarding),
+        "master_count": len(master),
         "on_site_df": on_site_df,
-        "monthly_summary": _build_monthly_summary(master, history, offboarding),
+        "monthly_summary": _build_monthly_summary(all_workers, history, offboarding),
         "company_summary": _build_company_summary(on_site_df, onboarding, offboarding),
     }
 
@@ -207,11 +212,11 @@ def _render_overview(data):
     with c1: _kpi_card("当前在场总人数", data["on_site_count"], "#6366F1")
     with c2: _kpi_card("进场手续办理中", data["onboarding_in_progress"], "#34D399")
     with c3: _kpi_card("离场结算办理中", data["offboarding_in_progress"], "#F87171")
-    with c4: _kpi_card("含手续中总在场", data["on_site_count"]+data["onboarding_in_progress"], "#FB923C")
+    with c4: _kpi_card("档案库登记总数", data.get("master_count", 0), "#FB923C")
     st.markdown("<div style='margin-top:24px'></div>", unsafe_allow_html=True)
     monthly = data["monthly_summary"]
     if monthly.empty:
-        st.info("暂无月度趋势数据。\n\n进场数据来自档案魔法整合中的「进场日期」字段；离场数据来自离场流水线完成5步结算后的自动归档。")
+        st.info("暂无月度趋势数据。\n\n进场数据来自主表与进场流水线；离场数据来自离场流水线结算中与历史归档。")
         return
     st.markdown("#### 📈 月度人员变动趋势")
     try:
@@ -235,7 +240,7 @@ def _render_company(data):
     company = data["company_summary"]
     on_site_df = data["on_site_df"]
     if company.empty:
-        st.info("暂无公司数据，请先在「档案魔法整合」中同步人员信息。")
+        st.info("暂无公司数据，请先在「档案魔法整合」或「进场流水线」中录入人员信息。")
         return
     st.markdown("#### 🏢 各公司人员分布")
     try:
@@ -302,14 +307,15 @@ def _render_excel_import():
         master = load_master_df()
         history = load_offboarding_history()
         offboarding = load_offboarding_active()
-        if total_df.empty or master.empty:
+        all_workers = onboarding_service.merge_with_master(master)
+        if total_df.empty or (master.empty and all_workers.empty):
             st.info("系统档案或月报汇总数据不足，无法对比。")
             return
-        date_col = next((c for c in ["进场日期","进场时间","入场日期"] if c in master.columns), None)
+        date_col = next((c for c in ["进场日期","进场时间","入场日期"] if c in all_workers.columns), None)
         compare_rows = []
         for _, row in total_df.iterrows():
             m = row["月份"]
-            sys_in = sum(1 for v in master[date_col].dropna() if str(v)[:7]==m) if date_col else 0
+            sys_in = sum(1 for v in all_workers[date_col].dropna() if str(v)[:7]==m) if date_col else 0
             hist_out = sum(1 for rec in history if str(rec.get("离场日期",""))[:7]==m)
             active_out = sum(
                 1 for _, rec in offboarding.items()

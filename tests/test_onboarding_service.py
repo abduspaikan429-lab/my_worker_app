@@ -80,3 +80,35 @@ def test_data_persistence_and_formatting(
     content = test_file.read_text(encoding="utf-8")
     assert '"赵六_水暖组"' in content
     assert '"姓名": "赵六"' in content
+
+
+def test_get_onboarding_df_and_merge_with_master(
+    temp_onboarding_service: OnboardingService,
+):
+    """5. Test get_onboarding_df and merging onboarding workers with master df without duplicates."""
+    import pandas as pd
+
+    master_df = pd.DataFrame([
+        {"姓名": "张三", "班组": "木工组", "身份证号": "110101199001011234"},
+        {"姓名": "李四", "班组": "电工组", "身份证号": "110101199505054321"},
+    ])
+
+    # Add an existing worker (张三) and a brand new worker (王新民) to onboarding
+    temp_onboarding_service.create_onboarding({
+        "info": {"姓名": "张三", "班组": "木工组", "身份证号": "110101199001011234"}
+    })
+    temp_onboarding_service.create_onboarding({
+        "info": {"姓名": "王新民", "班组": "钢筋工组", "身份证号": "330101200001019999"}
+    })
+
+    # Test get_onboarding_df
+    onboarding_df = temp_onboarding_service.get_onboarding_df()
+    assert len(onboarding_df) == 2
+    assert "王新民" in onboarding_df["姓名"].values
+
+    # Test merge_with_master (should have 3 workers: 张三, 李四, 王新民)
+    merged_df = temp_onboarding_service.merge_with_master(master_df)
+    assert len(merged_df) == 3
+    assert set(merged_df["姓名"].values) == {"张三", "李四", "王新民"}
+    assert "进场日期" in merged_df.columns
+
