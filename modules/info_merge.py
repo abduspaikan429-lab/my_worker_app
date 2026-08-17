@@ -8,6 +8,14 @@ from openpyxl.drawing.image import Image as OpenpyxlImage
 from openpyxl.utils import get_column_letter
 import os
 from modules import archive_export
+from modules.archive_export import extract_cscec2_archive
+from modules.report_generator import (
+    extract_full_info,
+    extract_roster,
+    extract_monthly_report,
+    render_copy_grid,
+    paste_text,
+)
 from modules.master_data import load_master_df, preview_update, commit_update, get_last_changes
 
 def clean_val(val):
@@ -420,8 +428,28 @@ def render():
                     else:
                         st.session_state.merged_df = saved['merged_df']
                         st.session_state.master_sync_result = saved
-                        st.success(f"主表已同步。新增 {len(saved['new_rows'])} 人，资料变化 {len(saved['updated_rows'])} 人。请到【花名册与报表】直接复制新增行。")
-            elif st.session_state.get('master_sync_result'):
+                        st.success(f"主表已同步。新增 {len(saved['new_rows'])} 人，资料变化 {len(saved['updated_rows'])} 人。")
+
+            sync_res = st.session_state.get('master_sync_result')
+            if sync_res and sync_res.get('new_rows'):
+                sync_new_df = pd.DataFrame(sync_res['new_rows'])
+                with st.expander(f"✨ 立即复制本次新进场人员直贴数据 ({len(sync_new_df)} 人) - 免下载直贴 Excel", expanded=True):
+                    st.markdown('<div class="hint-box">点击下方各表格选项卡，一键复制代码框内容后直接粘贴到您本地已有的 Excel 表格末尾即可（身份证号与银行卡号等已做纯文本防科学计数法保护）。</div>', unsafe_allow_html=True)
+                    s_tab1, s_tab2, s_tab3, s_tab4 = st.tabs([
+                        "📊 全量信息表",
+                        "📋 中建二局标准档案表",
+                        "📑 标准花名册",
+                        "📅 变更月报"
+                    ])
+                    with s_tab1:
+                        render_copy_grid("全量信息表新增行", extract_full_info(sync_new_df), "im_sync_full")
+                    with s_tab2:
+                        render_copy_grid("中建二局标准档案新增行", extract_cscec2_archive(sync_new_df), "im_sync_cscec")
+                    with s_tab3:
+                        render_copy_grid("花名册新增行", extract_roster(sync_new_df), "im_sync_roster")
+                    with s_tab4:
+                        render_copy_grid("变更月报新增行", extract_monthly_report(sync_new_df), "im_sync_monthly")
+            elif st.session_state.get('master_sync_result') and not (new_count or updated_count):
                 saved = st.session_state.master_sync_result
                 st.success(f"最近一次同步完成：新增 {len(saved.get('new_rows', []))} 人，资料变化 {len(saved.get('updated_rows', []))} 人。")
 
@@ -459,8 +487,8 @@ def render():
                 </div>
             """, unsafe_allow_html=True)
 
-        # 5. 分标签页展示：检索、统计分析、导出
-        tab_data, tab_charts, tab_export = st.tabs(["人员档案明细与检索", "工种与班组统计", "数据导出"])
+        # 5. 分标签页展示：检索、统计分析、导出与直贴
+        tab_data, tab_charts, tab_export = st.tabs(["人员档案明细与检索", "工种与班组统计", "数据导出与直贴复制"])
 
         # 初始化检索 Session State
         if 'search_query' not in st.session_state:
@@ -539,82 +567,135 @@ def render():
                     st.info("暂无班组数据")
 
         with tab_export:
-            st.markdown("### 导出整合后的 Excel 文件")
+            st.markdown("### 数据导出与直贴复制")
 
-            # ── 动态计算企业名称和文件名（按分包/所属企业）──────────────────
-            GROUP_COL = '分包/所属企业'
-            teams = []
-            if GROUP_COL in filtered_df.columns:
-                teams = sorted([t for t in filtered_df[GROUP_COL].fillna("未分配").replace("", "未分配").unique() if str(t).strip() not in ("", "未分配")])
-            
-            if len(teams) == 0:
-                team_suffix = "全量"
-            elif len(teams) <= 3:
-                team_suffix = "_".join([str(t)[:10] for t in teams])
-            else:
-                team_suffix = f"{len(teams)}个班组"
+            export_tab_copy, export_tab_download = st.tabs([
+                "📋 直贴复制数据行（免下载，直接复制追加到已有 Excel）",
+                "📥 下载完整 Excel 文件（多 Sheet、复杂表头及 Logo）",
+            ])
 
-            # ── 导出模式选择 ──────────────────────────────────────────────
-            export_mode = st.radio(
-                "选择导出格式",
-                options=["📊 系统导出人员信息整理汇总", "📋 人员信息档案表（中建二局标准）"],
-                horizontal=True,
-                key="export_mode_radio",
-            )
-
-            if export_mode == "📊 系统导出人员信息整理汇总":
-                # ── 全量信息表：按班组分 Sheet，含中建标准复杂表头 ──────────
-                st.caption("包含所有原始字段的完整档案表，按班组自动分为多个 Sheet，带标准跨列标题头与企业 Logo，适用于内部存档与数据核查。")
-                st.markdown('<div class="hint-box">已使用中建标准模板格式，按班组自动分为多个 Sheet，带有标准的跨列标题头与企业 Logo。同时身份证号、手机号、工资卡号等关键数据已被强制格式化为纯文本(@)，防止出现科学计数法。</div>', unsafe_allow_html=True)
-
-                excel_bytes = generate_excel(filtered_df)
-                file_name = f"劳务人员汇总_{team_suffix}.xlsx"
-
-                st.download_button(
-                    label="📥 导出全量人员信息汇总表 Excel（多 Sheet 按班组）",
-                    data=excel_bytes,
-                    file_name=file_name,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    type="primary",
-                    use_container_width=False,
+            with export_tab_copy:
+                st.markdown(
+                    '<div class="hint-box">提示：直接复制纯数据行（含 Tab 制表符），可直接粘贴到本地已有 Excel 表格末尾。身份证号、银行卡号与手机号已添加文本保护，不会变成科学计数法。</div>',
+                    unsafe_allow_html=True,
                 )
 
-            else:
-                # ── 中建二局标准档案表 ────────────────────────────────────
-                st.caption(
-                    "按中建二局 people.xlsx 标准格式输出，含工程标题头、特殊工种自动识别、"
-                    "住址与联系人拼接，身份证号/银行卡号强制文本格式 @。"
-                )
-                project_name = st.text_input(
-                    "工程名称（将写入表格第一行标题）",
-                    value="XX工程劳务人员档案表",
-                    key="archive_project_name",
-                    placeholder="请输入工程全称，例如：XX项目劳务人员档案表",
+                # 数据源选择
+                latest_changes = get_last_changes()
+                recent_new_rows = latest_changes.get("new_rows") or []
+                recent_new_df = pd.DataFrame(recent_new_rows)
+                has_recent_new = not recent_new_df.empty
+
+                copy_scope = st.radio(
+                    "选择复制范围",
+                    options=["🆕 仅复制本次新进场/新增人员 (推荐)", "📦 复制当前筛选/全部人员"],
+                    horizontal=True,
+                    key="info_merge_copy_scope_radio",
                 )
 
-                # 实时预览字段映射结果
-                with st.expander("预览档案表格式（前5行）", expanded=False):
-                    try:
-                        preview_df = archive_export.build_archive_df(filtered_df)
-                        st.dataframe(preview_df.head(5), use_container_width=True)
-                    except Exception as prev_err:
-                        st.warning(f"预览失败：{prev_err}")
+                if copy_scope.startswith("🆕"):
+                    if has_recent_new:
+                        target_copy_df = recent_new_df
+                        st.caption(f"当前选中最近同步的 **{len(target_copy_df)}** 位新进场/新增人员")
+                    else:
+                        target_copy_df = pd.DataFrame()
+                        st.info("最近一次主表同步未检测到新增人员。如果需要提取现有人员，请切换至『复制当前筛选/全部人员』。")
+                else:
+                    target_copy_df = filtered_df
+                    st.caption(f"当前选中筛选范围内的 **{len(target_copy_df)}** 位人员")
 
-                archive_bytes = archive_export.generate_archive_excel_multi_sheet(
-                    filtered_df,
-                    project_name=project_name or "XX工程劳务人员档案表",
-                    group_col="分包/所属企业",
-                )
-                archive_file_name = f"{project_name or '劳务人员档案表'}_{team_suffix}.xlsx"
+                if not target_copy_df.empty:
+                    c_tab1, c_tab2, c_tab3, c_tab4 = st.tabs([
+                        "📊 全量信息表",
+                        "📋 中建二局标准档案表",
+                        "📑 标准花名册",
+                        "📅 变更月报",
+                    ])
+                    with c_tab1:
+                        render_copy_grid("全量信息表数据行", extract_full_info(target_copy_df), "im_tab_full_info")
+                    with c_tab2:
+                        render_copy_grid("中建二局标准档案数据行", extract_cscec2_archive(target_copy_df), "im_tab_cscec")
+                    with c_tab3:
+                        render_copy_grid("标准花名册数据行", extract_roster(target_copy_df), "im_tab_roster")
+                    with c_tab4:
+                        render_copy_grid("变更月报数据行", extract_monthly_report(target_copy_df), "im_tab_monthly")
 
-                st.download_button(
-                    label="📥 导出人员信息档案表 Excel（中建二局标准）",
-                    data=archive_bytes,
-                    file_name=archive_file_name,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    type="primary",
-                    use_container_width=False,
+            with export_tab_download:
+                st.markdown("#### 下载完整 Excel 文件")
+                # ── 动态计算企业名称和文件名（按分包/所属企业）──────────────────
+                GROUP_COL = '分包/所属企业'
+                teams = []
+                if GROUP_COL in filtered_df.columns:
+                    teams = sorted([t for t in filtered_df[GROUP_COL].fillna("未分配").replace("", "未分配").unique() if str(t).strip() not in ("", "未分配")])
+                
+                if len(teams) == 0:
+                    team_suffix = "全量"
+                elif len(teams) <= 3:
+                    team_suffix = "_".join([str(t)[:10] for t in teams])
+                else:
+                    team_suffix = f"{len(teams)}个班组"
+
+                # ── 导出模式选择 ──────────────────────────────────────────────
+                export_mode = st.radio(
+                    "选择导出格式",
+                    options=["📊 系统导出人员信息整理汇总", "📋 人员信息档案表（中建二局标准）"],
+                    horizontal=True,
+                    key="export_mode_radio",
                 )
+
+                if export_mode == "📊 系统导出人员信息整理汇总":
+                    # ── 全量信息表：按班组分 Sheet，含中建标准复杂表头 ──────────
+                    st.caption("包含所有原始字段的完整档案表，按班组自动分为多个 Sheet，带标准跨列标题头与企业 Logo，适用于内部存档与数据核查。")
+                    st.markdown('<div class="hint-box">已使用中建标准模板格式，按班组自动分为多个 Sheet，带有标准的跨列标题头与企业 Logo。同时身份证号、手机号、工资卡号等关键数据已被强制格式化为纯文本(@)，防止出现科学计数法。</div>', unsafe_allow_html=True)
+
+                    excel_bytes = generate_excel(filtered_df)
+                    file_name = f"劳务人员汇总_{team_suffix}.xlsx"
+
+                    st.download_button(
+                        label="📥 导出全量人员信息汇总表 Excel（多 Sheet 按班组）",
+                        data=excel_bytes,
+                        file_name=file_name,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        type="primary",
+                        use_container_width=False,
+                    )
+
+                else:
+                    # ── 中建二局标准档案表 ────────────────────────────────────
+                    st.caption(
+                        "按中建二局 people.xlsx 标准格式输出，含工程标题头、特殊工种自动识别、"
+                        "住址与联系人拼接，身份证号/银行卡号强制文本格式 @。"
+                    )
+                    project_name = st.text_input(
+                        "工程名称（将写入表格第一行标题）",
+                        value="XX工程劳务人员档案表",
+                        key="archive_project_name",
+                        placeholder="请输入工程全称，例如：XX项目劳务人员档案表",
+                    )
+
+                    # 实时预览字段映射结果
+                    with st.expander("预览档案表格式（前5行）", expanded=False):
+                        try:
+                            preview_df = archive_export.build_archive_df(filtered_df)
+                            st.dataframe(preview_df.head(5), use_container_width=True)
+                        except Exception as prev_err:
+                            st.warning(f"预览失败：{prev_err}")
+
+                    archive_bytes = archive_export.generate_archive_excel_multi_sheet(
+                        filtered_df,
+                        project_name=project_name or "XX工程劳务人员档案表",
+                        group_col="分包/所属企业",
+                    )
+                    archive_file_name = f"{project_name or '劳务人员档案表'}_{team_suffix}.xlsx"
+
+                    st.download_button(
+                        label="📥 导出人员信息档案表 Excel（中建二局标准）",
+                        data=archive_bytes,
+                        file_name=archive_file_name,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        type="primary",
+                        use_container_width=False,
+                    )
 
     except Exception as e:
         st.error(f"处理数据时出错: {e}")

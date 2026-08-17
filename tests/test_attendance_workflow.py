@@ -138,34 +138,34 @@ def test_export_attendance_and_payroll():
     assert len(zip_data) > 0
     with ZipFile(BytesIO(zip_data)) as archive:
         names = archive.namelist()
-        assert len(names) == 4
+        assert len(names) == 8
         assert all(name.endswith('.xlsx') and '/' not in name for name in names)
-        assert any('公司标准_考勤表' in name for name in names)
-        assert any('公司标准_工资确认表' in name for name in names)
-        assert any('总包标准_考勤表' in name for name in names)
-        assert any('总包标准_工资确认表' in name for name in names)
+        assert any('-考勤表.xlsx' in name for name in names)
+        assert any('-工资确认表.xlsx' in name for name in names)
+        assert any('_考勤表.xlsx' in name for name in names)
+        assert any('_工资确认表.xlsx' in name for name in names)
 
         company_attendance = load_workbook(
-            BytesIO(archive.read(next(name for name in names if '公司标准_考勤表' in name))),
+            BytesIO(archive.read(next(name for name in names if '旭之升' in name and '-考勤表.xlsx' in name))),
             data_only=False,
         )
-        assert len(company_attendance.sheetnames) == 2
+        assert len(company_attendance.sheetnames) == 1
         assert company_attendance[company_attendance.sheetnames[0]]['D6'].value == '✓'
         assert company_attendance[company_attendance.sheetnames[0]]['AI6'].value == 20
 
         zongbao_attendance = load_workbook(
-            BytesIO(archive.read(next(name for name in names if '总包标准_考勤表' in name))),
+            BytesIO(archive.read(next(name for name in names if '青海久昌' in name and '_考勤表.xlsx' in name))),
             data_only=False,
         )
-        assert len(zongbao_attendance.sheetnames) == 2
+        assert len(zongbao_attendance.sheetnames) == 1
         assert zongbao_attendance[zongbao_attendance.sheetnames[0]]['D5'].value == 8
 
         company_wage = load_workbook(
-            BytesIO(archive.read(next(name for name in names if '公司标准_工资确认表' in name))),
+            BytesIO(archive.read(next(name for name in names if '旭之升' in name and '-工资确认表.xlsx' in name))),
             data_only=False,
         )
         assert company_wage.sheetnames[0] == '总计'
-        assert len(company_wage.sheetnames) == 3
+        assert len(company_wage.sheetnames) == 2
         detail = company_wage[company_wage.sheetnames[1]]
         card_col = next(cell.column for cell in detail[3] if cell.value == '银行卡号')
         assert detail.cell(row=5, column=card_col).data_type == 's'

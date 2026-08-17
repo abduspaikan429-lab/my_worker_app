@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 from modules.master_data import get_last_changes, load_master_df
+from modules.archive_export import extract_cscec2_archive
 
 def clean_val(val):
     if pd.isna(val) or val is None:
@@ -33,6 +34,36 @@ def ensure_excel_text(val):
             return f"'{val}"
         return val
     return ""
+
+def extract_full_info(df: pd.DataFrame, ensure_text: bool = True) -> pd.DataFrame:
+    """提取全量信息表数据行（保持标准列顺序并对长数字文本字段防科学计数法保护）"""
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    desired_order = [
+        # 1. 个人基础信息
+        "姓名", "性别", "民族", "年龄", "身份证号", "手机号", "详细地址", "家庭住址",
+        # 2. 进场与班组信息
+        "班组", "工种", "人员类型", "进场日期", "进场时间", "在场状态", "进退场状态", "在场/进退场状态",
+        # 3. 银行与发薪信息
+        "银行卡号", "工资卡号", "开户银行",
+        # 4. 合同与合规信息
+        "劳动合同编号", "合同签订状态", "劳动合同", "是否在市建委"
+    ]
+    existing_cols = [c for c in desired_order if c in df.columns]
+    remaining_cols = [c for c in df.columns if c not in existing_cols and not str(c).startswith("Unnamed")]
+    ordered_cols = existing_cols + remaining_cols
+
+    out_df = df[ordered_cols].copy()
+
+    text_keywords = ['身份证', '手机', '电话', '卡号', '银行卡', '工资卡', '编号', '代码']
+    for col in out_df.columns:
+        if ensure_text and any(kw in col for kw in text_keywords):
+            out_df[col] = out_df[col].apply(ensure_excel_text)
+        else:
+            out_df[col] = out_df[col].apply(clean_val)
+
+    return out_df
 
 def extract_roster(df):
     """花名册数据提取"""
@@ -96,14 +127,16 @@ def extract_monthly_report(df, in_jianwei="是"):
         
     return out_df
 
-def _paste_text(df: pd.DataFrame) -> str:
+def paste_text(df: pd.DataFrame) -> str:
     """仅输出数据行，不输出表头；直接复制后粘贴到原有 Excel 空行。"""
     if df is None or df.empty:
         return ""
     return df.fillna("").astype(str).to_csv(sep="\t", index=False, header=False, lineterminator="\n")
 
+_paste_text = paste_text
 
-def _render_copy_grid(title: str, df: pd.DataFrame, key: str) -> None:
+
+def render_copy_grid(title: str, df: pd.DataFrame, key: str = "") -> None:
     st.markdown(f"#### {title}")
     if df is None or df.empty:
         st.info("当前没有可追加的数据。")
@@ -113,7 +146,9 @@ def _render_copy_grid(title: str, df: pd.DataFrame, key: str) -> None:
         '<div class="hint-box">这里只显示数据行，不含表头。点击下方代码框右上角的复制按钮，再粘贴到你原有 Excel 的最后一行；不会下载文件，也不会新增 Sheet。</div>',
         unsafe_allow_html=True,
     )
-    st.code(_paste_text(df), language="text")
+    st.code(paste_text(df), language="text")
+
+_render_copy_grid = render_copy_grid
 
 
 def _parse_date_series(df: pd.DataFrame, date_col: str) -> pd.Series:
@@ -136,7 +171,7 @@ def render():
         <span class="header-emoji">📑</span>
         <div class="header-text">
             <h2>花名册与报表直贴</h2>
-            <p>官网数据同步后，只复制新增人员行到你现有的 Excel 台账</p>
+            <p>官网数据同步后，只复制新增人员行到你现有的 Excel 台账（支持全量信息表、中建二局标准表、花名册与变更月报）</p>
         </div>
     </div>
     <div class="color-strip"></div>
@@ -160,17 +195,28 @@ def render():
     with tab_changes:
         if changes.get("updated_at"):
             st.caption(f"最近同步：{changes['updated_at']}；来源：{'、'.join(changes.get('source_files') or []) or '未记录'}")
-        change_tab1, change_tab2 = st.tabs(["新增人员", "资料变化人员"])
+        change_tab1, change_tab2 = st.tabs(["新增人员 (新进场)", "资料变化人员"])
         with change_tab1:
+            full_new = extract_full_info(new_df) if not new_df.empty else pd.DataFrame()
+            cscec_new = extract_cscec2_archive(new_df) if not new_df.empty else pd.DataFrame()
             roster_new = extract_roster(new_df) if not new_df.empty else pd.DataFrame()
             monthly_new = extract_monthly_report(new_df) if not new_df.empty else pd.DataFrame()
-            sub1, sub2 = st.tabs(["花名册新增行", "变更月报新增行"])
+            sub1, sub2, sub3, sub4 = st.tabs([
+                "📊 全量信息表新增行",
+                "📋 中建二局标准档案新增行",
+                "📑 花名册新增行",
+                "📅 变更月报新增行",
+            ])
             with sub1:
-                _render_copy_grid("花名册新增行", roster_new, "copy_new_roster")
+                render_copy_grid("全量信息表新增行", full_new, "copy_new_full")
             with sub2:
-                _render_copy_grid("变更月报新增行", monthly_new, "copy_new_monthly")
+                render_copy_grid("中建二局标准档案新增行", cscec_new, "copy_new_cscec")
+            with sub3:
+                render_copy_grid("花名册新增行", roster_new, "copy_new_roster")
+            with sub4:
+                render_copy_grid("变更月报新增行", monthly_new, "copy_new_monthly")
         with change_tab2:
-            _render_copy_grid("资料变化明细（供核对）", updated_df, "copy_changed_people")
+            render_copy_grid("资料变化明细（供核对）", updated_df, "copy_changed_people")
 
     with tab_full:
         working = df.copy()
@@ -190,13 +236,22 @@ def render():
             if selected_month != "全部":
                 working = working[dates.dt.strftime("%Y-%m") == selected_month]
 
-        st.caption(f"当前筛选 {len(working)} 人；以下仍然只显示数据行，适合粘贴到既有 Excel。")
-        full1, full2 = st.tabs(["花名册", "变更月报"])
+        st.caption(f"当前筛选 {len(working)} 人；以下只显示数据行，适合直接复制粘贴到既有 Excel。")
+        full1, full2, full3, full4 = st.tabs([
+            "📊 全量信息表",
+            "📋 中建二局标准档案",
+            "📑 花名册",
+            "📅 变更月报",
+        ])
         with full1:
-            _render_copy_grid("花名册数据行", extract_roster(working), "copy_full_roster")
+            render_copy_grid("全量信息表数据行", extract_full_info(working), "copy_full_info")
         with full2:
+            render_copy_grid("中建二局标准档案数据行", extract_cscec2_archive(working), "copy_full_cscec")
+        with full3:
+            render_copy_grid("花名册数据行", extract_roster(working), "copy_full_roster")
+        with full4:
             in_jianwei = st.text_input("是否在市建委默认值", value="是", key="report_jianwei_default")
-            _render_copy_grid("变更月报数据行", extract_monthly_report(working, in_jianwei), "copy_full_monthly")
+            render_copy_grid("变更月报数据行", extract_monthly_report(working, in_jianwei), "copy_full_monthly")
 
     with tab_quick:
         names = st.text_input("输入需要提取的姓名，多个姓名用空格分隔", key="report_quick_names")
@@ -206,8 +261,18 @@ def render():
             if selected.empty:
                 st.warning("未找到匹配人员，请检查姓名。")
             else:
-                left, right = st.columns(2)
-                with left:
-                    _render_copy_grid("花名册数据行", extract_roster(selected), "copy_quick_roster")
-                with right:
-                    _render_copy_grid("变更月报数据行", extract_monthly_report(selected), "copy_quick_monthly")
+                q1, q2, q3, q4 = st.tabs([
+                    "📊 全量信息表",
+                    "📋 中建二局标准档案",
+                    "📑 花名册",
+                    "📅 变更月报",
+                ])
+                with q1:
+                    render_copy_grid("全量信息表数据行", extract_full_info(selected), "copy_quick_full")
+                with q2:
+                    render_copy_grid("中建二局标准档案数据行", extract_cscec2_archive(selected), "copy_quick_cscec")
+                with q3:
+                    render_copy_grid("花名册数据行", extract_roster(selected), "copy_quick_roster")
+                with q4:
+                    render_copy_grid("变更月报数据行", extract_monthly_report(selected), "copy_quick_monthly")
+

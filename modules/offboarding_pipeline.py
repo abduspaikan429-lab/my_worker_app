@@ -66,8 +66,10 @@ def init_offboarding_worker(name, team, source_id=""):
                 "姓名": name,
                 "班组": team,
                 "身份证号": source_id,
+                "离场日期": str(date.today()),
             },
             "steps": {k: False for k in OFFBOARDING_STEPS},
+            "created_at": str(date.today()),
         }
         return True
     return False
@@ -189,15 +191,17 @@ def render():
     tab_add, tab_track = st.tabs(["发起人员离场", "离场进度看板"])
 
     with tab_add:
-        # Load master df to select workers
+        # 加载主表并只保留当前在场人员（已进入离场结算或已归档人员不重复展示）
         df = load_master_df()
+        onsite_df = offboarding_service.filter_onsite_df(df)
         
         st.markdown("#### 从花名册中选择人员发起离场")
         st.markdown("<p style='color: #64748B; font-size: 13px;'>在下方选择当前在场的工人，将其移入离场待办清单。</p>", unsafe_allow_html=True)
         
-        if not df.empty:
-            df['display_name'] = df['姓名'] + " (" + df.get('班组', df.get('工种', '未知')) + ")"
-            options = df.to_dict('records')
+        if not onsite_df.empty:
+            onsite_df = onsite_df.copy()
+            onsite_df['display_name'] = onsite_df['姓名'] + " (" + onsite_df.get('班组', onsite_df.get('工种', '未知')) + ")"
+            options = onsite_df.to_dict('records')
             
             # Use multiselect to pick workers
             selected_workers = st.multiselect(
@@ -219,8 +223,13 @@ def render():
                         if init_offboarding_worker(name, team, sid):
                             success_count += 1
                     st.success(f"成功将 {success_count} 名工人加入离场追踪清单！请前往【离场进度看板】办理手续。")
+                    time.sleep(0.5)
+                    st.rerun()
         else:
-            st.warning("当前主表中没有人员数据。请先在【档案魔法整合】中同步人员台账。")
+            if df.empty:
+                st.warning("当前主表中没有人员数据。请先在【档案魔法整合】中同步人员台账。")
+            else:
+                st.info("当前主表中的所有人员均已在离场结算中或已归档离场。")
             
         st.markdown("---")
         st.markdown("#### 或手动输入姓名发起离场")

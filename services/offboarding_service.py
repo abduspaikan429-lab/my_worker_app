@@ -3,7 +3,9 @@ from __future__ import annotations
 from datetime import date
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Set, Tuple, Union
+
+import pandas as pd
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_OFFBOARDING_FILE = BASE_DIR / "data" / "offboarding_data.json"
@@ -32,6 +34,13 @@ class OffboardingService:
 
     def get_records(self) -> Dict[str, Dict[str, Any]]:
         """Read and return all active offboarding records."""
+        try:
+            import streamlit as st
+            if hasattr(st, "session_state") and "offboarding_data" in st.session_state:
+                if isinstance(st.session_state.offboarding_data, dict):
+                    return st.session_state.offboarding_data
+        except Exception:
+            pass
         if not self.file_path.exists():
             return {}
         try:
@@ -87,8 +96,10 @@ class OffboardingService:
                     "身份证号": source_id,
                     "手机号": str(info.get("手机号") or info.get("phone") or "").strip(),
                     "工种": str(info.get("工种") or info.get("job_type") or "").strip(),
+                    "离场日期": str(info.get("离场日期") or date.today()),
                 },
                 "steps": {k: data.get("steps", {}).get(k, False) for k in OFFBOARDING_STEPS},
+                "created_at": str(data.get("created_at") or date.today()),
             }
             records[record_id] = new_record
             self.save_records(records)
@@ -147,3 +158,82 @@ class OffboardingService:
             self.history_path.parent.mkdir(parents=True, exist_ok=True)
             with open(self.history_path, "w", encoding="utf-8") as f:
                 json.dump(history, f, ensure_ascii=False, indent=2)
+
+    def get_offboarded_identifiers(self, include_active: bool = True) -> Tuple[Set[str], Set[str]]:
+        """
+        获取已离场/离场结算中的人员唯一标识。
+        :param include_active: 若为 True，则包含正在办理离场结算板块中的人员（即只要加入离场板块即扣减在场）。
+        :return: (left_ids: 身份证集合, left_names: 姓名/姓名_班组集合)
+        """
+        left_ids: Set[str] = set()
+        left_names: Set[str] = set()
+
+        # 1. 历史归档已办结离场人员
+        for rec in self.load_history():
+            sid = str(rec.get("身份证号") or "").strip()
+            nm = str(rec.get("姓名") or "").strip()
+            tm = str(rec.get("班组") or "").strip()
+            if sid:
+                left_ids.add(sid)
+            if nm:
+                left_names.add(nm)
+                if tm:
+                    left_names.add(f"{nm}_{tm}")
+
+        # 2. 正在离场结算中（活跃离场板块）的人员
+        if include_active:
+            for rec in self.get_records().values():
+                info = rec.get("info", {}) if isinstance(rec, dict) else {}
+                sid = str(info.get("身份证号") or info.get("id_card") or "").strip()
+                nm = str(info.get("姓名") or info.get("name") or "").strip()
+                tm = str(info.get("班组") or info.get("team") or "").strip()
+                if sid:
+                    left_ids.add(sid)
+                if nm:
+                    left_names.add(nm)
+                    if tm:
+                        left_names.add(f"{nm}_{tm}")
+
+        return left_ids, left_names
+
+    def filter_onsite_df(self, df: pd.DataFrame, include_active: bool = True) -> pd.DataFrame:
+        """
+        过滤人员 DataFrame，返回当前在场人员名单（自动剔除已归档和正在离场结算板块中的人员）。
+        """
+        if df is None or df.empty:
+            return pd.DataFrame() if df is None else df.copy()
+
+        left_ids, left_names = self.get_offboarded_identifiers(include_active=include_active)
+        if not left_ids and not left_names:
+            return df.copy()
+
+        mask_out = pd.Series(False, index=df.index)
+
+        # 优先通过身份证号比对
+        id_col = next((c for c in ["身份证号", "id_card"] if c in df.columns), None)
+        if id_col and left_ids:
+            clean_ids = df[id_col].astype(str).str.strip()
+            mask_out |= clean_ids.isin(left_ids)
+
+        # 次选通过姓名/班组比对（针对未填身份证或主表无身份证的情况）
+        name_col = next((c for c in ["姓名", "name"] if c in df.columns), None)
+        team_col = next((c for c in ["班组", "team", "工种", "job_type"] if c in df.columns), None)
+
+        if name_col and left_names:
+            names = df[name_col].astype(str).str.strip()
+            if team_col:
+                teams = df[team_col].astype(str).str.strip()
+                combo = names + "_" + teams
+                mask_out |= combo.isin(left_names)
+
+            # 单纯姓名匹配（主要处理班组为空/待分配班组的情况）
+            pure_left_names = {k for k in left_names if "_" not in k}
+            if pure_left_names:
+                if team_col:
+                    team_empty = df[team_col].astype(str).str.strip().isin(["", "nan", "None", "待分配班组", "未分组", "未知"])
+                    mask_out |= (names.isin(pure_left_names) & team_empty)
+                else:
+                    mask_out |= names.isin(pure_left_names)
+
+        return df[~mask_out].copy()
+

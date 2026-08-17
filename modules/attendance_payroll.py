@@ -188,12 +188,17 @@ def _raw_attendance_value(value):
 def _attendance_state(value):
     """仅做比对状态识别，不决定最终写回工资表的格式。"""
     text = _raw_attendance_value(value)
-    if not text or text in {"--", "—", "-", "/"}:
+    if not text or text in {"--", "—", "-", "/", "0"}:
         return "缺勤/无记录"
     if any(mark in text for mark in ["√", "✓", "✔", "出勤", "正常"]):
         return "有考勤"
     if re.search(r"\d{1,2}:\d{2}", text):
         return "有考勤"
+    try:
+        if float(text) > 0:
+            return "有考勤"
+    except (ValueError, TypeError):
+        pass
     return "待确认"
 
 

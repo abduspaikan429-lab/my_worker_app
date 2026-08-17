@@ -169,6 +169,61 @@ def build_archive_df(df: pd.DataFrame) -> pd.DataFrame:
     return archive_df
 
 
+def ensure_excel_text(val) -> str:
+    """在非空长数字或文本前添加单引号，防止粘贴到 Excel 时被转换为科学计数法。"""
+    if pd.isna(val) or val is None:
+        return ""
+    s = str(val).strip()
+    if s.lower() in ["nan", "none", "null", "<na>"]:
+        return ""
+    if s.endswith(".0"):
+        s = s[:-2]
+    if s:
+        if not s.startswith("'"):
+            return f"'{s}"
+        return s
+    return ""
+
+
+def extract_cscec2_archive(
+    df: pd.DataFrame,
+    ensure_text: bool = True,
+    include_seq: bool = True,
+) -> pd.DataFrame:
+    """
+    提取中建二局标准档案格式数据行，用于直贴复制或表格预览。
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        人员信息数据表
+    ensure_text : bool
+        是否对身份证、银行卡、手机号等添加防科学计数法保护
+    include_seq : bool
+        是否保留序号/编号
+
+    Returns
+    -------
+    pd.DataFrame
+        标准20列中建二局档案表 DataFrame
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=ARCHIVE_COLUMNS)
+
+    archive_df = build_archive_df(df)
+
+    if not include_seq:
+        archive_df["编号"] = ""
+
+    if ensure_text:
+        text_cols = ["身份证号", "银行卡号", "手机", "岗位证书编号", "入场教育资料存档号"]
+        for col in text_cols:
+            if col in archive_df.columns:
+                archive_df[col] = archive_df[col].apply(ensure_excel_text)
+
+    return archive_df
+
+
 def generate_archive_excel(df: pd.DataFrame, project_name: str = "XX工程劳务人员档案表") -> bytes:
     """
     将合并后的全量 DataFrame 写入中建二局标准档案 Excel，格式说明：

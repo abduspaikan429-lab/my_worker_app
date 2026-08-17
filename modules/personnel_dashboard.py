@@ -6,7 +6,7 @@ from datetime import date, datetime
 import pandas as pd
 import streamlit as st
 from modules.master_data import load_master_df
-from modules.offboarding_pipeline import load_offboarding_history
+from modules.offboarding_pipeline import load_offboarding_history, offboarding_service
 
 ONBOARDING_FILE = "data/onboarding_data.json"
 OFFBOARDING_FILE = "data/offboarding_data.json"
@@ -56,35 +56,20 @@ def compute_dashboard():
     onboarding = load_onboarding_active()
     offboarding = load_offboarding_active()
     history = load_offboarding_history()
-    left_ids = set()
-    left_names = set()
-    for rec in history:
-        sid = rec.get("身份证号", "").strip()
-        nm = rec.get("姓名", "").strip()
-        tm = rec.get("班组", "").strip()
-        if sid:
-            left_ids.add(sid)
-        elif nm:
-            left_names.add(nm + "_" + tm)
-    if not master.empty and "身份证号" in master.columns:
-        mask_id = master["身份证号"].isin(left_ids)
-        if "姓名" in master.columns and "班组" in master.columns:
-            mask_name = master.apply(lambda r: str(r.get("姓名","")) + "_" + str(r.get("班组","")) in left_names, axis=1)
-            on_site_df = master[~(mask_id | mask_name)].copy()
-        else:
-            on_site_df = master[~mask_id].copy()
-    else:
-        on_site_df = master.copy()
+    
+    # 只要人员进入离场结算板块或历史归档，即自动从在场人员中剔除
+    on_site_df = offboarding_service.filter_onsite_df(master)
+    
     return {
         "on_site_count": len(on_site_df),
         "onboarding_in_progress": len(onboarding),
         "offboarding_in_progress": len(offboarding),
         "on_site_df": on_site_df,
-        "monthly_summary": _build_monthly_summary(master, history),
+        "monthly_summary": _build_monthly_summary(master, history, offboarding),
         "company_summary": _build_company_summary(on_site_df, onboarding, offboarding),
     }
 
-def _build_monthly_summary(master, history):
+def _build_monthly_summary(master, history, offboarding=None):
     date_col = next((c for c in ["进场日期","进场时间","入场日期"] if not master.empty and c in master.columns), None)
     onboard_dates = []
     if date_col:
@@ -97,6 +82,12 @@ def _build_monthly_summary(master, history):
         d = _parse_date(rec.get("离场日期",""))
         if d:
             offboard_dates.append(d)
+    if offboarding:
+        for _, rec in offboarding.items():
+            info = rec.get("info", {}) if isinstance(rec, dict) else {}
+            d = _parse_date(info.get("离场日期") or rec.get("created_at") or str(date.today()))
+            if d:
+                offboard_dates.append(d)
     all_dates = onboard_dates + offboard_dates
     if not all_dates:
         return pd.DataFrame(columns=["月份","进场人数","离场人数","累计在场"])
@@ -310,6 +301,7 @@ def _render_excel_import():
         st.markdown("#### 🔍 月报 vs 系统实时数据对比")
         master = load_master_df()
         history = load_offboarding_history()
+        offboarding = load_offboarding_active()
         if total_df.empty or master.empty:
             st.info("系统档案或月报汇总数据不足，无法对比。")
             return
@@ -318,7 +310,12 @@ def _render_excel_import():
         for _, row in total_df.iterrows():
             m = row["月份"]
             sys_in = sum(1 for v in master[date_col].dropna() if str(v)[:7]==m) if date_col else 0
-            sys_out = sum(1 for rec in history if str(rec.get("离场日期",""))[:7]==m)
+            hist_out = sum(1 for rec in history if str(rec.get("离场日期",""))[:7]==m)
+            active_out = sum(
+                1 for _, rec in offboarding.items()
+                if str(rec.get("info", {}).get("离场日期") or rec.get("created_at") or str(date.today()))[:7] == m
+            )
+            sys_out = hist_out + active_out
             compare_rows.append({"月份":m,"月报进场":int(row.get("进场人数",0)),"系统进场":sys_in,
                 "进场差异":sys_in-int(row.get("进场人数",0)),"月报离场":int(row.get("离场人数",0)),
                 "系统离场":sys_out,"离场差异":sys_out-int(row.get("离场人数",0))})
