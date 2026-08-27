@@ -27,7 +27,7 @@ def archive_offboarding(worker_id: str, data: dict) -> None:
 
 
 def load_data():
-    return offboarding_service.get_pending_workers()
+    return offboarding_service.get_records()
 
 
 def save_data():
@@ -48,35 +48,35 @@ def save_data_if_changed():
         save_data()
         st.session_state._offboarding_last_hash = current_hash
 
-# 离场手续核心 5 步 Checklist
 OFFBOARDING_STEPS = [
     "1. 工人小灵光发起",
     "2. 班组长确认",
-    "3. 劳资员确认",
-    "4. 劳资员提交财务发放",
+    "3. 劳资员（我）确认",
+    "4. 提交财务发放",
     "5. 财务发放完成"
 ]
-TOTAL_ITEMS = len(OFFBOARDING_STEPS)
+OFF_PAPER = ["收纸质离场结算单", "归档身份证+结算单照片", "结清证明上传"]
+OFF_SYSTEM = ["处理离场月报", "更新花名册", "更新签到表"]
+TOTAL_ITEMS = len(OFFBOARDING_STEPS) + len(OFF_PAPER) + len(OFF_SYSTEM)
 
 def init_offboarding_worker(name, team, source_id=""):
-    worker_id = f"{name}_{team}"
-    
-    if worker_id not in st.session_state.offboarding_data:
-        st.session_state.offboarding_data[worker_id] = {
+    try:
+        offboarding_service.create_offboarding({
             "info": {
                 "姓名": name,
                 "班组": team,
                 "身份证号": source_id,
-                "离场日期": str(date.today()),
-            },
-            "steps": {k: False for k in OFFBOARDING_STEPS},
-            "created_at": str(date.today()),
-        }
+            }
+        })
         return True
-    return False
+    except Exception:
+        return False
 
 def get_progress(worker_data):
-    completed = sum(1 for v in worker_data.get("steps", {}).values() if v)
+    steps = worker_data.get("steps", {})
+    paper = worker_data.get("paper", {})
+    system = worker_data.get("system", {})
+    completed = sum(1 for v in steps.values() if v) + sum(1 for v in paper.values() if v) + sum(1 for v in system.values() if v)
     return completed, TOTAL_ITEMS
 
 def generate_wechat_notice():
@@ -138,6 +138,8 @@ def worker_dialog(worker_id):
     data = st.session_state.offboarding_data[worker_id]
     
     if "steps" not in data: data["steps"] = {k: False for k in OFFBOARDING_STEPS}
+    if "paper" not in data: data["paper"] = {k: False for k in OFF_PAPER}
+    if "system" not in data: data["system"] = {k: False for k in OFF_SYSTEM}
     
     info = data["info"]
     completed, total = get_progress(data)
@@ -149,27 +151,38 @@ def worker_dialog(worker_id):
     
     st.markdown('<div style="margin-top: 15px;"></div>', unsafe_allow_html=True)
     
-    st.markdown('<span class="tag-badge badge-orange">小灵光离场结算 5 步曲</span>', unsafe_allow_html=True)
-    st.markdown('<div style="margin-top: 10px;"></div>', unsafe_allow_html=True)
-    
-    for item in OFFBOARDING_STEPS:
-        data["steps"][item] = st.checkbox(item, value=data["steps"].get(item, False), key=f"d_off_{worker_id}_{item}")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.markdown('<span class="tag-badge badge-orange">小灵光及财务流程</span>', unsafe_allow_html=True)
+        for item in OFFBOARDING_STEPS:
+            data["steps"][item] = st.checkbox(item, value=data["steps"].get(item, False), key=f"d_off_{worker_id}_{item}")
+    with col2:
+        st.markdown('<span class="tag-badge badge-blue">纸质与证明材料</span>', unsafe_allow_html=True)
+        for item in OFF_PAPER:
+            data["paper"][item] = st.checkbox(item, value=data["paper"].get(item, False), key=f"d_op_{worker_id}_{item}")
+    with col3:
+        st.markdown('<span class="tag-badge badge-green">台账更新（尾项）</span>', unsafe_allow_html=True)
+        for item in OFF_SYSTEM:
+            data["system"][item] = st.checkbox(item, value=data["system"].get(item, False), key=f"d_os_{worker_id}_{item}")
 
-    # 检查是否全部完成，若完成则归档并自动删除
+    # 检查是否全部完成
     new_c, new_t = get_progress(data)
-    if new_c == new_t and new_t > 0:
+    if new_c == new_t and new_t > 0 and data.get("status") != "completed":
         st.markdown("<hr style='margin: 15px 0;'/>", unsafe_allow_html=True)
-        st.success("🎉 该人员所有离场手续均已完成，系统已自动将其移除！")
-        if worker_id in st.session_state.offboarding_data:
-            # 归档离场记录（记录离场日期，供变更面板统计）
-            archive_offboarding(worker_id, st.session_state.offboarding_data[worker_id])
-            del st.session_state.offboarding_data[worker_id]
-        time.sleep(1.2)
-        st.rerun()
-        return
+        st.success("🎉 该人员所有离场手续均已完成！")
+        if st.button("归档此记录", type="primary", use_container_width=True):
+            offboarding_service.mark_completed(worker_id, True)
+            st.rerun()
+            
+    if data.get("status") == "completed":
+        st.markdown("<hr style='margin: 15px 0;'/>", unsafe_allow_html=True)
+        st.info(f"✅ 该记录已于 {data.get('completed_at', '')} 归档。")
+        if st.button("撤销归档 (恢复办理)", use_container_width=True):
+            offboarding_service.mark_completed(worker_id, False)
+            st.rerun()
 
     st.markdown("<div style='margin-top: 20px;'></div>", unsafe_allow_html=True)
-    if st.button("🗑️ 撤销离场办理 (恢复在场)", key=f"delete_off_{worker_id}", use_container_width=True):
+    if st.button("🗑️ 彻底删除该离场记录", key=f"delete_off_{worker_id}", use_container_width=True):
         if worker_id in st.session_state.offboarding_data:
             del st.session_state.offboarding_data[worker_id]
             st.rerun()
@@ -177,6 +190,12 @@ def worker_dialog(worker_id):
 def render():
     if "offboarding_data" not in st.session_state:
         st.session_state.offboarding_data = load_data()
+
+    if "target_worker_id" in st.session_state and st.session_state.target_worker_id:
+        worker_id = st.session_state.target_worker_id
+        if worker_id in st.session_state.offboarding_data:
+            del st.session_state.target_worker_id
+            worker_dialog(worker_id)
 
     st.markdown("""
     <div class="page-header-deco">
@@ -288,8 +307,11 @@ def render():
             st.markdown("<div style='margin-top: 12px;'></div>", unsafe_allow_html=True)
 
             filtered_workers = []
+            show_completed = st.checkbox("显示已归档记录", value=False)
             for worker_id, data in workers_list:
                 info = data["info"]
+                if not show_completed and data.get("status") == "completed":
+                    continue
                 if search_query and search_query not in info["姓名"] and search_query not in info["班组"]:
                     continue
                 filtered_workers.append((worker_id, data))
@@ -310,8 +332,7 @@ def render():
                             if c == t:
                                 st.markdown('<span class="tag-badge badge-green">已结清退场</span>', unsafe_allow_html=True)
                             else:
-                                current_step = OFFBOARDING_STEPS[c] if c < t else "未知"
-                                st.markdown(f'<span class="tag-badge badge-orange">待办理: {current_step.split(" ")[1]}</span>', unsafe_allow_html=True)
+                                st.markdown('<span class="tag-badge badge-orange">办理中</span>', unsafe_allow_html=True)
                             
                             st.markdown(f'<div class="progress-bar-container" style="margin: 10px 0 6px 0;"><div class="progress-bar-fill" style="width: {pct}%; background: linear-gradient(90deg, #F87171, #FCA5A5);"></div></div>', unsafe_allow_html=True)
                             st.caption(f"已办理: {c}/{t}")

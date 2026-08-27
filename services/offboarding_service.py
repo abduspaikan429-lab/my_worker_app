@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Set, Tuple, Union
@@ -14,11 +14,13 @@ DEFAULT_HISTORY_FILE = BASE_DIR / "data" / "offboarding_history.json"
 OFFBOARDING_STEPS = [
     "1. 工人小灵光发起",
     "2. 班组长确认",
-    "3. 劳资员确认",
-    "4. 劳资员提交财务发放",
+    "3. 劳资员（我）确认",
+    "4. 提交财务发放",
     "5. 财务发放完成",
 ]
-TOTAL_ITEMS = len(OFFBOARDING_STEPS)
+OFF_PAPER = ["收纸质离场结算单", "归档身份证+结算单照片", "结清证明上传"]
+OFF_SYSTEM = ["处理离场月报", "更新花名册", "更新签到表"]
+TOTAL_ITEMS = len(OFFBOARDING_STEPS) + len(OFF_PAPER) + len(OFF_SYSTEM)
 
 
 class OffboardingService:
@@ -59,7 +61,9 @@ class OffboardingService:
     def get_progress(self, worker_data: Dict[str, Any]) -> tuple[int, int]:
         """Calculate completed steps count and total count."""
         steps = worker_data.get("steps", {})
-        completed = sum(1 for v in steps.values() if v)
+        paper = worker_data.get("paper", {})
+        system = worker_data.get("system", {})
+        completed = sum(1 for v in steps.values() if v) + sum(1 for v in paper.values() if v) + sum(1 for v in system.values() if v)
         return completed, TOTAL_ITEMS
 
     def get_pending_workers(self) -> Dict[str, Dict[str, Any]]:
@@ -67,8 +71,7 @@ class OffboardingService:
         records = self.get_records()
         pending = {}
         for record_id, record_data in records.items():
-            completed, total = self.get_progress(record_data)
-            if completed < total:
+            if record_data.get("status") != "completed":
                 pending[record_id] = record_data
         return pending
 
@@ -81,12 +84,39 @@ class OffboardingService:
         name = str(info.get("姓名") or info.get("name") or "").strip()
         team = str(info.get("班组") or info.get("team") or "").strip() or "待分配班组"
         source_id = str(info.get("身份证号") or info.get("id_card") or "").strip()
+        phone = str(info.get("手机号") or info.get("phone") or "").strip()
 
         if not name:
             raise ValueError("Worker name is required for offboarding")
 
-        record_id = f"{name}_{team}"
         records = self.get_records()
+        record_id = None
+        
+        if source_id:
+            for k, v in records.items():
+                if v.get("info", {}).get("身份证号") == source_id:
+                    record_id = k
+                    break
+        if not record_id and phone:
+            for k, v in records.items():
+                i = v.get("info", {})
+                if i.get("姓名") == name and i.get("手机号") == phone:
+                    record_id = k
+                    break
+        if not record_id:
+            for k, v in records.items():
+                i = v.get("info", {})
+                if i.get("姓名") == name and i.get("班组") == team:
+                    record_id = k
+                    break
+                    
+        if not record_id:
+            if source_id:
+                record_id = source_id
+            elif phone:
+                record_id = f"{name}_{phone}"
+            else:
+                record_id = f"{name}_{team}"
 
         if record_id not in records:
             new_record = {
@@ -94,11 +124,13 @@ class OffboardingService:
                     "姓名": name,
                     "班组": team,
                     "身份证号": source_id,
-                    "手机号": str(info.get("手机号") or info.get("phone") or "").strip(),
+                    "手机号": phone,
                     "工种": str(info.get("工种") or info.get("job_type") or "").strip(),
                     "离场日期": str(info.get("离场日期") or date.today()),
                 },
                 "steps": {k: data.get("steps", {}).get(k, False) for k in OFFBOARDING_STEPS},
+                "paper": {k: data.get("paper", {}).get(k, False) for k in OFF_PAPER},
+                "system": {k: data.get("system", {}).get(k, False) for k in OFF_SYSTEM},
                 "created_at": str(data.get("created_at") or date.today()),
             }
             records[record_id] = new_record
@@ -107,25 +139,17 @@ class OffboardingService:
 
         return records[record_id]
 
-    def update_status(self, record_id: str, step_updates: Dict[str, bool]) -> Dict[str, Any]:
-        """Update step completion status for offboarding record."""
+    def mark_completed(self, record_id: str, is_completed: bool = True) -> None:
+        """Mark an offboarding record as completed/active without deleting it."""
         records = self.get_records()
-        if record_id not in records:
-            raise ValueError(f"Offboarding record '{record_id}' not found")
+        if record_id in records:
+            records[record_id]["status"] = "completed" if is_completed else "active"
+            if is_completed:
+                records[record_id]["completed_at"] = str(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                self.archive_offboarding(record_id, records[record_id])
+            self.save_records(records)
 
-        record = records[record_id]
-        if "steps" not in record:
-            record["steps"] = {k: False for k in OFFBOARDING_STEPS}
-
-        record["steps"].update(step_updates)
-        self.save_records(records)
-
-        # Auto-archive if 100% complete
-        completed, total = self.get_progress(record)
-        if completed == total:
-            self.archive_offboarding(record_id, record)
-
-        return record
+    # Remove update_status
 
     def load_history(self) -> List[Dict[str, Any]]:
         """Load offboarding history records."""

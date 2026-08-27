@@ -429,6 +429,7 @@ def render():
                         st.session_state.merged_df = saved['merged_df']
                         st.session_state.master_sync_result = saved
                         st.success(f"主表已同步。新增 {len(saved['new_rows'])} 人，资料变化 {len(saved['updated_rows'])} 人。")
+                        st.info("💡 提示：同步完成后，请前往【今日办公中控台】查看。此前处于“等官方数据”状态的人员，其任务状态将被自动更新推进！")
 
             sync_res = st.session_state.get('master_sync_result')
             if sync_res and sync_res.get('new_rows'):

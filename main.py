@@ -2,7 +2,7 @@
 import streamlit as st
 import pandas as pd
 from utils.style_loader import load_css
-from modules import info_merge, pro_data_processing, onboarding_pipeline, offboarding_pipeline, report_generator, daily_assistant, attendance_payroll, personnel_dashboard
+from modules import info_merge, pro_data_processing, onboarding_pipeline, offboarding_pipeline, report_generator, daily_assistant, attendance_payroll, personnel_dashboard, workspace_console
 from modules.master_data import load_master_df
 from modules.offboarding_pipeline import load_offboarding_history
 
@@ -16,29 +16,45 @@ st.set_page_config(
 load_css()
 
 # 3. 顶部欢迎 Banner (动态雷达)
+from datetime import date
 cached_count = 0
-today_onboarding = 0
 onsite_count = 0
+onboarding_count = 0
+offboarding_count = 0
+today_onboard = 0
+today_offboard = 0
+pending_tasks_count = 0
+
 try:
     persisted_master = load_master_df()
-    today_onboarding = len(onboarding_pipeline.onboarding_service.get_records())
+    
+    # 1. 在场人数
     if not persisted_master.empty:
-        cached_count = len(persisted_master)
-        # 在场 = (主表 + 进场流程) - 已离场归档 - 正在办理离场结算
         all_workers = onboarding_pipeline.onboarding_service.merge_with_master(persisted_master)
         onsite_df = offboarding_pipeline.offboarding_service.filter_onsite_df(all_workers)
         onsite_count = len(onsite_df)
-    elif 'merged_df' in st.session_state and isinstance(st.session_state.merged_df, pd.DataFrame):
-        cached_count = len(st.session_state.merged_df)
-        all_workers = onboarding_pipeline.onboarding_service.merge_with_master(st.session_state.merged_df)
-        onsite_df = offboarding_pipeline.offboarding_service.filter_onsite_df(all_workers)
-        onsite_count = len(onsite_df)
-    else:
-        onboarding_df = onboarding_pipeline.onboarding_service.get_onboarding_df()
-        onsite_df = offboarding_pipeline.offboarding_service.filter_onsite_df(onboarding_df)
-        onsite_count = len(onsite_df)
-except Exception:
-    pass
+    
+    today_str = str(date.today())
+    
+    # 2. 进场人数
+    onboarding_data = onboarding_pipeline.onboarding_service.get_pending_workers()
+    onboarding_count = len(onboarding_data)
+    today_onboard = sum(1 for d in onboarding_data.values() if d.get("created_at") == today_str)
+    
+    # 3. 离场人数
+    offboarding_data = offboarding_pipeline.offboarding_service.get_pending_workers()
+    offboarding_count = len(offboarding_data)
+    
+    history = load_offboarding_history()
+    today_offboard = sum(1 for d in history if d.get("离场日期", "") == today_str or d.get("info", {}).get("离场日期") == today_str)
+    
+    # 4. 待办总数
+    from modules.workspace_console import get_tasks
+    tasks_red, _, _ = get_tasks()
+    pending_tasks_count = len(tasks_red)
+
+except Exception as e:
+    print(f"Stats Error: {e}")
 
 # 模块配置：名称、图标、颜色映射
 MODULES_CONFIG = {
@@ -109,23 +125,37 @@ MODULES_CONFIG = {
 }
 
 st.markdown(f"""
-<div class="welcome-banner">
-    <div class="welcome-banner-left">
-        <span class="welcome-title">Hello, 劳务指挥官</span>
-        <span class="welcome-subtitle">劳务管理一站式指挥中心</span>
+<div class="welcome-banner" style="display: flex; flex-direction: column; gap: 8px; padding-bottom: 12px;">
+    <div style="display: flex; justify-content: space-between; align-items: center;">
+        <div class="welcome-banner-left">
+            <span class="welcome-title">Hello, 劳务指挥官</span>
+            <span class="welcome-subtitle">劳务管理一站式指挥中心</span>
+        </div>
+        <div class="welcome-banner-right" style="gap: 12px;">
+            <div class="status-badge" style="background: rgba(99, 102, 241, 0.1); color: #4f46e5;">
+                <span class="material-symbols-outlined" style="font-size: 16px;">group</span>
+                <span>当前在场: <b>{onsite_count}</b></span>
+            </div>
+            <div class="status-badge" style="background: rgba(52, 211, 153, 0.1); color: #059669;">
+                <span class="material-symbols-outlined" style="font-size: 16px;">how_to_reg</span>
+                <span>办理进场: <b>{onboarding_count}</b></span>
+            </div>
+            <div class="status-badge" style="background: rgba(248, 113, 113, 0.1); color: #dc2626;">
+                <span class="material-symbols-outlined" style="font-size: 16px;">flight_takeoff</span>
+                <span>办理离场: <b>{offboarding_count}</b></span>
+            </div>
+        </div>
     </div>
-    <div class="welcome-banner-right">
-        <div class="status-badge">
-            <span class="material-symbols-outlined" style="font-size: 16px;">folder</span>
-            <span>档案缓存: <b>{cached_count}</b> 人</span>
+    <div style="display: flex; justify-content: flex-end; gap: 15px; margin-top: 2px;">
+        <div class="status-badge" style="background: rgba(251, 146, 60, 0.1); color: #ea580c; border: 1px solid rgba(251, 146, 60, 0.2);">
+            <span class="material-symbols-outlined" style="font-size: 16px;">assignment_late</span>
+            <span>待办总数: <b>{pending_tasks_count}</b></span>
         </div>
-        <div class="status-badge">
-            <span class="material-symbols-outlined" style="font-size: 16px;">groups</span>
-            <span>当前在场: <b>{onsite_count}</b> 人</span>
+        <div class="status-badge" style="background: transparent; padding: 0 4px; color: #64748b;">
+            <span>今日新增进场: <b>{today_onboard}</b></span>
         </div>
-        <div class="status-badge">
-            <span class="material-symbols-outlined" style="font-size: 16px;">rocket_launch</span>
-            <span>追踪进场: <b>{today_onboarding}</b> 人</span>
+        <div class="status-badge" style="background: transparent; padding: 0 4px; color: #64748b;">
+            <span>今日离场: <b>{today_offboard}</b></span>
         </div>
     </div>
 </div>
@@ -139,7 +169,11 @@ st.sidebar.markdown("""
 """, unsafe_allow_html=True)
 
 # 5. 模块导航路由
+if "current_nav" not in st.session_state:
+    st.session_state.current_nav = "workspace_console"
+
 modules_map = {
+    "workspace_console": (":material/dashboard: 今日办公中控台", workspace_console.render),
     "personnel_dashboard": (":material/bar_chart: 人员变更面板", personnel_dashboard.render),
     "info_merge": (":material/folder_managed: 档案魔法整合", info_merge.render),
     "pro_data": (":material/analytics: 专业数据处理", pro_data_processing.render),
@@ -165,7 +199,8 @@ selected_module_key = st.sidebar.radio(
     "功能导航",
     list(modules_map.keys()),
     format_func=lambda k: modules_map[k][0],
-    label_visibility="collapsed"
+    label_visibility="collapsed",
+    key="current_nav"
 )
 
 # 6. 执行选中的模块

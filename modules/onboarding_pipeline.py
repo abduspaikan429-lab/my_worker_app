@@ -14,7 +14,7 @@ DATA_FILE = "data/onboarding_data.json"
 onboarding_service = OnboardingService()
 
 def load_data():
-    return onboarding_service.get_pending_workers()
+    return onboarding_service.get_records()
 
 def save_data():
     if "onboarding_data" in st.session_state:
@@ -193,32 +193,24 @@ def worker_dialog(worker_id):
             label = f"**{item}**" if "百工聚" in item else item
             data["access"][item] = st.checkbox(label, value=data["access"].get(item, False), key=f"d_a_{worker_id}_{item}")
 
-    # 检查是否全部完成，若完成则自动删除
+    # 检查是否全部完成
     new_c, new_t = get_progress(data)
-    if new_c == new_t and new_t > 0:
+    if new_c == new_t and new_t > 0 and data.get("status") != "completed":
         st.markdown("<hr style='margin: 15px 0;'/>", unsafe_allow_html=True)
-        st.success("🎉 该人员所有手续均已完成，系统已自动将其移除！")
-        if worker_id in st.session_state.onboarding_data:
-            del st.session_state.onboarding_data[worker_id]
-        time.sleep(1.2)
-        st.rerun()
-        return
+        st.success("🎉 该人员当前展示的手续均已完成！")
+        if st.button("归档此记录", type="primary", use_container_width=True):
+            onboarding_service.mark_completed(worker_id, True)
+            st.rerun()
 
-    # st.markdown("<hr style='margin: 15px 0;'/>", unsafe_allow_html=True)
-    # with st.expander(":material/edit_document: 补充详细档案 (保存后自动刷新)"):
-    #     new_id = st.text_input("身份证号", value=info["身份证号"], key=f"d_id_{worker_id}")
-    #     new_bc = st.text_input("银行卡号", value=info["银行卡号"], key=f"d_bc_{worker_id}")
-    #     new_phone = st.text_input("手机号", value=info["手机号"], key=f"d_ph_{worker_id}")
-    #     new_job = st.text_input("工种", value=info["工种"], key=f"d_jb_{worker_id}")
-    #     if st.button("保存详细档案", key=f"save_{worker_id}"):
-    #         data["info"]["身份证号"] = new_id.strip()
-    #         data["info"]["银行卡号"] = new_bc.strip()
-    #         data["info"]["手机号"] = new_phone.strip()
-    #         data["info"]["工种"] = new_job.strip()
-    #         st.rerun()
+    if data.get("status") == "completed":
+        st.markdown("<hr style='margin: 15px 0;'/>", unsafe_allow_html=True)
+        st.info(f"✅ 该记录已于 {data.get('completed_at', '')} 归档。")
+        if st.button("撤销归档 (恢复办理)", use_container_width=True):
+            onboarding_service.mark_completed(worker_id, False)
+            st.rerun()
 
     st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
-    if st.button("🗑️ 删除该人员记录", key=f"delete_worker_{worker_id}", use_container_width=True):
+    if st.button("🗑️ 彻底删除该人员记录", key=f"delete_worker_{worker_id}", use_container_width=True):
         if worker_id in st.session_state.onboarding_data:
             del st.session_state.onboarding_data[worker_id]
             st.rerun()
@@ -226,6 +218,12 @@ def worker_dialog(worker_id):
 def render():
     if "onboarding_data" not in st.session_state:
         st.session_state.onboarding_data = load_data()
+
+    if "target_worker_id" in st.session_state and st.session_state.target_worker_id:
+        worker_id = st.session_state.target_worker_id
+        if worker_id in st.session_state.onboarding_data:
+            del st.session_state.target_worker_id
+            worker_dialog(worker_id)
 
     st.markdown("""
     <div class="page-header-deco">
@@ -357,9 +355,12 @@ def render():
             st.markdown("<div style='margin-top: 12px;'></div>", unsafe_allow_html=True)
 
             # 4. 过滤数据
+            show_completed = st.checkbox("显示已归档记录", value=False)
             filtered_workers = []
             for worker_id, data in workers_list:
                 info = data["info"]
+                if not show_completed and data.get("status") == "completed":
+                    continue
                 if search_query and search_query not in info["姓名"] and search_query not in info["班组"]:
                     continue
                 filtered_workers.append((worker_id, data))

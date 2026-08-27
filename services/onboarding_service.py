@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 import json
 from pathlib import Path
 from typing import Any, Dict, Union
@@ -68,12 +68,11 @@ class OnboardingService:
         return completed, TOTAL_ITEMS
 
     def get_pending_workers(self) -> Dict[str, Dict[str, Any]]:
-        """Get onboarding records for workers who are not 100% complete."""
+        """Get onboarding records for workers who are not marked as completed."""
         records = self.get_records()
         pending = {}
         for record_id, record_data in records.items():
-            completed, total = self.get_progress(record_data)
-            if completed < total:
+            if record_data.get("status") != "completed":
                 pending[record_id] = record_data
         return pending
 
@@ -89,13 +88,42 @@ class OnboardingService:
             or "待分配班组"
         )
 
+        sid = str(info.get("身份证号") or info.get("id_card") or "").strip()
+        phone = str(info.get("手机号") or info.get("phone") or "").strip()
+
         if not name:
             raise ValueError(
                 "Worker name is required for creating onboarding record"
             )
 
-        record_id = f"{name}_{team}"
         records = self.get_records()
+        record_id = None
+        
+        if sid:
+            for k, v in records.items():
+                if v.get("info", {}).get("身份证号") == sid:
+                    record_id = k
+                    break
+        if not record_id and phone:
+            for k, v in records.items():
+                i = v.get("info", {})
+                if i.get("姓名") == name and i.get("手机号") == phone:
+                    record_id = k
+                    break
+        if not record_id:
+            for k, v in records.items():
+                i = v.get("info", {})
+                if i.get("姓名") == name and i.get("班组") == team:
+                    record_id = k
+                    break
+        
+        if not record_id:
+            if sid:
+                record_id = sid
+            elif phone:
+                record_id = f"{name}_{phone}"
+            else:
+                record_id = f"{name}_{team}"
 
         if record_id not in records:
             new_record = {
@@ -137,14 +165,13 @@ class OnboardingService:
 
         return records[record_id]
 
-    def complete_onboarding(self, record_id: str) -> None:
-        """Mark all onboarding items for record_id as 100% complete."""
+    def mark_completed(self, record_id: str, is_completed: bool = True) -> None:
+        """Mark an onboarding record as completed/active without deleting it."""
         records = self.get_records()
         if record_id in records:
-            record = records[record_id]
-            record["paper"] = {k: True for k in PAPER_ITEMS}
-            record["system"] = {k: True for k in SYSTEM_ITEMS}
-            record["access"] = {k: True for k in ACCESS_ITEMS}
+            records[record_id]["status"] = "completed" if is_completed else "active"
+            if is_completed:
+                records[record_id]["completed_at"] = str(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             self.save_records(records)
 
     def get_onboarding_df(self) -> pd.DataFrame:
