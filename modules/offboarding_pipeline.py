@@ -49,11 +49,10 @@ def save_data_if_changed():
         st.session_state._offboarding_last_hash = current_hash
 
 OFFBOARDING_STEPS = [
-    "1. 工人小灵光发起",
+    "1. 工人在百工聚发起离场",
     "2. 班组长确认",
     "3. 劳资员（我）确认",
-    "4. 提交财务发放",
-    "5. 财务发放完成"
+    "4. 财务发放完成"
 ]
 OFF_PAPER = ["收纸质离场结算单", "归档身份证+结算单照片", "结清证明上传"]
 OFF_SYSTEM = ["处理离场月报", "更新花名册", "更新签到表"]
@@ -90,7 +89,7 @@ def generate_wechat_notice():
         name = data["info"]["姓名"]
         team = data["info"]["班组"]
         
-        step1 = data["steps"].get("1. 工人小灵光发起", False)
+        step1 = data["steps"].get("1. 工人在百工聚发起离场", False)
         step2 = data["steps"].get("2. 班组长确认", False)
         
         if not step1:
@@ -114,7 +113,7 @@ def generate_wechat_notice():
     for team, workers in missing_worker_init.items():
         leader = leader_map.get(team, "汪老板")
         workers_str = "、".join(workers)
-        lines.append(f"{leader}，麻烦提醒一下这几位准备离场的兄弟：{workers_str}，在人社小灵光发起离场结算哦~")
+        lines.append(f"{leader}，麻烦提醒一下这几位准备离场的兄弟：{workers_str}，在百工聚发起离场结算哦~")
         
     for team, workers in missing_leader_confirm.items():
         leader = leader_map.get(team, "汪老板")

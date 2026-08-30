@@ -5,11 +5,10 @@ from modules.onboarding_pipeline import PAPER_ITEMS as ON_PAPER, SYSTEM_ITEMS as
 
 # Offboarding constants to be synced with offboarding_service
 OFF_STEPS = [
-    "1. 工人小灵光发起",
+    "1. 工人在百工聚发起离场",
     "2. 班组长确认",
     "3. 劳资员（我）确认",
-    "4. 提交财务发放",
-    "5. 财务发放完成",
+    "4. 财务发放完成",
 ]
 OFF_PAPER = ["收纸质离场结算单", "归档身份证+结算单照片", "结清证明上传"]
 OFF_SYSTEM = ["处理离场月报", "更新花名册", "更新签到表"]
@@ -17,7 +16,7 @@ OFF_SYSTEM = ["处理离场月报", "更新花名册", "更新签到表"]
 def _is_all_true(d: dict, keys: list) -> bool:
     return all(d.get(k, False) for k in keys)
 
-def get_onboarding_status(worker_id: str, data: dict, master_ids: set, master_names: set) -> dict:
+def get_onboarding_status(worker_id: str, data: dict, master_ids: set, master_name_phones: set, master_name_teams: set) -> dict:
     """计算单个进场人员的下一步状态和异常。"""
     info = data.get("info", {})
     paper = data.get("paper", {})
@@ -28,8 +27,15 @@ def get_onboarding_status(worker_id: str, data: dict, master_ids: set, master_na
     name = str(info.get("姓名", "未知")).strip()
     team = str(info.get("班组", "未知")).strip()
     sid = str(info.get("身份证号", "")).strip()
+    phone = str(info.get("手机号", "")).strip()
     
-    in_master = (sid and sid in master_ids) or (f"{name}_{team}" in master_names) or (name in master_names)
+    in_master = False
+    if sid:
+        in_master = sid in master_ids
+    elif phone:
+        in_master = f"{name}_{phone}" in master_name_phones
+    else:
+        in_master = f"{name}_{team}" in master_name_teams
 
     # Calculate completed vs total items for general progress
     total_items = len(ON_PAPER) + len(ON_SYSTEM) + len(ON_ACCESS) + 1 # +1 for master sync
@@ -41,11 +47,13 @@ def get_onboarding_status(worker_id: str, data: dict, master_ids: set, master_na
         return {"worker_id": worker_id, "name": name, "team": team, "type": "onboarding", "category": "completed", "status": "正常在场", "action": "无", "anomaly": None}
 
     anomaly = None
-    if in_master and not _is_all_true(paper, ON_PAPER):
-        anomaly = "官方数据已同步，但纸质资料仍未补齐"
+    if any(access.values()) and not _is_all_true(paper, ON_PAPER):
+        anomaly = "平台手续已办，但前置纸质资料仍未补齐"
+    elif in_master and not _is_all_true(paper, ON_PAPER):
+        anomaly = "官方数据已同步，但前置纸质资料仍未补齐"
     elif in_master and not _is_all_true(access, ON_ACCESS):
         anomaly = "官方数据已同步，但门禁/小灵光手续未全部完成"
-    elif _is_all_true(system, ON_SYSTEM) and not in_master:
+    elif any(system.values()) and not in_master:
         anomaly = "本地台账已更新，但未执行官方数据导出同步"
 
     category = ""
@@ -103,35 +111,32 @@ def get_offboarding_status(worker_id: str, data: dict) -> dict:
         return {"worker_id": worker_id, "name": name, "team": team, "type": "offboarding", "category": "completed", "status": "历史归档", "action": "无", "anomaly": None}
 
     anomaly = None
-    if steps.get("5. 财务发放完成", False) and not paper.get("收纸质离场结算单", False):
+    if steps.get("4. 财务发放完成", False) and not paper.get("收纸质离场结算单", False):
         anomaly = "工资已发，但尚未收到纸质离场结算单！"
-    elif steps.get("5. 财务发放完成", False) and not steps.get("3. 劳资员（我）确认", False):
+    elif steps.get("4. 财务发放完成", False) and not steps.get("3. 劳资员（我）确认", False):
         anomaly = "工资已发，但我尚未在小灵光确认"
 
     category = ""
     action = ""
     status_label = "离场办理中"
 
-    # Ordered rules
-    if not steps.get("1. 工人小灵光发起", False):
+    # Ordered rules strictly following the real workflow
+    if not steps.get("1. 工人在百工聚发起离场", False):
         category = "orange"
-        action = "等待工人小灵光发起离场"
+        action = "等待工人在百工聚发起离场"
     elif not paper.get("收纸质离场结算单", False):
         category = "red"
         action = "收纸质离场结算单"
     elif not paper.get("归档身份证+结算单照片", False):
         category = "red"
-        action = "归档身份证+离场结算单照片"
+        action = "归档身份证+结算单照片"
     elif not steps.get("2. 班组长确认", False):
         category = "orange"
-        action = "等待班组长小灵光确认"
+        action = "等待班组长确认"
     elif not steps.get("3. 劳资员（我）确认", False):
         category = "red"
         action = "需要在小灵光进行劳资员确认"
-    elif not steps.get("4. 提交财务发放", False):
-        category = "red"
-        action = "提交财务发放工资"
-    elif not steps.get("5. 财务发放完成", False):
+    elif not steps.get("4. 财务发放完成", False):
         category = "orange"
         action = "等待财务打款完成"
     elif not paper.get("结清证明上传", False):
@@ -169,50 +174,61 @@ def get_all_tasks(onboarding_data: dict, offboarding_data: dict, master_df) -> T
 
     # Get master info
     master_ids = set()
-    master_names = set()
+    master_name_phones = set()
+    master_name_teams = set()
+    
     if master_df is not None and not master_df.empty:
         id_col = next((c for c in ["身份证号", "id_card"] if c in master_df.columns), None)
         if id_col:
             master_ids = {str(x).strip() for x in master_df[id_col].dropna() if str(x).strip()}
+        
         name_col = next((c for c in ["姓名", "name"] if c in master_df.columns), None)
+        phone_col = next((c for c in ["手机号", "phone"] if c in master_df.columns), None)
         team_col = next((c for c in ["班组", "team", "工种", "job_type"] if c in master_df.columns), None)
+        
         if name_col:
             for _, r in master_df.iterrows():
                 nm = str(r.get(name_col, "")).strip()
+                ph = str(r.get(phone_col, "")).strip() if phone_col else ""
                 tm = str(r.get(team_col, "")).strip() if team_col else ""
-                if nm:
-                    master_names.add(nm)
-                    if tm:
-                        master_names.add(f"{nm}_{tm}")
+                
+                if nm and ph:
+                    master_name_phones.add(f"{nm}_{ph}")
+                if nm and tm:
+                    master_name_teams.add(f"{nm}_{tm}")
 
     for worker_id, data in onboarding_data.items():
         if data.get("status") == "completed":
             continue
             
-        task = get_onboarding_status(worker_id, data, master_ids, master_names)
+        task = get_onboarding_status(worker_id, data, master_ids, master_name_phones, master_name_teams)
+        
+        # Deduplicate anomalies: if anomaly exists, ONLY show in anomalies list
         if task["anomaly"]:
             anomalies.append(task)
-            
-        if task["category"] == "red":
-            tasks_red.append(task)
-        elif task["category"] == "orange":
-            tasks_orange.append(task)
-        elif task["category"] == "yellow":
-            tasks_yellow.append(task)
+        else:
+            if task["category"] == "red":
+                tasks_red.append(task)
+            elif task["category"] == "orange":
+                tasks_orange.append(task)
+            elif task["category"] == "yellow":
+                tasks_yellow.append(task)
 
     for worker_id, data in offboarding_data.items():
         if data.get("status") == "completed":
             continue
             
         task = get_offboarding_status(worker_id, data)
+        
+        # Deduplicate anomalies: if anomaly exists, ONLY show in anomalies list
         if task["anomaly"]:
             anomalies.append(task)
-            
-        if task["category"] == "red":
-            tasks_red.append(task)
-        elif task["category"] == "orange":
-            tasks_orange.append(task)
-        elif task["category"] == "yellow":
-            tasks_yellow.append(task)
+        else:
+            if task["category"] == "red":
+                tasks_red.append(task)
+            elif task["category"] == "orange":
+                tasks_orange.append(task)
+            elif task["category"] == "yellow":
+                tasks_yellow.append(task)
 
     return tasks_red, tasks_orange, tasks_yellow, anomalies

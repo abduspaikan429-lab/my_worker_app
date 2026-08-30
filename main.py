@@ -50,8 +50,9 @@ try:
     
     # 4. 待办总数
     from modules.workspace_console import get_tasks
-    tasks_red, _, _ = get_tasks()
-    pending_tasks_count = len(tasks_red)
+    tasks_red, tasks_orange, tasks_yellow, anomalies = get_tasks()
+    distinct_workers = {t['worker_id'] for t in (tasks_red + tasks_orange + tasks_yellow + anomalies)}
+    pending_tasks_count = len(distinct_workers)
 
 except Exception as e:
     print(f"Stats Error: {e}")
@@ -195,13 +196,22 @@ st.sidebar.markdown("""
 <b style="color:#64748B; font-size:13px;">功能导航</b>
 """, unsafe_allow_html=True)
 
-selected_module_key = st.sidebar.radio(
+def on_nav_change():
+    st.session_state.current_nav = st.session_state._nav_radio
+
+nav_keys = list(modules_map.keys())
+if st.session_state.current_nav not in nav_keys:
+    st.session_state.current_nav = "workspace_console"
+
+st.sidebar.radio(
     "功能导航",
-    list(modules_map.keys()),
+    nav_keys,
     format_func=lambda k: modules_map[k][0],
     label_visibility="collapsed",
-    key="current_nav"
+    index=nav_keys.index(st.session_state.current_nav),
+    key="_nav_radio",
+    on_change=on_nav_change
 )
 
 # 6. 执行选中的模块
-modules_map[selected_module_key][1]()
+modules_map[st.session_state.current_nav][1]()

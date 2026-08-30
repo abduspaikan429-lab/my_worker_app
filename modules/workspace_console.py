@@ -52,19 +52,18 @@ def render():
     
     # 🚨 逻辑异常区
     if anomalies:
-        st.markdown(f"### 🚨 逻辑异常与漏项检查 ({len(anomalies)})")
-        for task in anomalies:
-            st.error(f"**{task['name']}** ({task['status']}) - **异常**: {task['anomaly']}")
-            if st.button("进入处理", key=f"anomaly_{task['worker_id']}_{task['action']}", help="跳转到对应人员处理", type="primary"):
-                handle_task_click(task['type'], task['worker_id'])
-                st.rerun()
+        with st.expander(f"🚨 逻辑异常与漏项检查 ({len(anomalies)})", expanded=True):
+            for task in anomalies:
+                st.error(f"**{task['name']}** ({task['status']}) - **异常**: {task['anomaly']}")
+                if st.button("进入处理", key=f"anomaly_{task['worker_id']}_{task['action']}", help="跳转到对应人员处理", type="primary"):
+                    handle_task_click(task['type'], task['worker_id'])
+                    st.rerun()
         st.markdown("<br>", unsafe_allow_html=True)
 
     st.markdown("### 📋 今日待办清单")
     
     # 🔴 我现在需要处理
-    with st.container():
-        st.markdown(f"#### 🔴 我现在需要处理 ({len(tasks_red)})")
+    with st.expander(f"🔴 我现在需要处理 ({len(tasks_red)})", expanded=True):
         if not tasks_red:
             st.info("太棒了！当前没有需要您亲自处理的紧急待办事项。")
         else:
@@ -86,8 +85,7 @@ def render():
     st.markdown("<br>", unsafe_allow_html=True)
 
     # 🟠 等别人处理
-    with st.container():
-        st.markdown(f"#### 🟠 等别人处理 ({len(tasks_orange)})")
+    with st.expander(f"🟠 等别人处理 ({len(tasks_orange)})", expanded=False):
         if not tasks_orange:
             st.info("当前没有等待他人处理的事项。")
         else:
@@ -109,8 +107,7 @@ def render():
     st.markdown("<br>", unsafe_allow_html=True)
 
     # 🟡 等官方系统/数据
-    with st.container():
-        st.markdown(f"#### 🟡 等官方系统/数据 ({len(tasks_yellow)})")
+    with st.expander(f"🟡 等官方系统/数据 ({len(tasks_yellow)})", expanded=False):
         if not tasks_yellow:
             st.info("当前没有需要同步或等待官方系统的特殊事项。")
         else:

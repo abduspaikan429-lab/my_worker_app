@@ -12,11 +12,10 @@ DEFAULT_OFFBOARDING_FILE = BASE_DIR / "data" / "offboarding_data.json"
 DEFAULT_HISTORY_FILE = BASE_DIR / "data" / "offboarding_history.json"
 
 OFFBOARDING_STEPS = [
-    "1. 工人小灵光发起",
+    "1. 工人在百工聚发起离场",
     "2. 班组长确认",
     "3. 劳资员（我）确认",
-    "4. 提交财务发放",
-    "5. 财务发放完成",
+    "4. 财务发放完成",
 ]
 OFF_PAPER = ["收纸质离场结算单", "归档身份证+结算单照片", "结清证明上传"]
 OFF_SYSTEM = ["处理离场月报", "更新花名册", "更新签到表"]

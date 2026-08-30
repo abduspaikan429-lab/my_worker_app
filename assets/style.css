@@ -68,7 +68,7 @@ div[data-testid="stAppViewContainer"] > section > div.block-container,
 }
 
 [data-testid="stHeader"] {
-    display: none !important;
+    background: transparent !important;
 }
 
 /* === 2. 侧边栏 === */
