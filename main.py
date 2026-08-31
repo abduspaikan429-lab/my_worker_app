@@ -2,7 +2,7 @@
 import streamlit as st
 import pandas as pd
 from utils.style_loader import load_css
-from modules import info_merge, pro_data_processing, onboarding_pipeline, offboarding_pipeline, report_generator, daily_assistant, attendance_payroll, personnel_dashboard, workspace_console
+from modules import info_merge, pro_data_processing, onboarding_pipeline, offboarding_pipeline, report_generator, attendance_payroll, personnel_dashboard, workspace_console
 from modules.master_data import load_master_df
 from modules.offboarding_pipeline import load_offboarding_history
 
@@ -99,14 +99,6 @@ MODULES_CONFIG = {
         "gradient": "linear-gradient(135deg, #FDF2F8 0%, #FCE7F3 100%)",
         "description": "花名册快速提取与变更月报一键生成",
     },
-    "daily": {
-        "name": "微信办公辅助",
-        "icon": "",
-        "material_icon": ":material/chat_bubble:",
-        "color": "#FB923C",
-        "gradient": "linear-gradient(135deg, #FFF7ED 0%, #FEF3C7 100%)",
-        "description": "考勤日报生成、闪念备忘与疑问管理",
-    },
     "attendance_payroll": {
         "name": "考勤对账与工资结算",
         "icon": "",
@@ -162,7 +154,73 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-# 4. 侧边栏 - 装饰性标题
+# 4. 侧边栏
+if "current_nav" not in st.session_state:
+    st.session_state.current_nav = "workspace_console"
+if "pro_data_tool_index" not in st.session_state:
+    st.session_state.pro_data_tool_index = 0
+
+is_pro_active = (st.session_state.current_nav == "pro_data")
+
+def select_pro_tool(idx):
+    st.session_state.current_nav = "pro_data"
+    st.session_state.pro_data_tool_index = idx
+    st.session_state._nav_radio = None
+    tool_keys = [
+        "① 檩条分轴合并与重量计算",
+        "② 檩条下料单自动合计与汇总",
+        "③ 扩展专业工具 (预留)",
+    ]
+    if idx < len(tool_keys):
+        st.session_state._pro_data_radio = tool_keys[idx]
+
+# 4.1 专业功能独立板块（置于“劳务管理平台”上方）
+st.sidebar.markdown("""
+<div class="sidebar-pro-badge-header">
+    <span class="material-symbols-outlined" style="font-size: 14px; color: #818CF8;">tune</span>
+    <span style="font-size: 12px; font-weight: 700; color: #64748B;">专业功能</span>
+</div>
+""", unsafe_allow_html=True)
+
+pro_col1, pro_col2, pro_col3 = st.sidebar.columns([1, 1, 1])
+
+with pro_col1:
+    b1_active = is_pro_active and st.session_state.pro_data_tool_index == 0
+    st.button(
+        "①",
+        key="btn_pro_tool_1",
+        use_container_width=True,
+        type="primary" if b1_active else "secondary",
+        on_click=select_pro_tool,
+        args=(0,),
+        help="① 檩条分轴合并与重量计算"
+    )
+
+with pro_col2:
+    b2_active = is_pro_active and st.session_state.pro_data_tool_index == 1
+    st.button(
+        "②",
+        key="btn_pro_tool_2",
+        use_container_width=True,
+        type="primary" if b2_active else "secondary",
+        on_click=select_pro_tool,
+        args=(1,),
+        help="② 檩条下料单自动合计与汇总"
+    )
+
+with pro_col3:
+    b3_active = is_pro_active and st.session_state.pro_data_tool_index == 2
+    st.button(
+        "③",
+        key="btn_pro_tool_3",
+        use_container_width=True,
+        type="primary" if b3_active else "secondary",
+        on_click=select_pro_tool,
+        args=(2,),
+        help="③ 扩展专业工具 (预留)"
+    )
+
+# 4.2 侧边栏 - 装饰性标题（劳务管理平台）
 st.sidebar.markdown("""
 <div class="sidebar-title-deco">
     <span>劳务管理平台</span>
@@ -170,20 +228,27 @@ st.sidebar.markdown("""
 """, unsafe_allow_html=True)
 
 # 5. 模块导航路由
-if "current_nav" not in st.session_state:
-    st.session_state.current_nav = "workspace_console"
-
 modules_map = {
     "workspace_console": (":material/dashboard: 今日办公中控台", workspace_console.render),
     "personnel_dashboard": (":material/bar_chart: 人员变更面板", personnel_dashboard.render),
     "info_merge": (":material/folder_managed: 档案魔法整合", info_merge.render),
-    "pro_data": (":material/analytics: 专业数据处理", pro_data_processing.render),
     "onboarding": (":material/how_to_reg: 进场流水线追踪", onboarding_pipeline.render),
     "offboarding": (":material/flight_takeoff: 离场流水线追踪", offboarding_pipeline.render),
     "report": (":material/contact_page: 花名册与报表导出", report_generator.render),
-    "daily": (":material/chat_bubble: 微信日常办公辅助", daily_assistant.render),
     "attendance_payroll": (":material/payments: 考勤对账与工资结算", attendance_payroll.render),
+    "pro_data": (":material/analytics: 专业数据处理", pro_data_processing.render),
 }
+
+# 侧边栏常规主导航项（7项高频劳务管理功能，不占用空间放置低频工具）
+main_nav_keys = [
+    "workspace_console",
+    "personnel_dashboard",
+    "info_merge",
+    "onboarding",
+    "offboarding",
+    "report",
+    "attendance_payroll",
+]
 
 # 侧边栏导航分组
 st.sidebar.markdown("""
@@ -197,21 +262,24 @@ st.sidebar.markdown("""
 """, unsafe_allow_html=True)
 
 def on_nav_change():
-    st.session_state.current_nav = st.session_state._nav_radio
+    if st.session_state._nav_radio is not None:
+        st.session_state.current_nav = st.session_state._nav_radio
 
-nav_keys = list(modules_map.keys())
-if st.session_state.current_nav not in nav_keys:
-    st.session_state.current_nav = "workspace_console"
+radio_index = main_nav_keys.index(st.session_state.current_nav) if st.session_state.current_nav in main_nav_keys else None
 
 st.sidebar.radio(
     "功能导航",
-    nav_keys,
+    main_nav_keys,
     format_func=lambda k: modules_map[k][0],
     label_visibility="collapsed",
-    index=nav_keys.index(st.session_state.current_nav),
+    index=radio_index,
     key="_nav_radio",
     on_change=on_nav_change
 )
 
 # 6. 执行选中的模块
-modules_map[st.session_state.current_nav][1]()
+if st.session_state.current_nav in modules_map:
+    modules_map[st.session_state.current_nav][1]()
+else:
+    workspace_console.render()
+

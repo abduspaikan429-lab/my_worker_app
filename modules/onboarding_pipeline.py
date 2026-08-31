@@ -151,6 +151,8 @@ def get_dialog_decorator():
 
 @get_dialog_decorator()("进场手续办理面板")
 def worker_dialog(worker_id):
+    if "onboarding_data" not in st.session_state:
+        st.session_state.onboarding_data = load_data()
     if worker_id not in st.session_state.onboarding_data:
         st.rerun()
         return
@@ -214,6 +216,8 @@ def worker_dialog(worker_id):
         if worker_id in st.session_state.onboarding_data:
             del st.session_state.onboarding_data[worker_id]
             st.rerun()
+            
+    save_data_if_changed()
 
 def render():
     if "onboarding_data" not in st.session_state:
