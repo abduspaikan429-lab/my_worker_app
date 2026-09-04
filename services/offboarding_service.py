@@ -148,7 +148,19 @@ class OffboardingService:
                 self.archive_offboarding(record_id, records[record_id])
             self.save_records(records)
 
-    # Remove update_status
+    def update_status(self, record_id: str, steps_data: Dict[str, bool]) -> Dict[str, Any]:
+        """Update steps and auto-archive if all items are completed."""
+        records = self.get_records()
+        if record_id not in records:
+            raise ValueError(f"Worker record '{record_id}' not found")
+        if "steps" not in records[record_id]:
+            records[record_id]["steps"] = {}
+        records[record_id]["steps"].update(steps_data)
+        completed, total = self.get_progress(records[record_id])
+        if completed == total:
+            self.archive_offboarding(record_id, records[record_id])
+        self.save_records(records)
+        return records[record_id]
 
     def load_history(self) -> List[Dict[str, Any]]:
         """Load offboarding history records."""

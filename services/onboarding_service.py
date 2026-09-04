@@ -174,6 +174,10 @@ class OnboardingService:
                 records[record_id]["completed_at"] = str(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             self.save_records(records)
 
+    def complete_onboarding(self, record_id: str) -> None:
+        """Complete onboarding record (alias for mark_completed)."""
+        self.mark_completed(record_id, True)
+
     def get_onboarding_df(self) -> pd.DataFrame:
         """
         将进场流程中（进场流水线）的人员记录转换为标准 DataFrame。

@@ -200,13 +200,15 @@ def worker_dialog(worker_id):
     if new_c == new_t and new_t > 0 and data.get("status") != "completed":
         st.markdown("<hr style='margin: 15px 0;'/>", unsafe_allow_html=True)
         st.success("🎉 该人员当前展示的手续均已完成！")
-        if st.button("归档此记录", type="primary", use_container_width=True):
+        if st.button("🎉 归档并同步至主表 (data/master)", type="primary", use_container_width=True):
             onboarding_service.mark_completed(worker_id, True)
             st.rerun()
 
     if data.get("status") == "completed":
         st.markdown("<hr style='margin: 15px 0;'/>", unsafe_allow_html=True)
         st.info(f"✅ 该记录已于 {data.get('completed_at', '')} 归档。")
+        if data.get("synced_to_master"):
+            st.caption(f"🔄 档案已于 {data.get('last_synced_at', '')} 同步至项目主表 (data/master)")
         if st.button("撤销归档 (恢复办理)", use_container_width=True):
             onboarding_service.mark_completed(worker_id, False)
             st.rerun()
@@ -329,7 +331,7 @@ def render():
             st.markdown("<div style='margin-top: 16px;'></div>", unsafe_allow_html=True)
 
             # 2. 搜索与操作工具栏
-            f1, f2 = st.columns([3, 1])
+            f1, f2, f3 = st.columns([2.5, 1.2, 1.2])
             with f1:
                 search_query = st.text_input(
                     "搜索姓名或班组",
@@ -337,6 +339,14 @@ def render():
                     label_visibility="collapsed"
                 )
             with f2:
+                if st.button(":material/sync: 同步至项目主表", use_container_width=True, help="将进场流水线人员档案同步至项目主表"):
+                    sync_res = onboarding_service.sync_to_master()
+                    if not sync_res.get("error"):
+                        st.success(f"已同步主表：新增 {sync_res.get('added', 0)} 人，更新 {sync_res.get('updated', 0)} 人！")
+                        st.rerun()
+                    else:
+                        st.info(sync_res.get("error"))
+            with f3:
                 st.download_button(
                     label=":material/download: 导出进度 Excel",
                     data=export_to_excel(),

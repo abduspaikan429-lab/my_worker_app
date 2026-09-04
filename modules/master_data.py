@@ -14,6 +14,7 @@ from typing import Any
 
 import pandas as pd
 
+from repositories.shadow_worker_repository import ShadowWorkerRepository
 from repositories.worker_repository import JsonWorkerRepository
 from services.worker_service import WorkerService
 
@@ -24,7 +25,8 @@ HISTORY_DIR = Path("data/master_history")
 ID_COL = "身份证号"
 
 json_repository = JsonWorkerRepository(file_path=lambda: STATE_FILE)
-worker_service = WorkerService(repository=json_repository)
+shadow_repository = ShadowWorkerRepository(json_repo=json_repository)
+worker_service = WorkerService(repository=shadow_repository)
 
 
 def clean_value(value: Any) -> str:
@@ -212,8 +214,29 @@ def preview_update(current_df: pd.DataFrame | None, incoming_df: pd.DataFrame | 
     }
 
 
+def _write_master_excel(df: pd.DataFrame) -> None:
+    """将最新全量人员主表同步写入 data/master 目录下的 Excel 文件中，保持磁盘物理文件与系统状态实时一致。"""
+    if df is None or df.empty:
+        return
+    try:
+        MASTER_DIR.mkdir(parents=True, exist_ok=True)
+        target_path = MASTER_DIR / "全量劳务人员主表.xlsx"
+        with pd.ExcelWriter(target_path, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="全量人员主表")
+
+        for f in MASTER_DIR.glob("*.xlsx"):
+            if f.name != "全量劳务人员主表.xlsx" and not f.name.startswith("~$"):
+                try:
+                    with pd.ExcelWriter(f, engine="openpyxl") as writer:
+                        df.to_excel(writer, index=False, sheet_name="劳务人员汇总表")
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"Error writing master Excel: {e}")
+
+
 def commit_update(incoming_df: pd.DataFrame, source_files: list[str] | None = None) -> dict[str, Any]:
-    """保存主表新版本和本次变化快照。"""
+    """保存主表新版本和本次变化快照，并同步更新 data/master 物理 Excel 文件。"""
     preview = preview_update(load_master_df(), incoming_df)
     if preview.get("error"):
         return preview
@@ -242,10 +265,177 @@ def commit_update(incoming_df: pd.DataFrame, source_files: list[str] | None = No
     (HISTORY_DIR / f"{version}.json").write_text(
         json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    _write_master_excel(current_df)
 
     preview["version"] = version
     preview["updated_at"] = now.isoformat(timespec="seconds")
     preview["changes"] = changes
     return preview
+
+
+def upsert_master_workers(
+    workers_list: list[dict[str, Any]], source: str = "onboarding"
+) -> dict[str, Any]:
+    """
+    增量插入或更新项目主表中的人员档案（支持进场流程归档人员与手动录入人员的自动同步）。
+    写入 master_state.json，同步更新 SQLite 镜像，并保存版本快照。
+    """
+    if not workers_list:
+        return {
+            "added": 0,
+            "updated": 0,
+            "total": 0,
+            "version": "",
+            "error": "工人列表为空",
+        }
+
+    current_df = load_master_df()
+    state = _read_state()
+    existing_rows = state.get("rows") or []
+
+    # 建立现有主表记录的索引查找表
+    # 1. 身份证号索引
+    id_map: dict[str, int] = {}
+    for idx, r in enumerate(existing_rows):
+        sid = clean_value(r.get(ID_COL, ""))
+        if sid and len(sid) >= 15:
+            id_map[sid] = idx
+
+    # 2. 姓名+班组 / 姓名 索引
+    name_team_map: dict[str, int] = {}
+    name_map: dict[str, int] = {}
+    for idx, r in enumerate(existing_rows):
+        nm = clean_value(r.get("姓名", ""))
+        tm = clean_value(r.get("班组", ""))
+        if nm and tm:
+            name_team_map[f"{nm}_{tm}"] = idx
+        if nm and nm not in name_map:
+            name_map[nm] = idx
+
+    added_count = 0
+    updated_count = 0
+    new_records = []
+    updated_records = []
+
+    # 基础列集合
+    existing_cols = (
+        list(current_df.columns)
+        if not current_df.empty
+        else [
+            "姓名",
+            "班组",
+            "身份证号",
+            "手机号",
+            "工种",
+            "结算单价/标准",
+            "工资卡号",
+            "开户银行",
+            "进场日期",
+            "在场/进退场状态",
+            "人员类型",
+            "分包/所属企业",
+            "合同签订状态",
+        ]
+    )
+
+    for raw_worker in workers_list:
+        if not isinstance(raw_worker, dict):
+            continue
+        w = {k: clean_value(v) for k, v in raw_worker.items()}
+        nm = w.get("姓名", "")
+        if not nm:
+            continue
+        sid = w.get("身份证号", "")
+        tm = w.get("班组", "")
+
+        # 统一同义字段
+        if "银行卡号" in w and not w.get("工资卡号"):
+            w["工资卡号"] = w["银行卡号"]
+        if "日薪" in w and not w.get("结算单价/标准") and w["日薪"]:
+            wage_val = w["日薪"]
+            w["结算单价/标准"] = (
+                f"基本工资：{wage_val}元/天"
+                if not str(wage_val).endswith("元/天")
+                else str(wage_val)
+            )
+
+        # 查找现有记录（身份证优先，其次 姓名+班组，最后 姓名）
+        target_idx = None
+        if sid and len(sid) >= 15 and sid in id_map:
+            target_idx = id_map[sid]
+        elif f"{nm}_{tm}" in name_team_map:
+            target_idx = name_team_map[f"{nm}_{tm}"]
+        elif nm in name_map:
+            target_idx = name_map[nm]
+
+        if target_idx is not None:
+            # 更新已有记录（增量更新非空字段）
+            target = existing_rows[target_idx]
+            has_diff = False
+            for k, v in w.items():
+                if v and target.get(k) != v:
+                    target[k] = v
+                    has_diff = True
+            if has_diff:
+                updated_count += 1
+                updated_records.append(target)
+        else:
+            # 新增人员记录
+            new_row = {col: "" for col in existing_cols}
+            new_row.update(w)
+            if not new_row.get("在场/进退场状态"):
+                new_row["在场/进退场状态"] = "在场"
+            if not new_row.get("人员类型"):
+                new_row["人员类型"] = "劳务人员"
+            if not new_row.get("合同签订状态"):
+                new_row["合同签订状态"] = "已签订"
+
+            existing_rows.append(new_row)
+            added_count += 1
+            new_records.append(new_row)
+
+            # 更新索引
+            new_idx = len(existing_rows) - 1
+            if sid and len(sid) >= 15:
+                id_map[sid] = new_idx
+            if nm and tm:
+                name_team_map[f"{nm}_{tm}"] = new_idx
+            if nm and nm not in name_map:
+                name_map[nm] = new_idx
+
+    now = datetime.now()
+    version = now.strftime("%Y%m%d_%H%M%S_%f")
+    changes = {
+        "new_rows": new_records,
+        "updated_rows": updated_records,
+        "missing_from_import": [],
+        "source_files": [f"{source}_sync"],
+    }
+    state["version"] = version
+    state["updated_at"] = now.isoformat(timespec="seconds")
+    state["rows"] = existing_rows
+    state["last_changes"] = changes
+
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    worker_service.save_workers(existing_rows)
+    (HISTORY_DIR / f"{version}.json").write_text(
+        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    _write_master_excel(pd.DataFrame(existing_rows))
+
+    return {
+        "added": added_count,
+        "updated": updated_count,
+        "total": len(existing_rows),
+        "version": version,
+        "updated_at": state["updated_at"],
+        "changes": changes,
+        "error": "",
+    }
+
 
 

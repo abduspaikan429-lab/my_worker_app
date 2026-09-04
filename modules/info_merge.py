@@ -1,4 +1,6 @@
 # modules/info_merge.py
+from __future__ import annotations
+from typing import Any, Optional
 import streamlit as st
 import pandas as pd
 from io import BytesIO
@@ -6,6 +8,7 @@ import openpyxl
 from openpyxl.styles import Font, Alignment, Border, Side
 from openpyxl.drawing.image import Image as OpenpyxlImage
 from openpyxl.utils import get_column_letter
+from datetime import datetime
 import os
 from modules import archive_export
 from modules.archive_export import extract_cscec2_archive
@@ -75,19 +78,79 @@ def process_and_merge(files_a, files_b):
             return None
         
         mapping = {
+            # 合同
             '劳动合同': '合同签订状态',
             '合同签订': '合同签订状态',
+            '合同状态': '合同签订状态',
+            
+            # 工资/日薪
             '工资标准': '结算单价/标准',
             '结算单价(元)': '结算单价/标准',
+            '结算单价': '结算单价/标准',
+            '日薪': '结算单价/标准',
+            '日薪(元)': '结算单价/标准',
+            '日薪标准': '结算单价/标准',
+            '日工资': '结算单价/标准',
+            '基本工资': '结算单价/标准',
+            '单价': '结算单价/标准',
+            '工价': '结算单价/标准',
+            
+            # 银行与卡号
             '银行': '开户银行',
             '工资卡银行': '开户银行',
-            '家庭住址': '详细地址',
+            '开户行': '开户银行',
+            '开户支行': '开户银行',
+            '发卡行': '开户银行',
+            '银行名称': '开户银行',
+            '银行卡': '银行卡号',
+            '银行卡号': '银行卡号',
+            '工资卡': '工资卡号',
+            '工资卡号': '工资卡号',
+            '银行账号': '银行卡号',
+            '卡号': '银行卡号',
+            
+            # 电话
+            '手机': '手机号',
+            '手机号码': '手机号',
+            '联系电话': '手机号',
+            '电话': '手机号',
+            '联系方式': '手机号',
+            
+            # 身份证
+            '身份证': '身份证号',
+            '身份证号码': '身份证号',
+            '证件号码': '身份证号',
+            '证件号': '身份证号',
+            
+            # 班组与工种
+            '所属班组': '班组',
+            '班组名称': '班组',
+            '施工班组': '班组',
+            '工种名称': '工种',
+            '岗位': '工种',
+            '工种/岗位': '工种',
+            
+            # 企业/分包
             '分包单位': '分包/所属企业',
             '所属企业': '分包/所属企业',
+            '劳务公司': '分包/所属企业',
+            '劳务分包单位': '分包/所属企业',
+            '所属公司': '分包/所属企业',
+            '单位名称': '分包/所属企业',
+            
+            # 进退场与日期
             '进退场状态': '在场/进退场状态',
             '在场情况': '在场/进退场状态',
+            '在场状态': '在场/进退场状态',
+            '进场时间': '进场日期',
+            '入场日期': '进场日期',
+            '入场时间': '进场日期',
+            
+            # 人员类型与住址
             '工人类型': '人员类型',
-            '所属班组': '班组',
+            '家庭住址': '详细地址',
+            '住址': '详细地址',
+            '籍贯': '详细地址',
         }
         
         for file in file_list:
@@ -100,6 +163,13 @@ def process_and_merge(files_a, files_b):
                 if '身份证号' in df.columns:
                     df['身份证号'] = df['身份证号'].apply(clean_val)
                     df = df[df['身份证号'].str.len() >= 15]
+                
+                # 同义字段互补
+                if '银行卡号' in df.columns and '工资卡号' not in df.columns:
+                    df['工资卡号'] = df['银行卡号']
+                elif '工资卡号' in df.columns and '银行卡号' not in df.columns:
+                    df['银行卡号'] = df['工资卡号']
+
                 all_dfs.append(df)
         
         if not all_dfs:
@@ -164,9 +234,9 @@ def process_and_merge(files_a, files_b):
         # 1. 个人基础信息
         "姓名", "性别", "民族", "年龄", "身份证号", "手机号", "详细地址", "家庭住址",
         # 2. 进场与班组信息
-        "班组", "工种", "人员类型", "进场日期", "进场时间", "在场状态", "进退场状态", "在场/进退场状态",
+        "班组", "工种", "人员类型", "进场日期", "进场时间", "在场状态", "进退场状态", "在场/进退场状态", "分包/所属企业",
         # 3. 银行与发薪信息
-        "银行卡号", "工资卡号", "开户银行",
+        "结算单价/标准", "银行卡号", "工资卡号", "开户银行",
         # 4. 合同与合规信息
         "劳动合同编号", "合同签订状态", "劳动合同", "是否在市建委"
     ]
@@ -176,6 +246,7 @@ def process_and_merge(files_a, files_b):
     ordered_df = final_df[existing_cols + remaining_cols]
 
     return ordered_df, len(set_a), overlap_count, len(set_b)
+
 
 def generate_excel(df):
     """
@@ -325,7 +396,7 @@ def render():
         <span class="header-emoji">📋</span>
         <div class="header-text">
             <h2>劳务人员多系统档案自动整合</h2>
-            <p>将多平台导出的劳务档案标准化清洗、去重与合并输出</p>
+            <p>将多平台导出的劳务档案标准化清洗、去重与合并输出，并自动同步至项目主表</p>
         </div>
     </div>
     <div class="color-strip"></div>
@@ -339,7 +410,7 @@ def render():
             <span class="step-num">2</span>
             <span>自动清洗与合并</span>
             <span class="step-num">3</span>
-            <span>预览与导出</span>
+            <span>自动同步主表与导出</span>
         </div>
     """, unsafe_allow_html=True)
 
@@ -373,15 +444,25 @@ def render():
 
     try:
         if process_btn:
-            with st.spinner("数据清洗中..."):
-                result_df, count_a, overlap_count, count_b = process_and_merge(files_a, files_b)
+            with st.spinner("数据清洗与主表同步中..."):
+                raw_merged_df, count_a, overlap_count, count_b = process_and_merge(files_a, files_b)
 
-            if result_df is None or result_df.empty:
+            if raw_merged_df is None or raw_merged_df.empty:
                 st.warning("未能提取到有效的劳务人员数据。")
                 return
-            st.session_state.merged_df = result_df
+
             st.session_state.info_merge_counts = (count_a, overlap_count, count_b)
-            st.session_state.master_sync_result = None
+
+            # 自动全量写入/同步项目人员主表 (data/master_state.json & worker.db & 版本快照)
+            file_names = [getattr(f, 'name', '') for f in (files_a or []) + (files_b or [])]
+            saved = commit_update(raw_merged_df, source_files=file_names)
+            st.session_state.master_sync_result = saved
+            
+            if saved.get('error'):
+                st.error(f"主表同步失败: {saved['error']}")
+                st.session_state.merged_df = raw_merged_df
+            else:
+                st.session_state.merged_df = saved['merged_df']
 
         result_df = st.session_state.get('merged_df')
         if result_df is None or result_df.empty:
@@ -389,51 +470,36 @@ def render():
             return
         count_a, overlap_count, count_b = st.session_state.get('info_merge_counts', (0, 0, 0))
 
-        # 官网导出结果先进入预览，确认后才写入项目人员主表。
-        master_preview = preview_update(load_master_df(), result_df)
-        if master_preview.get('error'):
-            st.error(master_preview['error'])
-        else:
-            new_count = len(master_preview['new_rows'])
-            updated_count = len(master_preview['updated_rows'])
-            missing_count = len(master_preview['missing_from_import'])
-            st.markdown("### 官网数据同步到项目主表")
-            st.markdown(
-                '<div class="hint-box">进场流程只负责新人员手续跟踪。只有智慧护薪和三局系统正式建档后，才在这里同步人员主表。空白官网字段不会覆盖主表已有资料。</div>',
-                unsafe_allow_html=True,
-            )
+        # 展示主表同步结果与概览
+        sync_res = st.session_state.get('master_sync_result')
+        if sync_res and not sync_res.get('error'):
+            new_rows_list = sync_res.get('new_rows', [])
+            updated_rows_list = sync_res.get('updated_rows', [])
+            new_count = len(new_rows_list)
+            updated_count = len(updated_rows_list)
+            total_master_count = len(result_df)
+
+            st.markdown("### 官网数据已同步至项目主表 (data/master)")
+            st.success(f"🎉 档案智能清洗与合并完成，**已全量自动同步至项目主表（data/master）**！本次主表新增 **{new_count}** 人，信息更新 **{updated_count}** 人，当前项目在册总人数 **{total_master_count}** 人。")
+            st.info("💡 **逻辑已闭环**：主表已拥有最新全量人员信息（含身份证、银行卡及日薪），您可直接在下方复制报表数据，或直接前往【考勤与工资计算】进行工资核算！")
+
             sm1, sm2, sm3, sm4 = st.columns(4)
-            sm1.metric("本次新增", f"{new_count} 人")
-            sm2.metric("资料变化", f"{updated_count} 人")
-            sm3.metric("主表同步后", f"{len(master_preview['merged_df'])} 人")
-            sm4.metric("本次未出现", f"{missing_count} 人")
-            if missing_count:
-                st.caption("本次官网导出中未出现的人员不会被删除，系统只提示，不做破坏性处理。")
+            sm1.metric("本次新增入库", f"{new_count} 人")
+            sm2.metric("档案信息更新", f"{updated_count} 人")
+            sm3.metric("主表当前总人数", f"{total_master_count} 人")
+            sm4.metric("双系统重合人数", f"{overlap_count} 人")
 
             if new_count or updated_count:
-                with st.expander("预览本次会写入主表的人员变化", expanded=True):
+                with st.expander("查看本次写入主表的人员变化明细", expanded=False):
                     if new_count:
-                        st.markdown("**新增人员**")
-                        st.dataframe(master_preview['new_rows'], use_container_width=True, hide_index=True)
+                        st.markdown(f"**新增人员 ({new_count} 人)**")
+                        st.dataframe(pd.DataFrame(new_rows_list), use_container_width=True, hide_index=True)
                     if updated_count:
-                        st.markdown("**信息变化人员**")
-                        st.dataframe(master_preview['updated_rows'], use_container_width=True, hide_index=True)
-                if st.button("确认同步，并生成新增人员直贴数据", type="primary", use_container_width=True, key="confirm_master_sync"):
-                    saved = commit_update(
-                        result_df,
-                        source_files=[getattr(f, 'name', '') for f in (files_a or []) + (files_b or [])],
-                    )
-                    if saved.get('error'):
-                        st.error(saved['error'])
-                    else:
-                        st.session_state.merged_df = saved['merged_df']
-                        st.session_state.master_sync_result = saved
-                        st.success(f"主表已同步。新增 {len(saved['new_rows'])} 人，资料变化 {len(saved['updated_rows'])} 人。")
-                        st.info("💡 提示：同步完成后，请前往【今日办公中控台】查看。此前处于“等官方数据”状态的人员，其任务状态将被自动更新推进！")
+                        st.markdown(f"**信息变化人员 ({updated_count} 人)**")
+                        st.dataframe(pd.DataFrame(updated_rows_list), use_container_width=True, hide_index=True)
 
-            sync_res = st.session_state.get('master_sync_result')
-            if sync_res and sync_res.get('new_rows'):
-                sync_new_df = pd.DataFrame(sync_res['new_rows'])
+            if new_count > 0:
+                sync_new_df = pd.DataFrame(new_rows_list)
                 with st.expander(f"✨ 立即复制本次新进场人员直贴数据 ({len(sync_new_df)} 人) - 免下载直贴 Excel", expanded=True):
                     st.markdown('<div class="hint-box">点击下方各表格选项卡，一键复制代码框内容后直接粘贴到您本地已有的 Excel 表格末尾即可（身份证号与银行卡号等已做纯文本防科学计数法保护）。</div>', unsafe_allow_html=True)
                     s_tab1, s_tab2, s_tab3, s_tab4 = st.tabs([
@@ -450,9 +516,7 @@ def render():
                         render_copy_grid("花名册新增行", extract_roster(sync_new_df), "im_sync_roster")
                     with s_tab4:
                         render_copy_grid("变更月报新增行", extract_monthly_report(sync_new_df), "im_sync_monthly")
-            elif st.session_state.get('master_sync_result') and not (new_count or updated_count):
-                saved = st.session_state.master_sync_result
-                st.success(f"最近一次同步完成：新增 {len(saved.get('new_rows', []))} 人，资料变化 {len(saved.get('updated_rows', []))} 人。")
+
 
         # 计算重合率
         total_unique = len(result_df)

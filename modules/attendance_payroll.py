@@ -632,12 +632,14 @@ def _load_master_data():
             df[col] = df[col].fillna('').astype(str).str.strip()
         
         def extract_wage(val):
-            if pd.isna(val): return None
-            match = re.search(r'(\d+)', str(val))
+            if pd.isna(val) or not str(val).strip():
+                return None
+            match = re.search(r'(\d+(?:\.\d+)?)', str(val))
             return float(match.group(1)) if match else None
 
-        if '结算单价/标准' in df.columns:
-            df['提取日薪'] = df['结算单价/标准'].apply(extract_wage)
+        wage_col = next((c for c in ['结算单价/标准', '日薪', '日工资', '工资标准', '单价', '基本工资', '提取日薪'] if c in df.columns), None)
+        if wage_col:
+            df['提取日薪'] = df[wage_col].apply(extract_wage)
         else:
             df['提取日薪'] = None
             
@@ -651,49 +653,92 @@ def _load_master_data():
         return None
 
 
+def _is_empty_val(v):
+    if v is None or pd.isna(v):
+        return True
+    s = str(v).strip()
+    return s == '' or s.lower() in ['nan', 'none', 'null', '<na>', '0', '0.0']
+
+
 def enrich_with_master(final_df):
-    """按身份证号补齐主数据；身份证号缺失时仅对唯一姓名做安全兜底。"""
+    """
+    按主表权威数据补齐人员档案与日薪：
+    1. 身份证号精确匹配（优先，支持大小写与去空格）
+    2. 姓名 + 班组 匹配
+    3. 姓名 匹配（唯一姓名优先，非唯一取首条保底）
+    主表作为最终权威来源，提取日薪、身份证号、银行卡等自动以主表最新数据为准。
+    """
     master = _load_master_data()
     if final_df is None or final_df.empty or master is None or master.empty:
         return final_df.copy() if isinstance(final_df, pd.DataFrame) else pd.DataFrame()
 
     out = final_df.copy()
-    for col in ['身份证号', '姓名']:
-        if col in out.columns:
-            out[col] = out[col].fillna('').astype(str).str.strip()
-    master = master.copy()
-    master['身份证号'] = master.get('身份证号', '').fillna('').astype(str).str.strip()
-    master['姓名'] = master.get('姓名', '').fillna('').astype(str).str.strip()
 
-    master_cols = [c for c in [
-        '姓名', '性别', '身份证号', '手机号', '班组', '工种', '人员类型',
+    # 建立主表索引
+    id_map = {}
+    for _, r in master.iterrows():
+        sid = str(r.get('身份证号', '')).strip().upper()
+        if sid and len(sid) >= 15:
+            id_map[sid] = r.to_dict()
+
+    name_team_map = {}
+    for _, r in master.iterrows():
+        nm = str(r.get('姓名', '')).strip()
+        tm = str(r.get('班组', '')).strip()
+        if nm and tm:
+            name_team_map[f"{nm}_{tm}"] = r.to_dict()
+
+    unique_names = master[master['姓名'].ne('')].groupby('姓名').filter(lambda x: len(x) == 1)
+    name_map = {str(r.get('姓名', '')).strip(): r.to_dict() for _, r in unique_names.iterrows()}
+
+    all_name_map = {}
+    for _, r in master.iterrows():
+        nm = str(r.get('姓名', '')).strip()
+        if nm and nm not in all_name_map:
+            all_name_map[nm] = r.to_dict()
+
+    fields_to_enrich = [
+        '身份证号', '姓名', '性别', '手机号', '班组', '工种', '人员类型',
         '分包/所属企业', '工资卡号', '开户银行', '提取日薪', '项目全称'
-    ] if c in master.columns]
-    lookup = master[master_cols].copy()
-    lookup = lookup.rename(columns={c: f'主表_{c}' for c in master_cols if c not in ['身份证号']})
-    out = out.merge(lookup, on='身份证号', how='left')
+    ]
 
-    # 主表是最终权威来源；考勤文件只用于三方天数和异常核对。
-    for col in ['姓名', '性别', '手机号', '班组', '工种', '分包/所属企业', '工资卡号', '开户银行', '提取日薪', '项目全称']:
-        master_col = f'主表_{col}'
-        if master_col in out.columns:
-            if col not in out.columns:
-                out[col] = ''
-            out[col] = out[col].replace('', pd.NA).fillna(out[master_col])
-            out.drop(columns=[master_col], inplace=True)
+    for col in fields_to_enrich:
+        if col not in out.columns:
+            out[col] = ''
 
-    # 只对身份证号确实无法匹配、且主表姓名唯一的人员进行姓名兜底。
-    if '姓名' in out.columns and '姓名' in master.columns:
-        unique_name = master[master['姓名'].ne('')].groupby('姓名').filter(lambda x: len(x) == 1)
-        name_map = unique_name.set_index('姓名').to_dict('index')
-        for idx, row in out.iterrows():
-            if row.get('身份证号', '') in master['身份证号'].values:
-                continue
-            candidate = name_map.get(str(row.get('姓名', '')).strip())
-            if candidate:
-                for col in ['性别', '手机号', '班组', '工种', '分包/所属企业', '工资卡号', '开户银行', '提取日薪', '项目全称']:
-                    if (not str(row.get(col, '')).strip()) and candidate.get(col):
-                        out.at[idx, col] = candidate[col]
+    for idx in range(len(out)):
+        sid = str(out.at[idx, '身份证号'] if '身份证号' in out.columns else '').strip().upper()
+        nm = str(out.at[idx, '姓名'] if '姓名' in out.columns else '').strip()
+        tm = str(out.at[idx, '班组'] if '班组' in out.columns else '').strip()
+
+        matched_record = None
+        if sid and len(sid) >= 15 and sid in id_map:
+            matched_record = id_map[sid]
+        elif f"{nm}_{tm}" in name_team_map:
+            matched_record = name_team_map[f"{nm}_{tm}"]
+        elif nm in name_map:
+            matched_record = name_map[nm]
+        elif nm in all_name_map:
+            matched_record = all_name_map[nm]
+
+        if matched_record:
+            # 提取日薪：主表有有效日薪时直接采用
+            master_wage = matched_record.get('提取日薪')
+            if master_wage is not None and not pd.isna(master_wage) and float(master_wage or 0) > 0:
+                out.at[idx, '提取日薪'] = float(master_wage)
+            elif _is_empty_val(out.at[idx, '提取日薪']):
+                if master_wage is not None and not pd.isna(master_wage):
+                    out.at[idx, '提取日薪'] = master_wage
+
+            # 其它关键字段覆盖或补齐
+            for f in fields_to_enrich:
+                if f == '提取日薪':
+                    continue
+                mv = matched_record.get(f, '')
+                if mv is not None and not pd.isna(mv) and str(mv).strip() != '':
+                    cur_val = out.at[idx, f]
+                    if _is_empty_val(cur_val) or f in ['身份证号', '工资卡号', '开户银行', '分包/所属企业', '班组', '工种']:
+                        out.at[idx, f] = mv
 
     # 统一导出字段别名，避免模板导出阶段因界面字段名不同而漏填电话/卡号。
     if '联系电话' not in out.columns:
@@ -1430,7 +1475,9 @@ def render():
                 salary_df['日薪'] = pd.to_numeric(salary_df.get('提取日薪', 0), errors='coerce')
                 missing_wage = salary_df['日薪'].isna() | (salary_df['日薪'] <= 0)
                 if missing_wage.any():
-                    st.warning(f'有 {int(missing_wage.sum())} 人未能从 data/master 取得有效日薪，请核对主表后再导出。')
+                    missing_names = salary_df.loc[missing_wage, '姓名'].dropna().tolist()
+                    names_str = '、'.join(missing_names[:6]) + (' 等' if len(missing_names) > 6 else '')
+                    st.warning(f'有 {int(missing_wage.sum())} 人未能从 data/master 取得有效日薪（{names_str}），请在【档案魔法整合】上传官方系统档案同步主表后再导出。')
             elif wage_mode == '全局统一日薪':
                 global_wage = st.number_input('统一日薪（元/天）', min_value=0.0, value=300.0, step=10.0, key='global_wage')
                 salary_df['日薪'] = global_wage
