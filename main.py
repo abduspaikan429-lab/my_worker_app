@@ -261,6 +261,12 @@ st.sidebar.markdown("""
 <b style="color:#64748B; font-size:13px;">功能导航</b>
 """, unsafe_allow_html=True)
 
+# 响应来自子模块的跨板块页面安全跳转请求 (必须在 st.sidebar.radio 创建前设置 _nav_radio)
+if st.session_state.get("pending_nav"):
+    target_nav = st.session_state.pop("pending_nav")
+    st.session_state.current_nav = target_nav
+    st.session_state._nav_radio = target_nav
+
 def on_nav_change():
     if st.session_state._nav_radio is not None:
         st.session_state.current_nav = st.session_state._nav_radio

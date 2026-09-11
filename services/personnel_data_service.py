@@ -101,6 +101,12 @@ class PersonnelDataService:
         df_outflow = self._parse_outflow()
 
         monthly_summary = self._compute_monthly_summary(df_roster, df_inflow, df_outflow)
+
+        # 动态联动：接入主表、进场流水线、离场流水线与离场归档
+        df_roster, unique_roster, df_inflow, df_outflow, monthly_summary, live_status = self._enrich_with_live_system(
+            df_roster, unique_roster, df_inflow, df_outflow, monthly_summary
+        )
+
         demographics = self._compute_demographics(unique_roster)
         compliance = self._compute_compliance(df_inflow, df_outflow)
 
@@ -112,11 +118,235 @@ class PersonnelDataService:
             "monthly_summary": monthly_summary,
             "demographics": demographics,
             "compliance": compliance,
+            "live_status": live_status,
             "months": ['6月', '7月', '8月', '9月'],
             "teams": ['江苏旭之升 (王宜强施工班组)', '青海久昌 (汪佩沾其他班组)']
         }
         self._cached_data = data
         return data
+
+    def _enrich_with_live_system(
+        self,
+        df_roster: pd.DataFrame,
+        unique_roster: pd.DataFrame,
+        df_inflow: pd.DataFrame,
+        df_outflow: pd.DataFrame,
+        monthly_summary: Dict[str, Any]
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, Any], Dict[str, Any]]:
+        """
+        与系统业务模块实时联动：
+        1. 接入主表档案 (modules.master_data)
+        2. 接入进场流水线 (modules.onboarding_pipeline.onboarding_service)
+        3. 接入离场流水线与离场归档 (services.offboarding_service.OffboardingService)
+        """
+        live_status: Dict[str, Any] = {
+            "master_count": 0,
+            "onboarding_pending_count": 0,
+            "offboarding_pending_count": 0,
+            "offboarding_history_count": 0,
+            "currently_onsite": len(unique_roster),
+            "unpasted_count": 0,
+            "unpasted_workers": []
+        }
+
+        try:
+            from modules.master_data import load_master_df
+            from modules.onboarding_pipeline import onboarding_service
+            from services.offboarding_service import OffboardingService
+        except Exception:
+            if not unique_roster.empty and 'Source' not in unique_roster.columns:
+                unique_roster['Source'] = 'Excel基准底册'
+                unique_roster['LiveStatus'] = '在场正常'
+            return df_roster, unique_roster, df_inflow, df_outflow, monthly_summary, live_status
+
+        def clean_id(v: Any) -> str:
+            s = str(v).strip().replace("'", "").strip()
+            return "" if s.lower() in ("nan", "none", "") else s
+
+        master_df = load_master_df()
+        onboarding_recs = onboarding_service.get_records()
+        off_svc = OffboardingService()
+        pending_off = off_svc.get_records()
+        history_off = off_svc.load_history()
+
+        live_status["master_count"] = len(master_df) if not master_df.empty else 0
+        live_status["onboarding_pending_count"] = len(onboarding_recs)
+        live_status["offboarding_pending_count"] = len(pending_off)
+        live_status["offboarding_history_count"] = len(history_off)
+
+        # 1. 建立离场工人识别索引
+        archived_exit_ids = set()
+        archived_exit_names = set()
+        for rec in history_off:
+            cid = clean_id(rec.get("身份证号"))
+            name = str(rec.get("姓名") or "").strip()
+            if cid:
+                archived_exit_ids.add(cid)
+            if name:
+                archived_exit_names.add(name)
+
+        pending_exit_ids = set()
+        pending_exit_names = set()
+        for k, p_data in pending_off.items():
+            info = p_data.get("info", {}) if isinstance(p_data, dict) else {}
+            cid = clean_id(info.get("身份证号") or k)
+            name = str(info.get("姓名") or k.split("_")[0]).strip()
+            if cid:
+                pending_exit_ids.add(cid)
+            if name:
+                pending_exit_names.add(name)
+
+        # 2. 为现有 Excel 花名册标记 Source 与 LiveStatus
+        unique_roster = unique_roster.copy()
+        if not unique_roster.empty:
+            if "Source" not in unique_roster.columns:
+                unique_roster["Source"] = "Excel基准底册"
+            
+            def determine_status(row):
+                cid = clean_id(row.get("ID"))
+                name = str(row.get("Name") or "").strip()
+                if (cid and cid in archived_exit_ids) or (name and name in archived_exit_names):
+                    return "已离场归档"
+                if (cid and cid in pending_exit_ids) or (name and name in pending_exit_names):
+                    return "离场结算中"
+                return "在场正常"
+
+            unique_roster["LiveStatus"] = unique_roster.apply(determine_status, axis=1)
+
+        existing_ids = {clean_id(x) for x in unique_roster["ID"] if clean_id(x)}
+        existing_names = set(unique_roster["Name"].str.strip()) if not unique_roster.empty else set()
+
+        unpasted_workers = []
+        new_roster_rows = []
+        new_inflow_rows = []
+
+        # 3. 扫描主表 (master_df) 中的增量人员（通过档案魔法整合新导入的人员）
+        if not master_df.empty:
+            id_col = next((c for c in master_df.columns if "身份证" in c), None)
+            name_col = next((c for c in master_df.columns if "姓名" in c), None)
+            team_col = next((c for c in master_df.columns if "班组" in c), None)
+            job_col = next((c for c in master_df.columns if "工种" in c), None)
+            date_col = next((c for c in master_df.columns if "进场" in c), None)
+            addr_col = next((c for c in master_df.columns if "住址" in c or "地址" in c), None)
+            gender_col = next((c for c in master_df.columns if "性别" in c), None)
+            contract_col = next((c for c in master_df.columns if "合同" in c), None)
+
+            for _, r in master_df.iterrows():
+                cid = clean_id(r[id_col]) if id_col else ""
+                name = str(r[name_col]).strip() if name_col else ""
+                if not name or name in ("nan", "None"):
+                    continue
+
+                is_known = (cid and cid in existing_ids) or (name and name in existing_names)
+                if not is_known:
+                    t_val = str(r[team_col]).strip() if team_col else "金属屋面班组"
+                    team_std = "江苏旭之升 (王宜强施工班组)" if ("旭之升" in t_val or "江" in t_val or "王宜强" in t_val) else "青海久昌 (汪佩沾其他班组)"
+                    job_std = clean_job_title(r[job_col] if job_col else "普工")
+                    gender_std = str(r[gender_col]).strip() if gender_col else "男"
+                    if gender_std in ("nan", "None", ""):
+                        gender_std = "男"
+                    d_val = str(r[date_col]).strip() if date_col else ""
+                    m_val = "9月" if "09" in d_val else ("8月" if "08" in d_val else "当月")
+                    addr_std = str(r[addr_col]).strip() if addr_col else ""
+                    c_no = str(r[contract_col]).strip() if contract_col else ""
+                    
+                    l_status = "在场正常"
+                    if (cid and cid in archived_exit_ids) or (name and name in archived_exit_names):
+                        l_status = "已离场归档"
+                    elif (cid and cid in pending_exit_ids) or (name and name in pending_exit_names):
+                        l_status = "离场结算中"
+
+                    new_row = {
+                        "Month": m_val,
+                        "Team": team_std,
+                        "Name": name,
+                        "ID": cid,
+                        "Gender": gender_std,
+                        "Job": job_std,
+                        "Job_Clean": job_std,
+                        "Address": addr_std,
+                        "ContractNo": c_no,
+                        "Province": get_province_from_id(cid),
+                        "Age": calculate_age_from_id(cid),
+                        "AgeGroup": "其他",
+                        "Source": "系统主表新同步",
+                        "LiveStatus": l_status
+                    }
+                    if new_row["Age"]:
+                        a = new_row["Age"]
+                        new_row["AgeGroup"] = '18-29岁 (青年)' if a < 30 else ('30-39岁 (青壮年)' if a < 40 else ('40-49岁 (成熟期)' if a < 50 else '50岁及以上 (老龄工)'))
+                    
+                    new_roster_rows.append(new_row)
+                    unpasted_workers.append(new_row)
+                    if cid:
+                        existing_ids.add(cid)
+                    if name:
+                        existing_names.add(name)
+
+                    new_inflow_rows.append({
+                        "Month": m_val,
+                        "Team": team_std,
+                        "Name": name,
+                        "ID": cid,
+                        "Date": d_val.split()[0] if d_val else "",
+                        "Job": job_std,
+                        "Job_Clean": job_std,
+                        "Registered": "是",
+                        "ContractSigned": "是",
+                        "Remarks": "系统主表新同步"
+                    })
+
+        # 4. 扫描【进场流水线】在办人员
+        for k, rec in onboarding_recs.items():
+            name = str(rec.get("name") or k.split("_")[0]).strip()
+            cid = clean_id(rec.get("id_card"))
+            if not name or name in ("nan", "None"):
+                continue
+
+            is_known = (cid and cid in existing_ids) or (name and name in existing_names)
+            if not is_known:
+                t_val = str(rec.get("team") or "").strip()
+                team_std = "江苏旭之升 (王宜强施工班组)" if ("旭之升" in t_val or "江" in t_val or "王宜强" in t_val) else "青海久昌 (汪佩沾其他班组)"
+                job_std = clean_job_title(rec.get("job") or "普工")
+                new_row = {
+                    "Month": "当月",
+                    "Team": team_std,
+                    "Name": name,
+                    "ID": cid,
+                    "Gender": "男",
+                    "Job": job_std,
+                    "Job_Clean": job_std,
+                    "Address": "",
+                    "ContractNo": "",
+                    "Province": get_province_from_id(cid),
+                    "Age": calculate_age_from_id(cid),
+                    "AgeGroup": "其他",
+                    "Source": "进场流水线在办",
+                    "LiveStatus": "进场手续在办"
+                }
+                new_roster_rows.append(new_row)
+                unpasted_workers.append(new_row)
+                if cid:
+                    existing_ids.add(cid)
+                if name:
+                    existing_names.add(name)
+
+        if new_roster_rows:
+            df_new_roster = pd.DataFrame(new_roster_rows)
+            unique_roster = pd.concat([unique_roster, df_new_roster], ignore_index=True)
+            df_roster = pd.concat([df_roster, df_new_roster], ignore_index=True)
+
+        if new_inflow_rows:
+            df_new_inflow = pd.DataFrame(new_inflow_rows)
+            df_inflow = pd.concat([df_inflow, df_new_inflow], ignore_index=True)
+
+        # 5. 动态在场总数计算
+        active_cnt = len(unique_roster[unique_roster["LiveStatus"].isin(["在场正常", "进场手续在办"])])
+        live_status["currently_onsite"] = active_cnt
+        live_status["unpasted_count"] = len(unpasted_workers)
+        live_status["unpasted_workers"] = unpasted_workers
+
+        return df_roster, unique_roster, df_inflow, df_outflow, monthly_summary, live_status
 
     def _parse_roster(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """解析花名册表中的全部月度名单"""
