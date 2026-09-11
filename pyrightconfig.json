@@ -1,0 +1,13 @@
+{
+  "include": [
+    "."
+  ],
+  "exclude": [
+    "**/__pycache__",
+    ".pytest_cache"
+  ],
+  "pythonPath": "C:\\Users\\20909\\AppData\\Local\\Programs\\Python\\Python311\\python.exe",
+  "extraPaths": [
+    "C:\\Users\\20909\\AppData\\Local\\Programs\\Python\\Python311\\Lib\\site-packages"
+  ]
+}

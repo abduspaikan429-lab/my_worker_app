@@ -10,6 +10,7 @@ from services.worker_backup_service import backup_workers_to_json
 from services.worker_compare_service import WorkerCompareService
 from services.worker_service import WorkerService
 from services.worker_sync_service import WorkerSyncService
+from services.personnel_data_service import PersonnelDataService, personnel_data_service
 
 __all__ = [
     "WorkerCompareService",
@@ -20,6 +21,8 @@ __all__ = [
     "AttendanceService",
     "PayrollService",
     "BackupService",
+    "PersonnelDataService",
+    "personnel_data_service",
     "write_sync_log",
     "backup_workers_to_json",
 ]

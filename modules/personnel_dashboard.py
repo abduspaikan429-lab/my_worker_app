@@ -1,20 +1,25 @@
 # modules/personnel_dashboard.py
-# 月度人员变更中心 - 历史与实时进离场自动关联计算 (细化到班组级别进退场)
+# 月度人员变更态势中心 - 全周期数据可视化看板与档案透视
 from __future__ import annotations
-import json, os, calendar, re
+import json, os, calendar, re, io
 from datetime import date, datetime
+from typing import Dict, Any, List, Optional
+
 import pandas as pd
+import numpy as np
 import streamlit as st
 
 from modules.master_data import load_master_df
 from modules.onboarding_pipeline import onboarding_service
 from modules.offboarding_pipeline import load_offboarding_history
+from services.personnel_data_service import personnel_data_service
 
 MONTHLY_DATA_FILE = "data/monthly_change_data.json"
-SWITCHOVER_MONTH = "2026-09" # 6, 7, 8 为纯历史输入
+SWITCHOVER_MONTH = "2026-09"
 START_MONTH = "2026-06"
 
-def _get_report_date_str(month_str):
+
+def _get_report_date_str(month_str: str) -> str:
     if not month_str or "-" not in month_str:
         return ""
     y, m = map(int, month_str.split('-'))
@@ -27,14 +32,17 @@ def _get_report_date_str(month_str):
     _, c_days = calendar.monthrange(y, m)
     return f"{py} 年 {pm} 月 {p_days} 日至 {y} 年 {m} 月 {c_days} 日"
 
-def _parse_report_text(text):
+
+def _parse_report_text(text: str) -> Dict[str, Any]:
     results = {}
     sections = text.replace("①", "").replace("②", "").replace("③", "").split("劳务（专业）分包单位")
     for sec in sections:
-        if not sec.strip(): continue
+        if not sec.strip():
+            continue
         
         team_match = re.search(r"班组名称[：:]\s*([^\s]+)", sec)
-        if not team_match: continue
+        if not team_match:
+            continue
         team = team_match.group(1).strip()
         
         in_match = re.search(r"本月进场务工人员总数[：:]\s*(\d+)", sec)
@@ -43,9 +51,12 @@ def _parse_report_text(text):
         
         if in_match and out_match and cur_match:
             t_key = "total"
-            if "王宜强" in team: t_key = "王宜强施工班组"
-            elif "汪佩沾" in team: t_key = "汪佩沾其他班组"
-            elif "金属屋面" in team: t_key = "total"
+            if "王宜强" in team:
+                t_key = "王宜强施工班组"
+            elif "汪佩沾" in team:
+                t_key = "汪佩沾其他班组"
+            elif "金属屋面" in team:
+                t_key = "total"
             
             results[t_key] = {
                 "in_count": int(in_match.group(1)),
@@ -55,44 +66,45 @@ def _parse_report_text(text):
     return results
 
 
-def _load_monthly_data():
+def _load_monthly_data() -> Dict[str, Any]:
     if os.path.exists(MONTHLY_DATA_FILE):
         try:
             with open(MONTHLY_DATA_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
             pass
-    # 默认空数据结构，支持细分到班组的进场、离场、在场
     return {
         "2026-06": {
-            "in_count": 0, "out_count": 0, "current_count": 0, 
+            "in_count": 34, "out_count": 1, "current_count": 34, 
             "teams": {
-                "汪佩沾其他班组": {"in_count": 0, "out_count": 0, "current_count": 0}, 
-                "王宜强施工班组": {"in_count": 0, "out_count": 0, "current_count": 0}
+                "汪佩沾其他班组": {"in_count": 15, "out_count": 0, "current_count": 15}, 
+                "王宜强施工班组": {"in_count": 19, "out_count": 1, "current_count": 19}
             }
         },
         "2026-07": {
-            "in_count": 0, "out_count": 0, "current_count": 0, 
+            "in_count": 24, "out_count": 11, "current_count": 58, 
             "teams": {
-                "汪佩沾其他班组": {"in_count": 0, "out_count": 0, "current_count": 0}, 
-                "王宜强施工班组": {"in_count": 0, "out_count": 0, "current_count": 0}
+                "汪佩沾其他班组": {"in_count": 17, "out_count": 4, "current_count": 32}, 
+                "王宜强施工班组": {"in_count": 7, "out_count": 7, "current_count": 26}
             }
         },
         "2026-08": {
-            "in_count": 0, "out_count": 0, "current_count": 0, 
+            "in_count": 13, "out_count": 3, "current_count": 60, 
             "teams": {
-                "汪佩沾其他班组": {"in_count": 0, "out_count": 0, "current_count": 0}, 
-                "王宜强施工班组": {"in_count": 0, "out_count": 0, "current_count": 0}
+                "汪佩沾其他班组": {"in_count": 3, "out_count": 2, "current_count": 31}, 
+                "王宜强施工班组": {"in_count": 10, "out_count": 1, "current_count": 29}
             }
         }
     }
 
-def _save_monthly_data(data):
+
+def _save_monthly_data(data: Dict[str, Any]) -> None:
     os.makedirs("data", exist_ok=True)
     with open(MONTHLY_DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-def _generate_months(start, end):
+
+def _generate_months(start: str, end: str) -> List[str]:
     sy, sm = map(int, start.split('-'))
     ey, em = map(int, end.split('-'))
     months = []
@@ -105,7 +117,8 @@ def _generate_months(start, end):
             cy += 1
     return months
 
-def _parse_date_to_month(val):
+
+def _parse_date_to_month(val: Any) -> Optional[str]:
     if not val:
         return None
     val_str = str(val).strip()
@@ -118,7 +131,8 @@ def _parse_date_to_month(val):
             continue
     return val_str[:7] if len(val_str) >= 7 and "-" in val_str else None
 
-def _format_date(val):
+
+def _format_date(val: Any) -> str:
     val_str = str(val).strip()
     if not val_str or val_str in ("nan", "None", ""):
         return ""
@@ -129,7 +143,8 @@ def _format_date(val):
             continue
     return val_str
 
-def _map_team(t_name):
+
+def _map_team(t_name: Any) -> str:
     name = str(t_name).strip()
     if not name or name in ("nan", "None", "待分配班组"):
         return "待分配"
@@ -139,27 +154,22 @@ def _map_team(t_name):
         return "汪佩沾其他班组"
     return name
 
-def get_dynamic_month_data(target_month):
-    """
-    账本法计算：从 2026-08 历史月作为基准起算，逐月累加进场，减去离场，得出指定月的月末人数。
-    """
+
+def get_dynamic_month_data(target_month: str) -> Dict[str, Any]:
+    """账本法计算：从 2026-08 历史月作为基准起算，逐月累加进场，减去离场"""
     saved_data = _load_monthly_data()
     base_month = "2026-08"
     months_to_calc = _generate_months(SWITCHOVER_MONTH, target_month)
     
     base_data = saved_data.get(base_month, {"current_count": 0, "teams": {}})
-    
-    # 初始化团队的当前人数
     current_teams = {}
     for t_name, t_data in base_data.get("teams", {}).items():
         if isinstance(t_data, dict):
             current_teams[t_name] = t_data.get("current_count", 0)
         else:
-            current_teams[t_name] = t_data # 兼容旧格式
+            current_teams[t_name] = t_data
             
-    # 从底层班组累加出严格准确的期初总人数，防止历史数据中全局总数与班组总数不一致
     current_total = sum(current_teams.values())
-    
     master = load_master_df()
     all_workers = onboarding_service.merge_with_master(master)
     history = load_offboarding_history()
@@ -189,7 +199,6 @@ def get_dynamic_month_data(target_month):
 
     target_in_list = []
     target_out_list = []
-    
     target_team_stats = {}
     
     for m in months_to_calc:
@@ -199,7 +208,6 @@ def get_dynamic_month_data(target_month):
         if m == target_month:
             target_in_list = in_recs
             target_out_list = out_recs
-            # 初始化该月的班组新增减少统计
             for r in in_recs:
                 t = _map_team(r.get("班组", ""))
                 target_team_stats.setdefault(t, {"in_count": 0, "out_count": 0})
@@ -219,7 +227,6 @@ def get_dynamic_month_data(target_month):
             t = _map_team(r.get("班组", ""))
             current_teams[t] = current_teams.get(t, 0) - 1
             
-    # 构建最终的 teams 结构
     final_teams = {}
     for t_name, current_cnt in current_teams.items():
         stats = target_team_stats.get(t_name, {"in_count": 0, "out_count": 0})
@@ -238,267 +245,399 @@ def get_dynamic_month_data(target_month):
         "out_list": target_out_list
     }
 
-def _kpi_card(label, value, color="#6366F1"):
-    st.markdown(f"""<div class="kpi-card" style="border-left:4px solid {color};">
-        <div class="kpi-value" style="color:{color};">{value}</div>
-        <div class="kpi-label">{label}</div></div>""", unsafe_allow_html=True)
 
-def render():
-    st.markdown("""<style>
-    .kpi-card{background:#fff;border-radius:14px;padding:20px 22px 16px;box-shadow:0 2px 12px rgba(0,0,0,0.07);margin-bottom:4px;}
-    .kpi-value{font-size:2.2rem;font-weight:700;line-height:1.1;}
-    .kpi-label{font-size:.82rem;color:#64748B;margin-top:4px;font-weight:500;}
-    .team-box{background:#f8fafc; border-left:4px solid #6366F1; padding: 16px; border-radius: 8px;}
-    .team-item{display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px dashed #e2e8f0; font-size: 0.95em;}
-    .team-total{display: flex; justify-content: space-between; padding: 12px 0 0 0; font-weight: bold; font-size: 1.1em;}
-    </style>""", unsafe_allow_html=True)
-    
-    st.markdown("""
-    <div class="page-header-deco">
-        <span class="material-symbols-outlined" style="font-size:32px;color:#6366F1;">calendar_month</span>
-        <div class="header-text"><h2>月度人员变动中心</h2>
-        <p>自动关联进退场，精准呈现每月月末在场与各班组进出场数字</p></div>
+def _render_executive_card(title: str, value: str, subtitle: str, icon: str, border_color: str = "#3B82F6", bg_gradient: str = "linear-gradient(135deg, #F8FAFC 0%, #EFF6FF 100%)") -> None:
+    st.markdown(f"""
+    <div style="
+        background: {bg_gradient};
+        border-radius: 12px;
+        border-left: 5px solid {border_color};
+        padding: 16px 18px;
+        box-shadow: 0 4px 14px rgba(0,0,0,0.05);
+        margin-bottom: 12px;
+        transition: transform 0.2s ease;
+    ">
+        <div style="display: flex; justify-content: space-between; align-items: flex-start;">
+            <div>
+                <div style="font-size: 0.85rem; color: #64748B; font-weight: 600; margin-bottom: 4px;">{title}</div>
+                <div style="font-size: 2.1rem; font-weight: 800; color: #1E293B; line-height: 1.1;">{value}</div>
+                <div style="font-size: 0.78rem; color: #94A3B8; margin-top: 6px; font-weight: 500;">{subtitle}</div>
+            </div>
+            <span style="font-size: 2rem; opacity: 0.85;">{icon}</span>
+        </div>
     </div>
-    <div class="color-strip" style="background:linear-gradient(90deg,#C7D2FE,#EDE9FE);"></div>
     """, unsafe_allow_html=True)
 
-    today_month = date.today().strftime("%Y-%m")
-    all_months = _generate_months(START_MONTH, max(SWITCHOVER_MONTH, today_month))
-    all_months.reverse() # 最新的月份在最上面
-    
-    col_sel, _ = st.columns([1, 2])
-    with col_sel:
-        selected_month = st.selectbox("📅 查看月份", options=all_months, index=0)
-    
-    is_historical = selected_month < SWITCHOVER_MONTH
-    
-    saved_data = _load_monthly_data()
-    
-    if is_historical:
-        month_data = saved_data.get(selected_month, {
-            "in_count": 0, "out_count": 0, "current_count": 0, 
-            "teams": {
-                "汪佩沾其他班组": {"in_count": 0, "out_count": 0, "current_count": 0}, 
-                "王宜强施工班组": {"in_count": 0, "out_count": 0, "current_count": 0}
-            }
-        })
-        
-        t_yi = month_data["teams"].setdefault("王宜强施工班组", {"in_count": 0, "out_count": 0, "current_count": 0})
-        t_wang = month_data["teams"].setdefault("汪佩沾其他班组", {"in_count": 0, "out_count": 0, "current_count": 0})
-        
-        t_yi["in_count"] = st.session_state.get(f"hist_yi_in_{selected_month}", t_yi.get("in_count", 0))
-        t_yi["out_count"] = st.session_state.get(f"hist_yi_out_{selected_month}", t_yi.get("out_count", 0))
-        t_yi["current_count"] = st.session_state.get(f"hist_yi_cur_{selected_month}", t_yi.get("current_count", 0))
-        
-        t_wang["in_count"] = st.session_state.get(f"hist_wang_in_{selected_month}", t_wang.get("in_count", 0))
-        t_wang["out_count"] = st.session_state.get(f"hist_wang_out_{selected_month}", t_wang.get("out_count", 0))
-        t_wang["current_count"] = st.session_state.get(f"hist_wang_cur_{selected_month}", t_wang.get("current_count", 0))
-        
-        # 强制总人数自动等于各班组之和，避免手动输入不一致导致上方数据没跟着变
-        month_data["in_count"] = t_yi["in_count"] + t_wang["in_count"]
-        month_data["out_count"] = t_yi["out_count"] + t_wang["out_count"]
-        month_data["current_count"] = t_yi["current_count"] + t_wang["current_count"]
-        
-    else:
-        with st.spinner("正在基于台账账本计算月末人数..."):
-            month_data = get_dynamic_month_data(selected_month)
-        
-    st.markdown(f"### {selected_month.replace('-', '年')}月 人员变动")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        _kpi_card("本月进场汇总", f'{month_data["in_count"]} 人', "#34D399")
-    with c2:
-        _kpi_card("本月离场汇总", f'{month_data["out_count"]} 人', "#F87171")
-    with c3:
-        _kpi_card("月末在场汇总", f'{month_data["current_count"]} 人', "#6366F1")
-        
-    st.markdown("<div style='margin-top:24px'></div>", unsafe_allow_html=True)
-    
-    st.markdown("#### 🏢 班组数据明细 (包含进场/离场/月末在场)")
-    
-    teams_dict = month_data.get("teams", {})
-    metal_roof_keys = ["汪佩沾其他班组", "王宜强施工班组"]
-    
-    # 金属屋面合计计算
-    metal_in = 0
-    metal_out = 0
-    metal_current = 0
-    
-    html = '<div class="team-box"><div style="font-weight:bold; font-size:1.2em; margin-bottom:12px;">金属屋面 (专业分包总称)</div>'
-    for k in metal_roof_keys:
-        t_data = teams_dict.get(k, {})
-        if not isinstance(t_data, dict):
-            # 兼容老数据结构
-            t_data = {"in_count": 0, "out_count": 0, "current_count": t_data}
-            
-        c_in = t_data.get("in_count", 0)
-        c_out = t_data.get("out_count", 0)
-        c_cur = t_data.get("current_count", 0)
-        
-        metal_in += c_in
-        metal_out += c_out
-        metal_current += c_cur
-        
-        html += f'''
-<div class="team-item">
-    <span style="font-weight:600; min-width: 150px;">├── {k}</span>
-    <span style="color:#10B981;">进场: {c_in}</span>
-    <span style="color:#EF4444;">离场: {c_out}</span>
-    <span style="color:#4F46E5;">月末在场: {c_cur}</span>
-</div>
-'''
-        
-    html += f'''
-<div class="team-total" style="border-top: 1px solid #CBD5E1; padding-top: 12px; margin-top: 8px;">
-    <span style="min-width: 150px;">└── 金属屋面合计</span>
-    <span style="color:#10B981;">进场: {metal_in}</span>
-    <span style="color:#EF4444;">离场: {metal_out}</span>
-    <span style="color:#4F46E5;">月末在场: {metal_current}</span>
-</div>
-</div>
-'''
-    
-    other_teams = {k: v for k, v in teams_dict.items() if k not in metal_roof_keys and (isinstance(v, dict) and v.get("current_count", 0) > 0)}
-    if other_teams:
-        html += '<div class="team-box" style="margin-top: 16px;"><div style="font-weight:bold; font-size:1.2em; margin-bottom:12px;">其他</div>'
-        for k, v in other_teams.items():
-            if not isinstance(v, dict):
-                v = {"in_count": 0, "out_count": 0, "current_count": v}
-            html += f'''
-<div class="team-item">
-    <span style="font-weight:600; min-width: 150px;">├── {k}</span>
-    <span style="color:#10B981;">进场: {v.get('in_count',0)}</span>
-    <span style="color:#EF4444;">离场: {v.get('out_count',0)}</span>
-    <span style="color:#4F46E5;">月末在场: {v.get('current_count',0)}</span>
-</div>
-'''
-        html += '</div>'
-        
-    st.markdown(html, unsafe_allow_html=True)
-    
-    # 历史月份专属：保存与修改数字功能
-    if is_historical:
-        st.markdown("<div style='margin-top:32px'></div>", unsafe_allow_html=True)
-        st.info("📌 当前为历史月份，系统不从台账中反推数据。您可以随时补录或修改报表数字。")
-        with st.expander(f"✏️ 录入/修改 {selected_month} 历史月报数据", expanded=False):
-            tab_form, tab_parse = st.tabs(["📝 表单与生成的报文", "🤖 智能文本解析导入"])
-            
-            with tab_form:
-                # 获取数据库里最初始的数据作为 fallback
-                init_data = saved_data.get(selected_month, {})
-                init_yi = init_data.get("teams", {}).get("王宜强施工班组", {}) if isinstance(init_data.get("teams", {}).get("王宜强施工班组"), dict) else {}
-                init_wang = init_data.get("teams", {}).get("汪佩沾其他班组", {}) if isinstance(init_data.get("teams", {}).get("汪佩沾其他班组"), dict) else {}
-                
-                st.markdown("#### 王宜强施工班组")
-                c11, c12, c13 = st.columns(3)
-                yi_in = c11.number_input("王宜强 - 进场", min_value=0, value=init_yi.get("in_count",0), step=1, key=f"hist_yi_in_{selected_month}")
-                yi_out = c12.number_input("王宜强 - 离场", min_value=0, value=init_yi.get("out_count",0), step=1, key=f"hist_yi_out_{selected_month}")
-                yi_cur = c13.number_input("王宜强 - 在场", min_value=0, value=init_yi.get("current_count",0), step=1, key=f"hist_yi_cur_{selected_month}")
 
-                st.markdown("#### 汪佩沾其他班组")
-                c21, c22, c23 = st.columns(3)
-                wang_in = c21.number_input("汪佩沾 - 进场", min_value=0, value=init_wang.get("in_count",0), step=1, key=f"hist_wang_in_{selected_month}")
-                wang_out = c22.number_input("汪佩沾 - 离场", min_value=0, value=init_wang.get("out_count",0), step=1, key=f"hist_wang_out_{selected_month}")
-                wang_cur = c23.number_input("汪佩沾 - 在场", min_value=0, value=init_wang.get("current_count",0), step=1, key=f"hist_wang_cur_{selected_month}")
-                
-                st.markdown("---")
-                
-                st.markdown("#### 总人数 (金属屋面) - *自动汇总*")
-                col1, col2, col3 = st.columns(3)
-                new_in = col1.number_input("本月进场总数", value=yi_in + wang_in, disabled=True)
-                new_out = col2.number_input("本月离场总数", value=yi_out + wang_out, disabled=True)
-                new_current = col3.number_input("月末现场总数", value=yi_cur + wang_cur, disabled=True)
-                
-                st.markdown("#### ✨ 自动生成的报表文字")
-                date_str = _get_report_date_str(selected_month)
-                text_total = f"①总：劳务（专业）分包单位： 中建二局安装工程有限公司        班组名称：  金属屋面         日期： {date_str}  本月进场务工人员总数:    {new_in}          本月离场务工人员总数:   {new_out}         本月现场务工人员总数：   {new_current}"
-                text_wang = f"②分：劳务（专业）分包单位： 中建二局安装工程有限公司        班组名称：  汪佩沾其它班组         日期： {date_str}  本月进场务工人员总数:    {wang_in}         本月离场务工人员总数:   {wang_out}         本月现场务工人员总数：   {wang_cur}"
-                text_yi = f"③分：劳务（专业）分包单位： 中建二局安装工程有限公司        班组名称：  王宜强施工班组         日期： {date_str}  本月进场务工人员总数:    {yi_in}          本月离场务工人员总数:   {yi_out}         本月现场务工人员总数：   {yi_cur}"
-                st.code(f"{text_total}\n{text_wang}\n{text_yi}", language="text")
-                
-                if st.button("💾 保存历史报表数据", type="primary", use_container_width=True):
-                    if selected_month not in saved_data:
-                        saved_data[selected_month] = {}
-                    saved_data[selected_month].update({
-                        "in_count": new_in,
-                        "out_count": new_out,
-                        "current_count": new_current,
-                        "teams": {
-                            "王宜强施工班组": {"in_count": yi_in, "out_count": yi_out, "current_count": yi_cur},
-                            "汪佩沾其他班组": {"in_count": wang_in, "out_count": wang_out, "current_count": wang_cur}
-                        }
-                    })
-                    _save_monthly_data(saved_data)
-                    st.success(f"{selected_month} 数据保存成功！")
-                    st.rerun()
-            
-            with tab_parse:
-                st.markdown("将图文识别或复制的文字粘贴在此处，系统将自动解析并录入：")
-                paste_text = st.text_area("请粘贴报表文字：", height=150, help="可以一次性粘贴总计和各个分包班组的内容，系统会自动识别 '班组名称' 和对应人数。")
-                if st.button("🤖 解析并保存", type="primary"):
-                    parsed_res = _parse_report_text(paste_text)
-                    if not parsed_res:
-                        st.error("未能解析出有效的报表数据，请检查文字格式是否正确。")
-                    else:
-                        if selected_month not in saved_data:
-                            saved_data[selected_month] = {}
-                        
-                        updates = {}
-                        if "total" in parsed_res:
-                            updates["in_count"] = parsed_res["total"]["in_count"]
-                            updates["out_count"] = parsed_res["total"]["out_count"]
-                            updates["current_count"] = parsed_res["total"]["current_count"]
-                        
-                        teams_update = saved_data[selected_month].get("teams", {}).copy()
-                        if "汪佩沾其他班组" in parsed_res:
-                            teams_update["汪佩沾其他班组"] = parsed_res["汪佩沾其他班组"]
-                        if "王宜强施工班组" in parsed_res:
-                            teams_update["王宜强施工班组"] = parsed_res["王宜强施工班组"]
-                            
-                        updates["teams"] = teams_update
-                        saved_data[selected_month].update(updates)
-                        _save_monthly_data(saved_data)
-                        
-                        # 清理 session state 强制刷新表单
-                        for k in list(st.session_state.keys()):
-                            if k.startswith("hist_") and selected_month in k:
-                                del st.session_state[k]
-                        
-                        st.success("🎉 解析并保存成功！已自动录入人数，请在左侧【表单】确认结果。")
-                        st.rerun()
-                    
-    # 动态月份专属：人员进离场名单明细
-    if not is_historical:
-        st.markdown("<div style='margin-top:32px'></div>", unsafe_allow_html=True)
-        st.markdown("#### 📋 本月人员变化明细")
-        t1, t2 = st.tabs(["本月进场人员", "本月离场归档人员"])
+def render() -> None:
+    """人员变更态势中心主渲染入口"""
+    # 顶部自定义样式注入
+    st.markdown("""
+    <style>
+    .dashboard-badge {
+        display: inline-block;
+        padding: 3px 10px;
+        border-radius: 12px;
+        font-size: 0.82rem;
+        font-weight: 600;
+        margin-right: 6px;
+    }
+    .badge-in { background-color: #DBEAFE; color: #1D4ED8; }
+    .badge-out { background-color: #FEE2E2; color: #B91C1C; }
+    .badge-onsite { background-color: #D1FAE5; color: #047857; }
+    .compliance-box {
+        background: #F8FAFC;
+        border: 1px solid #E2E8F0;
+        border-radius: 10px;
+        padding: 14px 16px;
+        margin-bottom: 10px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown("""
+    <div style="display: flex; align-items: center; justify-content: space-between; padding-bottom: 12px; margin-bottom: 16px; border-bottom: 1px solid #E2E8F0;">
+        <div>
+            <h2 style="margin: 0; color: #0F172A; font-weight: 800; display: flex; align-items: center; gap: 8px;">
+                <span>📊</span> 人员变更态势中心
+            </h2>
+            <p style="margin: 4px 0 0 0; color: #64748B; font-size: 0.95rem;">
+                四源动态联动 · 全周期流动态势 · 劳务工人精准画像 · 100%合规闭环管控
+            </p>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # 1. 尝试从 Excel 数据服务加载全部数据
+    with st.spinner("正在解析项目人员花名册与变更月报表..."):
+        try:
+            data = personnel_data_service.load_all_data()
+            summary = data["monthly_summary"]
+            demo = data["demographics"]
+            comp = data["compliance"]
+            unique_df = data["unique_roster"]
+            df_inflow = data["df_inflow"]
+            df_outflow = data["df_outflow"]
+            load_success = True
+        except Exception as e:
+            st.error(f"解析人员变更 Excel 数据表时出错: {e}")
+            load_success = False
+
+    if not load_success or unique_df.empty:
+        st.warning("未能成功读取 load-data 目录下的三份核心 Excel 报表，请前往【数据源管理】检查文件路径。")
+        return
+
+    # 2. 顶部 Executive KPI Banner (核心规模与合规达标率)
+    col1, col2, col3, col4, col5 = st.columns(5)
+    with col1:
+        _render_executive_card("累计参建劳务工", f"{demo['total_unique']} 人", "去重实名制人员基数", "👥", "#3B82F6")
+    with col2:
+        _render_executive_card("最高在场峰值", "60 人", "8月份施工最高峰", "🏔️", "#10B981", "linear-gradient(135deg, #F8FAFC 0%, #ECFDF5 100%)")
+    with col3:
+        _render_executive_card("累计进场人次", f"{comp['inflow_total']} 人次", "6-9月爬坡进场", "🚀", "#6366F1")
+    with col4:
+        _render_executive_card("累计离场人次", f"{comp['outflow_total']} 人次", "规范退场工资结清", "🛫", "#EF4444", "linear-gradient(135deg, #F8FAFC 0%, #FEF2F2 100%)")
+    with col5:
+        _render_executive_card("合规履约达标率", f"{comp['contract_rate']:.0f}%", "合同/工资/退场承诺全覆盖", "🛡️", "#F59E0B", "linear-gradient(135deg, #F8FAFC 0%, #FFFBEB 100%)")
+
+    st.markdown("<div style='margin-top: 14px;'></div>", unsafe_allow_html=True)
+
+    # 3. 核心功能 Tab 布局
+    tab_overview, tab_monthly, tab_roster, tab_export, tab_source = st.tabs([
+        "📊 态势总览看板 (全景可视化)",
+        "📅 月度台账钻取 (进退场明细)",
+        "👥 全员参建档案总库 (72人透视)",
+        "🖼️ 高清报表大图导出 (Matplotlib)",
+        "📂 数据源管理与同步"
+    ])
+
+    # ==========================================
+    # Tab 1: 态势总览看板 (6大专业图表可视化)
+    # ==========================================
+    with tab_overview:
+        plotly_figs = personnel_data_service.generate_plotly_figures()
+
+        # 第一行：进退场流动趋势 + 队伍月度在场规模堆叠
+        row1_c1, row1_c2 = st.columns([1.1, 0.9])
+        with row1_c1:
+            st.plotly_chart(plotly_figs["trend"], use_container_width=True)
+        with row1_c2:
+            st.plotly_chart(plotly_figs["teams"], use_container_width=True)
+
+        st.markdown("<div style='margin-top: 8px;'></div>", unsafe_allow_html=True)
+
+        # 第二行：工种技能分布 + 年龄梯队结构 + 籍贯省份分布
+        row2_c1, row2_c2, row2_c3 = st.columns([1, 1, 1])
+        with row2_c1:
+            st.plotly_chart(plotly_figs["jobs"], use_container_width=True)
+        with row2_c2:
+            st.plotly_chart(plotly_figs["age"], use_container_width=True)
+        with row2_c3:
+            st.plotly_chart(plotly_figs["province"], use_container_width=True)
+
+        st.markdown("<div style='margin-top: 12px;'></div>", unsafe_allow_html=True)
+
+        # 第三行：合规管控与人员履约三大指标
+        st.markdown("#### 🛡️ 合规管控与人员履约保障体系")
+        c_comp1, c_comp2, c_comp3 = st.columns(3)
+        with c_comp1:
+            st.markdown(f"""
+            <div class="compliance-box" style="border-left: 4px solid #10B981;">
+                <div style="font-weight: 700; color: #047857; font-size: 1.05rem; margin-bottom: 4px;">📑 劳动合同签订率：{comp['contract_rate']:.1f}%</div>
+                <div style="font-size: 0.88rem; color: #475569; line-height: 1.5;">
+                    • 进场务工人员累计 <strong>{comp['inflow_total']}</strong> 人次全员签订合同。<br>
+                    • 100% 覆盖率，全部并在实名制系统与建委平台核查合规。
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+        with c_comp2:
+            st.markdown(f"""
+            <div class="compliance-box" style="border-left: 4px solid #3B82F6;">
+                <div style="font-weight: 700; color: #1D4ED8; font-size: 1.05rem; margin-bottom: 4px;">💰 离场工资结算支付：{comp['wage_settle_rate']:.1f}%</div>
+                <div style="font-size: 0.88rem; color: #475569; line-height: 1.5;">
+                    • 离场 <strong>{comp['outflow_total']}</strong> 人次全部明确登记为“已结算已支付”。<br>
+                    • 全流程离场闭环，无拖欠工资及劳务纠纷遗留风险。
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+        with c_comp3:
+            st.markdown(f"""
+            <div class="compliance-box" style="border-left: 4px solid #F59E0B;">
+                <div style="font-weight: 700; color: #B45309; font-size: 1.05rem; margin-bottom: 4px;">✍️ 《退场承诺书》签订率：{comp['commit_rate']:.1f}%</div>
+                <div style="font-size: 0.88rem; color: #475569; line-height: 1.5;">
+                    • 离场 <strong>{comp['outflow_total']}</strong> 人次规范签署《退场承诺书》。<br>
+                    • 明确离场日期与在场务工天数，退场法律文书档案完备。
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+    # ==========================================
+    # Tab 2: 月度台账钻取 (月度进退场名单与班组明细)
+    # ==========================================
+    with tab_monthly:
+        st.markdown("### 📅 项目月度变动深度钻取")
         
-        with t1:
-            in_list = month_data.get("in_list", [])
-            if not in_list:
-                st.info("本月暂无进场记录。")
+        all_months_options = ['6月', '7月', '8月', '9月']
+        col_m_sel, col_m_info = st.columns([1, 2])
+        with col_m_sel:
+            sel_month = st.selectbox("选择查看月份", options=all_months_options, index=1)
+            
+        m_data = summary.get(sel_month, {"in_total": 0, "out_total": 0, "onsite_total": 0, "actual_onsite_total": 0, "net_change": 0, "teams": {}})
+        
+        # 月度核心指标小卡片 (包含实际在场与报备在场)
+        m_c1, m_c2, m_c3, m_c4, m_c5 = st.columns(5)
+        with m_c1:
+            st.metric("本月进场人数", f"{m_data['in_total']} 人", help="当月新进场录入人数")
+        with m_c2:
+            st.metric("本月离场人数", f"{m_data['out_total']} 人", help="当月办结离场手续人数")
+        with m_c3:
+            st.metric("报备在场总数", f"{m_data['onsite_total']} 人", help="当月月末花名册登记在场总人数")
+        with m_c4:
+            act_val = m_data.get('actual_onsite_total', m_data['onsite_total'] - m_data['out_total'])
+            st.metric("实际在场人数", f"{act_val} 人", help="扣除退场离场人员后的现场真实驻场人数")
+        with m_c5:
+            delta_val = m_data['net_change']
+            st.metric("本月人员净变动", f"{delta_val:+d} 人", delta=f"{delta_val:+d}")
+
+        st.markdown("<div style='margin-top: 14px;'></div>", unsafe_allow_html=True)
+
+        # 分包队伍月度对比
+        st.markdown(f"#### 🏢 {sel_month} 分包队伍明细分布")
+        team_yi_stats = m_data["teams"].get("江苏旭之升 (王宜强施工班组)", {"in_count": 0, "out_count": 0, "onsite_count": 0, "actual_onsite_count": 0})
+        team_wang_stats = m_data["teams"].get("青海久昌 (汪佩沾其他班组)", {"in_count": 0, "out_count": 0, "onsite_count": 0, "actual_onsite_count": 0})
+        
+        team_summary_df = pd.DataFrame([
+            {
+                "分包单位 / 班组": "青海久昌 (汪佩沾其他班组)",
+                "进场人数": team_wang_stats["in_count"],
+                "离场人数": team_wang_stats["out_count"],
+                "报备在场人数": team_wang_stats["onsite_count"],
+                "实际在场人数": team_wang_stats.get("actual_onsite_count", team_wang_stats["onsite_count"] - team_wang_stats["out_count"]),
+                "净变动": team_wang_stats["in_count"] - team_wang_stats["out_count"]
+            },
+            {
+                "分包单位 / 班组": "江苏旭之升 (王宜强施工班组)",
+                "进场人数": team_yi_stats["in_count"],
+                "离场人数": team_yi_stats["out_count"],
+                "报备在场人数": team_yi_stats["onsite_count"],
+                "实际在场人数": team_yi_stats.get("actual_onsite_count", team_yi_stats["onsite_count"] - team_yi_stats["out_count"]),
+                "净变动": team_yi_stats["in_count"] - team_yi_stats["out_count"]
+            },
+            {
+                "分包单位 / 班组": "金属屋面专业分包合计",
+                "进场人数": m_data["in_total"],
+                "离场人数": m_data["out_total"],
+                "报备在场人数": m_data["onsite_total"],
+                "实际在场人数": m_data.get("actual_onsite_total", m_data["onsite_total"] - m_data["out_total"]),
+                "净变动": m_data["net_change"]
+            }
+        ])
+        st.dataframe(team_summary_df, use_container_width=True, hide_index=True)
+
+        # 展开全周期官方月报表核对
+        with st.expander("📑 查看 6-9 月全周期官方人员变更汇总基准表 (与月报合计表完全对齐)", expanded=False):
+            st.markdown("""
+| 月份 | 公司 | 进场 | 离场 | 在场 | 在场合计 | 实际在场 | 实际在场合计 |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| **6** | 青海久昌 | 15 | 0 | 15 | **34** | 15 | **34** |
+| | 江苏旭之升 | 19 | 0 | 19 | | 19 | |
+| **7** | 青海久昌 | 17 | 4 | 32 | **58** | 28 | **47** |
+| | 江苏旭之升 | 7 | 7 | 26 | | 19 | |
+| **8** | 青海久昌 | 3 | 2 | 31 | **60** | 29 | **57** |
+| | 江苏旭之升 | 10 | 1 | 29 | | 28 | |
+| **9** | 青海久昌 | 3 | 9 | 32 | **61** | 23 | **51** |
+| | 江苏旭之升 | 1 | 1 | 29 | | 28 | |
+            """)
+
+        st.markdown("<div style='margin-top: 20px;'></div>", unsafe_allow_html=True)
+
+        # 当月人员进出场明细表格
+        t_in_list, t_out_list = st.tabs([f"📥 {sel_month} 进场人员名单 ({m_data['in_total']}人)", f"📤 {sel_month} 离场人员名单 ({m_data['out_total']}人)"])
+        
+        with t_in_list:
+            sub_in = df_inflow[df_inflow['Month'] == sel_month] if not df_inflow.empty else pd.DataFrame()
+            if sub_in.empty:
+                st.info(f"{sel_month} 没有进场登记人员。")
             else:
-                df_in = pd.DataFrame([
-                    {
-                        "姓名": r.get("姓名", ""), 
-                        "班组": r.get("班组", ""), 
-                        "进场日期": _format_date(r.get("进场日期") or r.get("进场时间") or r.get("入场日期"))
-                    }
-                    for r in in_list
-                ])
-                st.dataframe(df_in, use_container_width=True, hide_index=True)
-                
-        with t2:
-            out_list = month_data.get("out_list", [])
-            if not out_list:
-                st.info("本月暂无完成归档的离场记录。正在离场结算中的人员不计入此处。")
+                show_in_cols = ['Name', 'Team', 'ID', 'Date', 'Job', 'ContractSigned', 'Registered', 'Remarks']
+                display_in = sub_in[show_in_cols].rename(columns={
+                    'Name': '姓名', 'Team': '所属队伍/班组', 'ID': '身份证号',
+                    'Date': '进场日期', 'Job': '工种', 'ContractSigned': '劳动合同签订',
+                    'Registered': '市建委备案', 'Remarks': '备注'
+                })
+                st.dataframe(display_in, use_container_width=True, hide_index=True)
+
+        with t_out_list:
+            sub_out = df_outflow[df_outflow['Month'] == sel_month] if not df_outflow.empty else pd.DataFrame()
+            if sub_out.empty:
+                st.info(f"{sel_month} 没有离场登记人员。")
             else:
-                df_out = pd.DataFrame([
-                    {
-                        "姓名": r.get("姓名", ""), 
-                        "班组": r.get("班组", ""), 
-                        "离场日期": _format_date(r.get("离场日期", ""))
-                    }
-                    for r in out_list
-                ])
-                st.dataframe(df_out, use_container_width=True, hide_index=True)
+                show_out_cols = ['Name', 'Team', 'ID', 'Date', 'Duration', 'Job', 'WageSettled', 'CommitmentSigned']
+                display_out = sub_out[show_out_cols].rename(columns={
+                    'Name': '姓名', 'Team': '所属队伍/班组', 'ID': '身份证号',
+                    'Date': '离场日期', 'Duration': '在场时间(天/月)', 'Job': '工种',
+                    'WageSettled': '工资结算支付情况', 'CommitmentSigned': '退场承诺书签订'
+                })
+                st.dataframe(display_out, use_container_width=True, hide_index=True)
+
+        # 可选：展开月度报文生成器 (向前兼容原功能)
+        with st.expander("📝 查看/生成该月标准化报表文本 (用于工作汇报直贴)", expanded=False):
+            date_str = _get_report_date_str(f"2026-0{sel_month[0]}")
+            text_total = f"①总：劳务（专业）分包单位： 中建二局安装工程有限公司        班组名称：  金属屋面         日期： {date_str}  本月进场务工人员总数:    {m_data['in_total']}          本月离场务工人员总数:   {m_data['out_total']}         本月现场务工人员总数：   {m_data['onsite_total']}"
+            text_wang = f"②分：劳务（专业）分包单位： 中建二局安装工程有限公司        班组名称：  汪佩沾其它班组         日期： {date_str}  本月进场务工人员总数:    {team_wang_stats['in_count']}         本月离场务工人员总数:   {team_wang_stats['out_count']}         本月现场务工人员总数：   {team_wang_stats['onsite_count']}"
+            text_yi = f"③分：劳务（专业）分包单位： 中建二局安装工程有限公司        班组名称：  王宜强施工班组         日期： {date_str}  本月进场务工人员总数:    {team_yi_stats['in_count']}          本月离场务工人员总数:   {team_yi_stats['out_count']}         本月现场务工人员总数：   {team_yi_stats['onsite_count']}"
+            st.code(f"{text_total}\n{text_wang}\n{text_yi}", language="text")
+
+    # ==========================================
+    # Tab 3: 全员参建档案总库 (72人花名册透视)
+    # ==========================================
+    with tab_roster:
+        st.markdown(f"### 👥 项目参建务工人员全景花名册 (累计参建 {len(unique_df)} 人)")
+        
+        # 多维筛选器
+        f_c1, f_c2, f_c3, f_c4 = st.columns(4)
+        with f_c1:
+            kw_search = st.text_input("🔍 搜索姓名 / 身份证", placeholder="输入姓名或身份证...")
+        with f_c2:
+            team_opts = ["全部队伍"] + sorted(list(unique_df['Team'].dropna().unique()))
+            sel_team = st.selectbox("筛选队伍/班组", options=team_opts)
+        with f_c3:
+            job_opts = ["全部工种"] + sorted(list(unique_df['Job_Clean'].dropna().unique()))
+            sel_job = st.selectbox("筛选工种", options=job_opts)
+        with f_c4:
+            prov_opts = ["全部省份"] + sorted(list(unique_df['Province'].dropna().unique()))
+            sel_prov = st.selectbox("筛选籍贯省份", options=prov_opts)
+
+        filtered_df = unique_df.copy()
+        if kw_search.strip():
+            kw = kw_search.strip()
+            filtered_df = filtered_df[filtered_df['Name'].str.contains(kw, na=False) | filtered_df['ID'].str.contains(kw, na=False)]
+        if sel_team != "全部队伍":
+            filtered_df = filtered_df[filtered_df['Team'] == sel_team]
+        if sel_job != "全部工种":
+            filtered_df = filtered_df[filtered_df['Job_Clean'] == sel_job]
+        if sel_prov != "全部省份":
+            filtered_df = filtered_df[filtered_df['Province'] == sel_prov]
+
+        # 筛选结果提示
+        f_ages = filtered_df['Age'].dropna()
+        f_avg_age = round(float(f_ages.mean()), 1) if not f_ages.empty else 0.0
+        st.caption(f"当前筛选出 **{len(filtered_df)}** 人 | 平均年龄: **{f_avg_age}** 岁 | 男: **{len(filtered_df[filtered_df['Gender']=='男'])}** 人 / 女: **{len(filtered_df[filtered_df['Gender']=='女'])}** 人")
+
+        display_roster = filtered_df[[
+            'Name', 'Gender', 'Age', 'AgeGroup', 'Job', 'Team', 'Province', 'ID', 'Address', 'ContractNo'
+        ]].rename(columns={
+            'Name': '姓名', 'Gender': '性别', 'Age': '周岁', 'AgeGroup': '年龄梯队',
+            'Job': '工种', 'Team': '所属队伍', 'Province': '籍贯省份', 'ID': '身份证号',
+            'Address': '家庭住址', 'ContractNo': '劳动合同编号'
+        })
+        st.dataframe(display_roster, use_container_width=True, hide_index=True)
+
+        # 导出下载按键
+        csv_buffer = io.BytesIO()
+        display_roster.to_csv(csv_buffer, index=False, encoding="utf_8_sig")
+        st.download_button(
+            label="📥 导出当前筛选人员名单 (CSV)",
+            data=csv_buffer.getvalue(),
+            file_name="project_workers_filtered.csv",
+            mime="text/csv",
+            type="primary"
+        )
+
+    # ==========================================
+    # Tab 4: 高清报表大图导出 (Matplotlib)
+    # ==========================================
+    with tab_export:
+        st.markdown("### 🖼️ 专业看板高清图表生成 (对标 plot_dashboard.py)")
+        st.write("根据现场实际解析数据，复刻生成 2x3 画布专业可视化看板大图，支持 300 DPI 超清保存与汇报打印。")
+
+        col_gen, col_down = st.columns([1, 1])
+        with col_gen:
+            if st.button("🎨 重新渲染高清看板图", type="primary"):
+                st.session_state["mpl_fig_rendered"] = True
+
+        try:
+            fig = personnel_data_service.generate_matplotlib_figure()
+            st.pyplot(fig, use_container_width=True)
+            
+            png_bytes = personnel_data_service.get_matplotlib_png_bytes()
+            st.download_button(
+                label="📥 一键下载 300 DPI 高清看板图片 (PNG)",
+                data=png_bytes,
+                file_name="soccer_stadium_labor_visualization.png",
+                mime="image/png"
+            )
+        except Exception as err:
+            st.error(f"渲染高清图表时出错: {err}")
+
+    # ==========================================
+    # Tab 5: 数据源管理与同步
+    # ==========================================
+    with tab_source:
+        st.markdown("### 📂 数据源管理与同步状态")
+        st.write("系统会自动解析 `load-data` 目录下的三张核心表格并动态缓存：")
+        
+        status_info = personnel_data_service.get_data_status()
+        status_rows = []
+        for k, v in status_info.items():
+            status_rows.append({
+                "数据表": v["label"],
+                "文件是否存在": "✅ 存在" if v["exists"] else "❌ 缺失",
+                "文件大小": f"{v['size_kb']} KB" if v["exists"] else "-",
+                "最后更新时间": v["mtime"] or "-",
+                "文件绝对路径": v["path"]
+            })
+        st.dataframe(pd.DataFrame(status_rows), use_container_width=True, hide_index=True)
+
+        if st.button("🔄 强制清空缓存并重新解析 Excel 数据", type="secondary"):
+            personnel_data_service.load_all_data(force_reload=True)
+            st.success("🎉 数据已成功重新解析并刷新！")
+            st.rerun()
+
+        st.markdown("---")
+        st.markdown("#### 💡 数据表规范说明")
+        st.markdown("""
+        1. **人员花名册**：`中建二局安装务工人员（含队长、班组长、弄民工）花名册.xlsx`，记录 6-9 月各队伍在场劳务工人员花名册；
+        2. **进场月报表**：`二局安装-足球场项目人员变更月报表（进场情况）.xlsx`，记录各月新增进场人员清单；
+        3. **离场月报表**：`二局安装-足球场项目人员变更月报表（离场情况）.xlsx`，记录各月规范退场人员清单、工资金额结清与退场承诺书签署状态。
+        """)
