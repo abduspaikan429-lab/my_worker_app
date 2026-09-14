@@ -184,17 +184,17 @@ def process_and_merge(files_a, files_b):
     df_b = process_file_list(files_b, 'B')
 
     if df_a is None and df_b is None:
-        return None, 0, 0, 0
+        return None, 0, 0, 0, []
 
     if df_a is None:
         for c in df_b.columns:
             df_b[c] = df_b[c].apply(clean_val)
-        return df_b, len(df_b), 0, len(df_b)
+        return df_b, len(df_b), 0, len(df_b), []
 
     if df_b is None:
         for c in df_a.columns:
             df_a[c] = df_a[c].apply(clean_val)
-        return df_a, len(df_a), 0, len(df_a)
+        return df_a, len(df_a), 0, len(df_a), []
 
     # 统计重合人数
     set_a = set(df_a['身份证号'].dropna().unique()) if '身份证号' in df_a.columns else set()
@@ -213,11 +213,29 @@ def process_and_merge(files_a, files_b):
     final_df = pd.DataFrame()
     final_df['身份证号'] = merged['身份证号']
 
+    conflicts = []
+
     for col in all_cols:
         col_a = f"{col}_A"
         col_b = f"{col}_B"
         if col_a in merged.columns and col_b in merged.columns:
-            final_df[col] = merged[col_a].replace('', pd.NA).fillna(merged[col_b])
+            def resolve_and_detect(row):
+                val_a = clean_val(row[col_a])
+                val_b = clean_val(row[col_b])
+                if val_a and val_b and val_a != val_b:
+                    name_a = clean_val(row['姓名_A']) if '姓名_A' in row.index else ''
+                    name_b = clean_val(row['姓名_B']) if '姓名_B' in row.index else ''
+                    conflicts.append({
+                        '身份证号': clean_val(row['身份证号']),
+                        '姓名': name_a if name_a else name_b,
+                        '字段': col,
+                        '系统A': val_a,
+                        '系统B': val_b,
+                        '最终决定': '系统A'
+                    })
+                return val_a if val_a else val_b
+            
+            final_df[col] = merged.apply(resolve_and_detect, axis=1)
         elif col_a in merged.columns:
             final_df[col] = merged[col_a]
         elif col_b in merged.columns:
@@ -245,7 +263,7 @@ def process_and_merge(files_a, files_b):
     remaining_cols = [c for c in final_df.columns if c not in existing_cols]
     ordered_df = final_df[existing_cols + remaining_cols]
 
-    return ordered_df, len(set_a), overlap_count, len(set_b)
+    return ordered_df, len(set_a), overlap_count, len(set_b), conflicts
 
 
 def generate_excel(df):
@@ -444,29 +462,88 @@ def render():
 
     try:
         if process_btn:
-            with st.spinner("数据清洗与主表同步中..."):
-                raw_merged_df, count_a, overlap_count, count_b = process_and_merge(files_a, files_b)
+            with st.spinner("数据清洗与待处理分析中..."):
+                raw_merged_df, count_a, overlap_count, count_b, conflicts = process_and_merge(files_a, files_b)
 
             if raw_merged_df is None or raw_merged_df.empty:
                 st.warning("未能提取到有效的劳务人员数据。")
                 return
 
             st.session_state.info_merge_counts = (count_a, overlap_count, count_b)
+            st.session_state.raw_merged_df = raw_merged_df
+            st.session_state.merge_conflicts = conflicts
 
-            # 自动全量写入/同步项目人员主表 (data/master_state.json & worker.db & 版本快照)
-            file_names = [getattr(f, 'name', '') for f in (files_a or []) + (files_b or [])]
-            saved = commit_update(raw_merged_df, source_files=file_names)
-            st.session_state.master_sync_result = saved
-            
-            if saved.get('error'):
-                st.error(f"主表同步失败: {saved['error']}")
-                st.session_state.merged_df = raw_merged_df
+            if conflicts:
+                st.session_state.resolving_conflicts = True
+                st.session_state.conflicts_df = pd.DataFrame(conflicts)
             else:
-                st.session_state.merged_df = saved['merged_df']
+                st.session_state.resolving_conflicts = False
+                st.session_state.merge_confirmed = True
+
+        if st.session_state.get('resolving_conflicts', False):
+            st.warning(f"⚠️ 检测到 {len(st.session_state.merge_conflicts)} 处两系统档案数据不一致（冲突），请您确认后存档。")
+            
+            st.markdown("### 解决数据冲突")
+            
+            col_a, col_b, col_empty = st.columns([1, 1, 4])
+            if col_a.button("一键全保留 系统A"):
+                st.session_state.conflicts_df['最终决定'] = '系统A'
+                st.rerun()
+            if col_b.button("一键全保留 系统B"):
+                st.session_state.conflicts_df['最终决定'] = '系统B'
+                st.rerun()
+
+            edited_conflicts_df = st.data_editor(
+                st.session_state.conflicts_df,
+                column_config={
+                    "最终决定": st.column_config.SelectboxColumn(
+                        "最终决定 (点击选择)",
+                        help="选择要保留的值",
+                        width="medium",
+                        options=["系统A", "系统B"],
+                        required=True,
+                    )
+                },
+                disabled=["身份证号", "姓名", "字段", "系统A", "系统B"],
+                hide_index=True,
+                use_container_width=True
+            )
+            
+            if st.button("✅ 确认合并并更新数据库", type="primary"):
+                resolved_df = st.session_state.raw_merged_df.copy()
+                for _, row in edited_conflicts_df.iterrows():
+                    sid = row['身份证号']
+                    field = row['字段']
+                    decision = row['最终决定']
+                    final_val = row['系统A'] if decision == '系统A' else row['系统B']
+                    
+                    resolved_df.loc[resolved_df['身份证号'] == sid, field] = final_val
+                
+                st.session_state.raw_merged_df = resolved_df
+                st.session_state.resolving_conflicts = False
+                st.session_state.merge_confirmed = True
+                st.rerun()
+            
+            return
+
+        if st.session_state.get('merge_confirmed', False):
+            st.session_state.merge_confirmed = False
+            
+            with st.spinner("自动全量写入/同步项目人员主表中..."):
+                file_names = [getattr(f, 'name', '') for f in (files_a or []) + (files_b or [])]
+                saved = commit_update(st.session_state.raw_merged_df, source_files=file_names)
+                st.session_state.master_sync_result = saved
+                
+                if saved.get('error'):
+                    st.error(f"主表同步失败: {saved['error']}")
+                    st.session_state.merged_df = st.session_state.raw_merged_df
+                else:
+                    st.session_state.merged_df = saved['merged_df']
 
         result_df = st.session_state.get('merged_df')
         if result_df is None or result_df.empty:
-            st.warning("未能提取到有效的劳务人员数据。")
+            if not st.session_state.get('resolving_conflicts', False):
+                st.warning("未能提取到有效的劳务人员数据。")
             return
         count_a, overlap_count, count_b = st.session_state.get('info_merge_counts', (0, 0, 0))
 

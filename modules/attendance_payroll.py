@@ -1174,6 +1174,60 @@ def _workbook_bytes(wb):
     return buffer.getvalue()
 
 
+def build_salary_card_ledger_xlsx(salary_df):
+    if not OPENPYXL_OK or salary_df is None or salary_df.empty:
+        return b''
+    wb = Workbook()
+    ws = wb.active
+    ws.title = '工资卡台账'
+    
+    ft_title = Font(name='宋体', size=16, bold=True)
+    ft_header = Font(name='宋体', size=11, bold=True)
+    ft_body = Font(name='宋体', size=11)
+    ac = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    bd = _thin_border()
+    
+    ws.row_dimensions[1].height = 30
+    title_cell = ws.cell(row=1, column=1, value='农民工工资卡登记台账')
+    title_cell.font = ft_title
+    title_cell.alignment = Alignment(horizontal='center', vertical='center')
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=9)
+    for col in range(1, 10):
+        ws.cell(row=1, column=col).border = bd
+        
+    headers = ['序号', '所属项目', '劳务单位', '姓名', '身份证号', '电话号码', '开户行', '卡号', '备注']
+    ws.row_dimensions[2].height = 20
+    for ci, h in enumerate(headers, 1):
+        c = ws.cell(row=2, column=ci, value=h)
+        c.font = ft_header
+        c.alignment = ac
+        c.border = bd
+        
+    start_row = 3
+    for idx, (_, row) in enumerate(salary_df.iterrows()):
+        r = start_row + idx
+        project = _excel_value(row, '项目全称', '项目简称') or '科技文化中心—国际体育中心（足球场项目）'
+        company = _excel_value(row, '分包/所属企业')
+        name = _excel_value(row, '姓名')
+        id_num = _excel_value(row, '身份证号')
+        phone = _excel_value(row, '联系电话', '手机号', '电话', '手机号码')
+        bank = _excel_value(row, '开户银行')
+        card = _excel_value(row, '银行卡号', '工资卡号', '卡号')
+        
+        vals = [idx + 1, project, company, name, id_num, phone, bank, card, '']
+        for ci, v in enumerate(vals, 1):
+            c = ws.cell(row=r, column=ci, value=_excel_text(v))
+            c.font = ft_body
+            c.alignment = ac
+            c.border = bd
+            if ci in (5, 6, 8):
+                c.number_format = '@'
+
+    _set_col_widths(ws, [6, 25, 25, 12, 22, 15, 20, 22, 15])
+    return _workbook_bytes(wb)
+
+
+
 def build_all_exports_zip(salary_df):
     """将每个公司/月份批次分别生成四个 Excel 工作簿，并打包为 ZIP。"""
     if not OPENPYXL_OK:
@@ -1185,6 +1239,13 @@ def build_all_exports_zip(salary_df):
     zip_buf = io.BytesIO()
     errors = []
     with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        try:
+            ledger_bytes = build_salary_card_ledger_xlsx(salary_df)
+            if ledger_bytes:
+                zf.writestr('农民工工资卡登记台账.xlsx', ledger_bytes)
+        except Exception as exc:
+            errors.append(f'工资卡台账生成失败：{exc}')
+
         for batch in batches:
             c_name = _short_company(batch['company'], attendance=False)
             p_name = batch['period'] or "未知月份"
