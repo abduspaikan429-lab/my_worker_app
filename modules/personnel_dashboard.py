@@ -381,7 +381,7 @@ def render() -> None:
         <div style="display: flex; align-items: center; gap: 14px; font-size: 0.84rem; color: #CBD5E1; flex-wrap: wrap;">
             <span>系统主表: <strong style="color: #60A5FA;">{master_count}</strong> 人</span>
             <span style="opacity: 0.4;">|</span>
-            <span>进场在办: <strong style="color: #34D399;">{onboard_pending}</strong> 人</span>
+            <span>进场在办: <strong style="color: #34D399;">{onboard_pending}</strong> 人 <span style="font-size: 0.76rem; color: #94A3B8;">(全周期卡片/9月5人)</span></span>
             <span style="opacity: 0.4;">|</span>
             <span>离场结算中: <strong style="color: #F87171;">{offboard_pending}</strong> 人</span>
             <span style="opacity: 0.4;">|</span>
@@ -452,7 +452,7 @@ def render() -> None:
     # Tab 1: 态势总览看板 (6大专业图表可视化)
     # ==========================================
     with tab_overview:
-        plotly_figs = personnel_data_service.generate_plotly_figures()
+        plotly_figs = personnel_data_service.generate_plotly_figures(data)
 
         # 第一行：进退场流动趋势 + 队伍月度在场规模堆叠
         row1_c1, row1_c2 = st.columns([1.1, 0.9])

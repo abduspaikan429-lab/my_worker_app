@@ -252,7 +252,7 @@ class OnboardingService:
 
             if sid and sid in master_ids:
                 continue
-            if not sid and (combo in master_names or (not tm and nm in master_names)):
+            if not sid and (combo in master_names or nm in master_names):
                 continue
             new_rows.append(r.to_dict())
 
