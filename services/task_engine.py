@@ -1,7 +1,14 @@
 # services/task_engine.py
 from datetime import date
 from typing import Any, Dict, List, Tuple
-from modules.onboarding_pipeline import PAPER_ITEMS as ON_PAPER, SYSTEM_ITEMS as ON_SYSTEM, ACCESS_ITEMS as ON_ACCESS
+from services.onboarding_service import (
+    PAPER_ITEMS as ON_PAPER,
+    ACCESS_ITEMS as ON_ACCESS,
+    PHOTO_ITEMS as ON_PHOTO,
+    SYSTEM_ITEMS as ON_SYSTEM,
+    is_item_done,
+    are_all_items_done,
+)
 
 # Offboarding constants to be synced with offboarding_service
 OFF_STEPS = [
@@ -20,8 +27,9 @@ def get_onboarding_status(worker_id: str, data: dict, master_ids: set, master_na
     """计算单个进场人员的下一步状态和异常。"""
     info = data.get("info", {})
     paper = data.get("paper", {})
-    system = data.get("system", {})
     access = data.get("access", {})
+    photo = data.get("photo", {})
+    system = data.get("system", {})
     status = data.get("status", "active")
     
     name = str(info.get("姓名", "未知")).strip()
@@ -38,8 +46,13 @@ def get_onboarding_status(worker_id: str, data: dict, master_ids: set, master_na
         in_master = f"{name}_{team}" in master_name_teams
 
     # Calculate completed vs total items for general progress
-    total_items = len(ON_PAPER) + len(ON_SYSTEM) + len(ON_ACCESS) + 1 # +1 for master sync
-    completed_items = sum(1 for v in paper.values() if v) + sum(1 for v in system.values() if v) + sum(1 for v in access.values() if v)
+    total_items = len(ON_PAPER) + len(ON_ACCESS) + len(ON_PHOTO) + len(ON_SYSTEM) + 1 # +1 for master sync
+    completed_items = (
+        sum(1 for k in ON_PAPER if is_item_done(paper, k))
+        + sum(1 for k in ON_ACCESS if is_item_done(access, k))
+        + sum(1 for k in ON_PHOTO if is_item_done(photo, k))
+        + sum(1 for k in ON_SYSTEM if is_item_done(system, k))
+    )
     if in_master:
         completed_items += 1
     
@@ -47,12 +60,12 @@ def get_onboarding_status(worker_id: str, data: dict, master_ids: set, master_na
         return {"worker_id": worker_id, "name": name, "team": team, "type": "onboarding", "category": "completed", "status": "正常在场", "action": "无", "anomaly": None}
 
     anomaly = None
-    if any(access.values()) and not _is_all_true(paper, ON_PAPER):
+    if any(access.values()) and not are_all_items_done(paper, ON_PAPER):
         anomaly = "平台手续已办，但前置纸质资料仍未补齐"
-    elif in_master and not _is_all_true(paper, ON_PAPER):
+    elif in_master and not are_all_items_done(paper, ON_PAPER):
         anomaly = "官方数据已同步，但前置纸质资料仍未补齐"
-    elif in_master and not _is_all_true(access, ON_ACCESS):
-        anomaly = "官方数据已同步，但门禁/小灵光手续未全部完成"
+    elif in_master and not are_all_items_done(access, ON_ACCESS):
+        anomaly = "官方数据已同步，但门禁/平台手续未全部完成"
     elif any(system.values()) and not in_master:
         anomaly = "本地台账已更新，但未执行官方数据导出同步"
 
@@ -60,28 +73,38 @@ def get_onboarding_status(worker_id: str, data: dict, master_ids: set, master_na
     action = ""
     status_label = "进场办理中"
 
-    # Rule Engine: Give ONLY ONE next step
-    if not _is_all_true(paper, ON_PAPER):
-        missing = [k for k in ON_PAPER if not paper.get(k, False)]
+    # Rule Engine: 按照进场实际业务顺序提示唯一下一步
+    if not are_all_items_done(paper, ON_PAPER):
+        missing = [k for k in ON_PAPER if not is_item_done(paper, k)]
         category = "red"
         action = f"补齐资料: {missing[0]}"
-    elif not access.get("门禁录入完成", False):
+    elif not is_item_done(access, "门禁录入完成"):
         category = "orange"
-        action = "等待总包录入门禁"
-    elif not access.get("百工聚合同/告知书签署及加卡", False):
+        action = "等待录入门禁"
+    elif not is_item_done(access, "扫进场码"):
+        category = "orange"
+        action = "扫现场进场码"
+    elif not is_item_done(access, "浙里办-工人保障在线"):
+        category = "orange"
+        action = "注册浙里办-工人保障在线"
+    elif not is_item_done(access, "百工聚加卡签合同"):
         category = "orange"
         action = "等待工人百工聚签合同及加卡"
-    elif not access.get("智慧护薪合同发起及工人/班组长确认", False):
+    elif not is_item_done(access, "人社小灵光签合同"):
         category = "orange"
-        action = "等待工人/班组长智慧护薪确认"
+        action = "等待工人人社小灵光签合同"
+    elif not are_all_items_done(photo, ON_PHOTO):
+        missing_ph = [k for k in ON_PHOTO if not is_item_done(photo, k)]
+        category = "orange"
+        action = f"采集影像: {missing_ph[0]}"
     elif not in_master:
         category = "yellow"
         action = "导出三局和智慧护薪数据导入系统"
         status_label = "等待官方数据同步"
-    elif not _is_all_true(system, ON_SYSTEM):
-        missing = [k for k in ON_SYSTEM if not system.get(k, False)]
+    elif not are_all_items_done(system, ON_SYSTEM):
+        missing_sys = [k for k in ON_SYSTEM if not is_item_done(system, k)]
         category = "red"
-        action = f"同步本地台账: {missing[0]}"
+        action = f"同步本地台账: {missing_sys[0]}"
         status_label = "台账同步中"
     else:
         category = "completed"

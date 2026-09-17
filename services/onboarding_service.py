@@ -11,22 +11,56 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_ONBOARDING_FILE = BASE_DIR / "data" / "onboarding_data.json"
 
 PAPER_ITEMS = [
+    "简易合同",
     "体检单",
     "三级教育",
     "承诺书",
-    "岗前培训",
+    "进场承诺书",
+    "岗前培训试题",
     "签到表按手印(2张)",
     "花名册",
-    "劳动合同(纸质)",
-    "进场告知书(纸质)",
+    "退场承诺书",
+    "离场结算单",
 ]
-SYSTEM_ITEMS = ["更新花名册", "更新月更报表", "更新签到表"]
 ACCESS_ITEMS = [
     "门禁录入完成",
-    "百工聚合同/告知书签署及加卡",
-    "智慧护薪合同发起及工人/班组长确认",
+    "扫进场码",
+    "浙里办-工人保障在线",
+    "百工聚加卡签合同",
+    "人社小灵光签合同",
 ]
-TOTAL_ITEMS = len(PAPER_ITEMS) + len(SYSTEM_ITEMS) + len(ACCESS_ITEMS)
+PHOTO_ITEMS = [
+    "手持身份证+工资卡",
+    "手持合同封面照",
+    "手持合同日工资页照",
+    "手持合同签字页照",
+]
+SYSTEM_ITEMS = ["更新花名册", "更新变更月报", "更新签到表"]
+TOTAL_ITEMS = len(PAPER_ITEMS) + len(ACCESS_ITEMS) + len(PHOTO_ITEMS) + len(SYSTEM_ITEMS)
+
+ITEM_ALIASES: dict[str, list[str]] = {
+    "简易合同": ["劳动合同(纸质)"],
+    "岗前培训试题": ["岗前培训"],
+    "进场承诺书": ["进场告知书(纸质)"],
+    "百工聚加卡签合同": ["百工聚合同/告知书签署及加卡"],
+    "人社小灵光签合同": ["智慧护薪合同发起及工人/班组长确认"],
+    "更新变更月报": ["更新月更报表"],
+}
+
+
+def is_item_done(d: dict, item: str) -> bool:
+    if not isinstance(d, dict):
+        return False
+    if d.get(item, False):
+        return True
+    for alias in ITEM_ALIASES.get(item, []):
+        if d.get(alias, False):
+            return True
+    return False
+
+
+def are_all_items_done(d: dict, items: list[str]) -> bool:
+    return all(is_item_done(d, it) for it in items)
 
 
 class OnboardingService:
@@ -61,10 +95,29 @@ class OnboardingService:
 
     def get_progress(self, worker_data: Dict[str, Any]) -> tuple[int, int]:
         """Calculate completed items count and total items count for a record."""
+        if not isinstance(worker_data, dict):
+            return 0, TOTAL_ITEMS
         completed = 0
-        completed += sum(1 for v in worker_data.get("paper", {}).values() if v)
-        completed += sum(1 for v in worker_data.get("system", {}).values() if v)
-        completed += sum(1 for v in worker_data.get("access", {}).values() if v)
+        paper = worker_data.get("paper", {})
+        for item in PAPER_ITEMS:
+            if is_item_done(paper, item):
+                completed += 1
+
+        access = worker_data.get("access", {})
+        for item in ACCESS_ITEMS:
+            if is_item_done(access, item):
+                completed += 1
+
+        photo = worker_data.get("photo", {})
+        for item in PHOTO_ITEMS:
+            if is_item_done(photo, item):
+                completed += 1
+
+        system = worker_data.get("system", {})
+        for item in SYSTEM_ITEMS:
+            if is_item_done(system, item):
+                completed += 1
+
         return completed, TOTAL_ITEMS
 
     def get_pending_workers(self) -> Dict[str, Dict[str, Any]]:
@@ -149,13 +202,17 @@ class OnboardingService:
                 "paper": {
                     k: data.get("paper", {}).get(k, False) for k in PAPER_ITEMS
                 },
-                "system": {
-                    k: data.get("system", {}).get(k, False)
-                    for k in SYSTEM_ITEMS
-                },
                 "access": {
                     k: data.get("access", {}).get(k, False)
                     for k in ACCESS_ITEMS
+                },
+                "photo": {
+                    k: data.get("photo", {}).get(k, False)
+                    for k in PHOTO_ITEMS
+                },
+                "system": {
+                    k: data.get("system", {}).get(k, False)
+                    for k in SYSTEM_ITEMS
                 },
                 "created_at": str(data.get("created_at") or date.today()),
             }
@@ -260,4 +317,49 @@ class OnboardingService:
             return master_df.copy()
 
         return pd.concat([master_df, pd.DataFrame(new_rows)], ignore_index=True)
+
+    def sync_to_master(self) -> dict[str, Any]:
+        """将进场流水线中已录入有效信息的人员档案增量同步至项目主表。"""
+        from modules.master_data import upsert_master_workers
+
+        records = self.get_records()
+        if not records:
+            return {"added": 0, "updated": 0, "total": 0, "error": "当前暂无进场人员记录"}
+
+        workers_to_sync = []
+        synced_ids = []
+        for rec_id, d in records.items():
+            if not isinstance(d, dict):
+                continue
+            info = d.get("info", {})
+            name = str(info.get("姓名") or "").strip()
+            if not name:
+                continue
+            worker_entry = {
+                "姓名": name,
+                "班组": str(info.get("班组") or "待分配班组").strip(),
+                "身份证号": str(info.get("身份证号") or "").strip(),
+                "手机号": str(info.get("手机号") or "").strip(),
+                "工种": str(info.get("工种") or "").strip(),
+                "银行卡号": str(info.get("银行卡号") or "").strip(),
+                "工资卡号": str(info.get("工资卡号") or info.get("银行卡号") or "").strip(),
+                "结算单价/标准": str(info.get("结算单价/标准") or info.get("日薪") or "").strip(),
+                "进场日期": str(info.get("进场日期") or d.get("created_at") or str(date.today())),
+            }
+            workers_to_sync.append(worker_entry)
+            synced_ids.append(rec_id)
+
+        if not workers_to_sync:
+            return {"added": 0, "updated": 0, "total": 0, "error": "没有可同步的人员信息"}
+
+        res = upsert_master_workers(workers_to_sync, source="onboarding_pipeline")
+        if not res.get("error"):
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            for rec_id in synced_ids:
+                if rec_id in records:
+                    records[rec_id]["synced_to_master"] = True
+                    records[rec_id]["last_synced_at"] = now_str
+            self.save_records(records)
+        return res
+
 

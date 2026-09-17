@@ -8,7 +8,17 @@ from datetime import date
 import hashlib
 import time
 
-from services.onboarding_service import OnboardingService
+from services.onboarding_service import (
+    PAPER_ITEMS,
+    ACCESS_ITEMS,
+    PHOTO_ITEMS,
+    SYSTEM_ITEMS,
+    TOTAL_ITEMS,
+    ITEM_ALIASES,
+    is_item_done,
+    are_all_items_done,
+    OnboardingService,
+)
 
 DATA_FILE = "data/onboarding_data.json"
 onboarding_service = OnboardingService()
@@ -34,18 +44,6 @@ def save_data_if_changed():
         save_data()
         st.session_state._onboarding_last_hash = current_hash
 
-PAPER_ITEMS = [
-    "体检单", "三级教育", "承诺书", "岗前培训", 
-    "签到表按手印(2张)", "花名册", "劳动合同(纸质)", "进场告知书(纸质)"
-]
-SYSTEM_ITEMS = [
-    "更新花名册", "更新月更报表", "更新签到表"
-]
-ACCESS_ITEMS = [
-    "门禁录入完成", "百工聚合同/告知书签署及加卡", "智慧护薪合同发起及工人/班组长确认"
-]
-TOTAL_ITEMS = len(PAPER_ITEMS) + len(SYSTEM_ITEMS) + len(ACCESS_ITEMS)
-
 def init_empty_worker(name, team=""):
     name = name.strip()
     team = team.strip() if team.strip() else "待分配班组"
@@ -63,19 +61,16 @@ def init_empty_worker(name, team=""):
                 "进场日期": str(date.today()),
             },
             "paper": {k: False for k in PAPER_ITEMS},
-            "system": {k: False for k in SYSTEM_ITEMS},
             "access": {k: False for k in ACCESS_ITEMS},
+            "photo": {k: False for k in PHOTO_ITEMS},
+            "system": {k: False for k in SYSTEM_ITEMS},
             "created_at": str(date.today()),
         }
         return True
     return False
 
 def get_progress(worker_data):
-    completed = 0
-    completed += sum(1 for v in worker_data.get("paper", {}).values() if v)
-    completed += sum(1 for v in worker_data.get("system", {}).values() if v)
-    completed += sum(1 for v in worker_data.get("access", {}).values() if v)
-    return completed, TOTAL_ITEMS
+    return onboarding_service.get_progress(worker_data)
 
 def generate_wechat_notice():
     if "onboarding_data" not in st.session_state:
@@ -85,11 +80,13 @@ def generate_wechat_notice():
     missing_huxin_map = {}
 
     for worker_id, data in st.session_state.onboarding_data.items():
-        name = data["info"]["姓名"]
-        team = data["info"]["班组"]
+        name = data.get("info", {}).get("姓名", "")
+        team = data.get("info", {}).get("班组", "")
+        if not name:
+            continue
         
-        missing_huxin = not data["access"]["智慧护薪合同发起及工人/班组长确认"]
-        missing_baigongju = not data["access"]["百工聚合同/告知书签署及加卡"]
+        missing_huxin = not is_item_done(data.get("access", {}), "人社小灵光签合同")
+        missing_baigongju = not is_item_done(data.get("access", {}), "百工聚加卡签合同")
         
         if missing_baigongju:
             if team not in missing_baigongju_map:
@@ -102,7 +99,7 @@ def generate_wechat_notice():
             missing_huxin_map[team].append(name)
             
     if not missing_baigongju_map and not missing_huxin_map:
-        return "所有人员已完成智慧护薪与百工聚确认！"
+        return "所有人员已完成百工聚与人社小灵光确认！"
         
     leader_map = {
         "王宜强": "郭工"
@@ -113,12 +110,12 @@ def generate_wechat_notice():
     for team, workers in missing_baigongju_map.items():
         leader = leader_map.get(team, "汪老板")
         workers_str = "、".join(workers)
-        lines.append(f"{leader}，提醒一下{workers_str}，在百工聚上签合同和进场告知书，并且添加银行卡一类卡信息哟")
+        lines.append(f"{leader}，提醒一下{workers_str}：在【百工聚】上签合同与告知书，并添加本人一类银行卡信息哟！")
         
     for team, workers in missing_huxin_map.items():
         leader = leader_map.get(team, "汪老板")
         workers_str = "、".join(workers)
-        lines.append(f"{leader}，提醒{workers_str}在人社小灵光里面签合同哦")
+        lines.append(f"{leader}，提醒一下{workers_str}：在【人社小灵光】小程序里签署电子劳动合同哦！")
         
     return "\n".join(lines)
 
@@ -128,20 +125,30 @@ def export_to_excel():
         
     rows = []
     for worker_id, data in st.session_state.onboarding_data.items():
-        row = data["info"].copy()
-        row.update(data["paper"])
-        row.update(data["system"])
-        row.update(data["access"])
+        row = data.get("info", {}).copy()
         
+        # 10类纸质材料
+        for k in PAPER_ITEMS:
+            row[f"纸质_{k}"] = "已收" if is_item_done(data.get("paper", {}), k) else "未收"
+        # 门禁与移动端
+        for k in ACCESS_ITEMS:
+            row[f"平台_{k}"] = "已办" if is_item_done(data.get("access", {}), k) else "未办"
+        # 合规影像
+        for k in PHOTO_ITEMS:
+            row[f"影像_{k}"] = "已留存" if is_item_done(data.get("photo", {}), k) else "未留存"
+        # 本地台账
+        for k in SYSTEM_ITEMS:
+            row[f"台账_{k}"] = "已更新" if is_item_done(data.get("system", {}), k) else "未更新"
+            
         completed, total = get_progress(data)
-        row["进场进度"] = f"{completed}/{total}"
-        row["进度百分比"] = f"{int(completed/total*100)}%"
+        row["进场总进度"] = f"{completed}/{total}"
+        row["进度百分比"] = f"{int(completed/total*100)}%" if total > 0 else "0%"
         rows.append(row)
         
     df = pd.DataFrame(rows)
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        df.to_excel(writer, index=False, sheet_name='进场状态追踪')
+        df.to_excel(writer, index=False, sheet_name='进场全要素状态追踪')
     return output.getvalue()
 
 def get_dialog_decorator():
@@ -159,41 +166,53 @@ def worker_dialog(worker_id):
         
     data = st.session_state.onboarding_data[worker_id]
     
-    # Ensure keys exist for backward compatibility
+    # 确保全部分类字典存在，向下无缝兼容历史记录
     if "paper" not in data: data["paper"] = {}
-    if "system" not in data: data["system"] = {}
     if "access" not in data: data["access"] = {}
+    if "photo" not in data: data["photo"] = {}
+    if "system" not in data: data["system"] = {}
     
     info = data["info"]
     
     completed, total = get_progress(data)
-    progress_pct = int((completed / total) * 100)
+    progress_pct = int((completed / total) * 100) if total > 0 else 0
     
     st.markdown(f"### :material/person: {info['姓名']} <span style='font-size:16px;color:gray;'>({info['班组']})</span>", unsafe_allow_html=True)
     st.markdown(f"**当前进度**: {completed}/{total} 项完成 ({progress_pct}%)")
     st.markdown(f'<div class="progress-bar-container"><div class="progress-bar-fill" style="width: {progress_pct}%;"></div></div>', unsafe_allow_html=True)
     
-    bank_card = str(info.get("银行卡号", "")).strip()
+    bank_card = str(info.get("银行卡号", "") or info.get("工资卡号", "")).strip()
     if bank_card:
         if len(bank_card) < 15:
             st.markdown('<div class="alert-box alert-danger">:material/warning: 警告：银行卡号长度不合规，请核实是否为一类卡！</div>', unsafe_allow_html=True)
         else:
-            st.markdown(f'<div class="alert-box alert-success">:material/check_circle: 银行卡号：{bank_card}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="alert-box alert-success">:material/check_circle: 一类工资卡号：{bank_card}</div>', unsafe_allow_html=True)
 
-    col_p, col_s, col_a = st.columns(3)
-    with col_p:
-        st.markdown('<span class="tag-badge badge-blue">纸质/电子资料</span>', unsafe_allow_html=True)
+    col_left, col_right = st.columns(2)
+    with col_left:
+        st.markdown('<span class="tag-badge badge-blue">📄 纸质版审查材料 (10类)</span>', unsafe_allow_html=True)
         for item in PAPER_ITEMS:
-            data["paper"][item] = st.checkbox(item, value=data["paper"].get(item, False), key=f"d_p_{worker_id}_{item}")
-    with col_s:
-        st.markdown('<span class="tag-badge badge-green">人员信息添加</span>', unsafe_allow_html=True)
+            curr_val = is_item_done(data["paper"], item)
+            data["paper"][item] = st.checkbox(item, value=curr_val, key=f"d_p_{worker_id}_{item}")
+
+        st.markdown("<div style='margin-top: 14px;'></div>", unsafe_allow_html=True)
+        st.markdown('<span class="tag-badge badge-green">📑 本地 Excel 台账更新 (3项)</span>', unsafe_allow_html=True)
         for item in SYSTEM_ITEMS:
-            data["system"][item] = st.checkbox(item, value=data["system"].get(item, False), key=f"d_s_{worker_id}_{item}")
-    with col_a:
-        st.markdown('<span class="tag-badge badge-orange">门禁与平台合同</span>', unsafe_allow_html=True)
+            curr_val = is_item_done(data["system"], item)
+            data["system"][item] = st.checkbox(item, value=curr_val, key=f"d_s_{worker_id}_{item}")
+
+    with col_right:
+        st.markdown('<span class="tag-badge badge-orange">📱 门禁与移动端办理 (5项)</span>', unsafe_allow_html=True)
         for item in ACCESS_ITEMS:
-            label = f"**{item}**" if "百工聚" in item else item
-            data["access"][item] = st.checkbox(label, value=data["access"].get(item, False), key=f"d_a_{worker_id}_{item}")
+            curr_val = is_item_done(data["access"], item)
+            label = f"**{item}**" if ("百工聚" in item or "人社小灵光" in item) else item
+            data["access"][item] = st.checkbox(label, value=curr_val, key=f"d_a_{worker_id}_{item}")
+
+        st.markdown("<div style='margin-top: 14px;'></div>", unsafe_allow_html=True)
+        st.markdown('<span class="tag-badge badge-pink">📸 必须留存合规影像 (4张)</span>', unsafe_allow_html=True)
+        for item in PHOTO_ITEMS:
+            curr_val = is_item_done(data["photo"], item)
+            data["photo"][item] = st.checkbox(item, value=curr_val, key=f"d_ph_{worker_id}_{item}")
 
     # 检查是否全部完成
     new_c, new_t = get_progress(data)
@@ -357,13 +376,13 @@ def render():
                 )
 
             # 3. 流程指南收纳在 Expander 中，避免占用大块视野
-            with st.expander(":material/menu_book: 查看标准进场全流程指南", expanded=False):
+            with st.expander(":material/menu_book: 查看标准进场全流程指南 (合规必读)", expanded=False):
                 st.markdown("""
-                1. **线下资料收集**：进场需提交合同、体检单、三级教育、承诺书、岗前培训、两张签到表按手印、花名册等资料。
-                2. **一站式登记与扫码**：资料收齐后去一站式大厅录入人员信息，检查浙里办、人社小灵光、云筑网是否注册，并扫进场二维码。
-                3. **门禁授权**：等待总包发录门禁通知。
-                4. **线上签约与加卡 (关键)**：录完门禁后，提醒工人在【百工聚】签合同、进场通知书及添加银行卡（必须是一类卡）。在【智慧护薪】发起合同后提醒确认。
-                5. **台账更新**：更新花名册、变更月报、签到表。
+                1. **10类纸质材料审查**：简易合同、体检单、三级教育、承诺书、进场承诺书、岗前培训试题、两张签到表按手印、花名册、退场承诺书、离场结算单。
+                2. **门禁与移动端4项**：录门禁、扫现场进场码、注册【浙里办-工人保障在线】、在【百工聚】添加一类银行卡并签合同、在【人社小灵光】签约。
+                3. **4张合规影像留存**：务工人员手持身份证+本人一类工资卡合影；手持合同封面、日工资页、签字页3张影像套件。
+                4. **两系统导出与整合**：在【智慧护薪】与【三局系统】沉淀后导出表格，使用【档案魔法整合】自动清洗去重生成《全量信息表》与《中建二局标准档案表》。
+                5. **台账回填与二局归档**：在【花名册与报表导出】复制新增人员回填本地 Excel（花名册、进场变更月报、水印签到表）；扫描纸质合同与进场承诺书上传【中建二局系统】完成闭环。
                 """)
 
             st.markdown("<div style='margin-top: 12px;'></div>", unsafe_allow_html=True)
@@ -392,10 +411,11 @@ def render():
                         c, t = get_progress(data)
                         pct = int((c / t) * 100) if t > 0 else 0
                         
-                        missing_paper = [k for k, v in data["paper"].items() if not v]
-                        missing_system = [k for k, v in data["system"].items() if not v]
-                        missing_access = [k for k, v in data["access"].items() if not v]
-                        all_missing = missing_paper + missing_system + missing_access
+                        m_paper = [k for k in PAPER_ITEMS if not is_item_done(data.get("paper", {}), k)]
+                        m_access = [k for k in ACCESS_ITEMS if not is_item_done(data.get("access", {}), k)]
+                        m_photo = [k for k in PHOTO_ITEMS if not is_item_done(data.get("photo", {}), k)]
+                        m_system = [k for k in SYSTEM_ITEMS if not is_item_done(data.get("system", {}), k)]
+                        all_missing = m_paper + m_access + m_photo + m_system
                         
                         with cols[idx % 4]:
                             with st.container(border=True):
@@ -417,15 +437,16 @@ def render():
                 summary_data = []
                 for wid, d in filtered_workers:
                     c, t = get_progress(d)
-                    m_paper = [k for k, v in d["paper"].items() if not v]
-                    m_system = [k for k, v in d["system"].items() if not v]
-                    m_access = [k for k, v in d["access"].items() if not v]
-                    m_all = m_paper + m_system + m_access
+                    m_paper = [k for k in PAPER_ITEMS if not is_item_done(d.get("paper", {}), k)]
+                    m_access = [k for k in ACCESS_ITEMS if not is_item_done(d.get("access", {}), k)]
+                    m_photo = [k for k in PHOTO_ITEMS if not is_item_done(d.get("photo", {}), k)]
+                    m_system = [k for k in SYSTEM_ITEMS if not is_item_done(d.get("system", {}), k)]
+                    m_all = m_paper + m_access + m_photo + m_system
                     
                     summary_data.append({
                         "姓名": d["info"]["姓名"],
                         "班组": d["info"]["班组"],
-                        "状态": "手续齐备" if c == t else f"缺 {len(m_all)} 项材料",
+                        "状态": "手续齐备" if c == t else f"缺 {len(m_all)} 项手续",
                         "待办事项": "无" if c == t else "、".join(m_all),
                         "进度": f"{c}/{t}"
                     })

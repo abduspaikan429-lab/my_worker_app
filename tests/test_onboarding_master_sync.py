@@ -148,7 +148,7 @@ def test_process_and_merge_with_synonyms(tmp_path: Path):
     df_huxin.to_excel(f_huxin, index=False)
 
     with open(f_sanju, "rb") as f_a, open(f_huxin, "rb") as f_b:
-        merged_df, count_a, overlap, count_b = info_merge.process_and_merge([f_a], [f_b])
+        merged_df, count_a, overlap, count_b, *rest = info_merge.process_and_merge([f_a], [f_b])
 
     assert merged_df is not None
     assert len(merged_df) == 1

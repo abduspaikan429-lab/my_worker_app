@@ -23,6 +23,8 @@ from modules.master_data import load_master_df, preview_update, commit_update, g
 
 def clean_val(val):
     """防止浮点数带.0以及处理科学计数法字符串与多余空格"""
+    if isinstance(val, pd.Series):
+        val = val.iloc[0] if not val.empty else ""
     if pd.isna(val) or val is None:
         return ""
     s = str(val).strip()
@@ -160,6 +162,10 @@ def process_and_merge(files_a, files_b):
                 if sys_type == 'B' and '序号' in df.columns:
                     df = df.drop(columns=['序号'])
                 df = df.rename(columns=mapping)
+                
+                # 去除重命名后可能产生的重复列，保留第一个
+                df = df.loc[:, ~df.columns.duplicated()]
+                
                 if '身份证号' in df.columns:
                     df['身份证号'] = df['身份证号'].apply(clean_val)
                     df = df[df['身份证号'].str.len() >= 15]
@@ -222,18 +228,40 @@ def process_and_merge(files_a, files_b):
             def resolve_and_detect(row):
                 val_a = clean_val(row[col_a])
                 val_b = clean_val(row[col_b])
-                if val_a and val_b and val_a != val_b:
-                    name_a = clean_val(row['姓名_A']) if '姓名_A' in row.index else ''
-                    name_b = clean_val(row['姓名_B']) if '姓名_B' in row.index else ''
-                    conflicts.append({
-                        '身份证号': clean_val(row['身份证号']),
-                        '姓名': name_a if name_a else name_b,
-                        '字段': col,
-                        '系统A': val_a,
-                        '系统B': val_b,
-                        '最终决定': '系统A'
-                    })
-                return val_a if val_a else val_b
+                
+                if not val_a: return val_b
+                if not val_b: return val_a
+                
+                if val_a != val_b:
+                    if col in ['手机号', '结算单价/标准']:
+                        if col == '结算单价/标准':
+                            import re
+                            nums_a = re.findall(r"[\d.]+", val_a)
+                            nums_b = re.findall(r"[\d.]+", val_b)
+                            if nums_a and nums_b:
+                                try:
+                                    if float(nums_a[0]) == float(nums_b[0]):
+                                        return val_a
+                                except Exception:
+                                    pass
+
+                        name_a = clean_val(row['姓名_A']) if '姓名_A' in row.index else ''
+                        name_b = clean_val(row['姓名_B']) if '姓名_B' in row.index else ''
+                        conflicts.append({
+                            '身份证号': clean_val(row['身份证号']),
+                            '姓名': name_a if name_a else name_b,
+                            '字段': col,
+                            '系统A': val_a,
+                            '系统B': val_b,
+                            '最终决定': '系统A'
+                        })
+                        return val_a
+                    elif col == '详细地址':
+                        return val_b
+                    else:
+                        return val_a
+                
+                return val_a
             
             final_df[col] = merged.apply(resolve_and_detect, axis=1)
         elif col_a in merged.columns:
