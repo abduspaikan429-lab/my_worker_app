@@ -749,6 +749,10 @@ def enrich_with_master(final_df):
         out['银行卡号'] = ''
     if '工资卡号' in out.columns:
         out['银行卡号'] = out['银行卡号'].replace('', pd.NA).fillna(out['工资卡号'])
+    if '工资卡号' not in out.columns:
+        out['工资卡号'] = out['银行卡号']
+    else:
+        out['工资卡号'] = out['工资卡号'].replace('', pd.NA).fillna(out['银行卡号'])
 
     return out
 
@@ -757,9 +761,14 @@ import zipfile
 from openpyxl import load_workbook
 
 def _excel_value(row, *names):
-    """按候选字段读取值；身份证、卡号等字段由调用方再按文本写入。"""
+    """按候选字段读取值；跳过 None、NaN 与空文本，回退到后续候选字段。"""
     for name in names:
-        value = row.get(name, '')
+        if hasattr(row, 'get'):
+            value = row.get(name)
+        elif hasattr(row, '__getitem__') and name in row:
+            value = row[name]
+        else:
+            continue
         if value is None:
             continue
         try:
@@ -767,6 +776,8 @@ def _excel_value(row, *names):
                 continue
         except (TypeError, ValueError):
             pass
+        if str(value).strip() == '':
+            continue
         return value
     return ''
 
@@ -1019,6 +1030,8 @@ def _normalize_company_attendance_grid(ws):
 
 def _populate_company_attendance_sheet(ws, batch):
     group = batch['df']
+    # 考勤为0的直接不要做到考勤表里面
+    group = group[pd.to_numeric(group.get('最终核定天数', 0), errors='coerce').fillna(0) > 0].copy()
     start_row = _normalize_company_attendance_grid(ws)
     footer_row = _prepare_data_area(ws, start_row, len(group), _find_attendance_footer_row)
     _set_attendance_sheet_header(ws, batch, 'company')
@@ -1033,6 +1046,8 @@ def _populate_company_attendance_sheet(ws, batch):
 
 def _populate_zongbao_attendance_sheet(ws, batch):
     group = batch['df']
+    # 考勤为0的直接不要做到考勤表里面
+    group = group[pd.to_numeric(group.get('最终核定天数', 0), errors='coerce').fillna(0) > 0].copy()
     start_row = 5
     footer_row = _prepare_data_area(ws, start_row, len(group), _find_attendance_footer_row)
     _set_attendance_sheet_header(ws, batch, 'zongbao')
@@ -1089,6 +1104,12 @@ def _set_wage_sheet_header(ws, comp_df, company, period=''):
 
 def _populate_company_wage_sheet(ws, batch):
     group = batch['df']
+    # 过滤全月0工时且0工资人员
+    valid_mask = (pd.to_numeric(group.get('最终核定天数', 0), errors='coerce').fillna(0) > 0) | \
+                 (pd.to_numeric(group.get('应发工资', 0), errors='coerce').fillna(0) > 0)
+    if valid_mask.any():
+        group = group[valid_mask].copy()
+
     start_row = 5
     footer_row = _prepare_data_area(ws, start_row, len(group), lambda sheet, start: _find_footer_row(sheet, start))
     _set_wage_sheet_header(ws, group, batch['company'], batch['period'])
@@ -1099,7 +1120,7 @@ def _populate_company_wage_sheet(ws, batch):
     rate_col = _header_col(ws, header_row, ['工资标准', '日薪']) or 5
     gross_col = _header_col(ws, header_row, ['工资总额', '应发工资']) or 6
     pay_col = _header_col(ws, header_row, ['应支付', '实发工资']) or 11
-    card_col = _header_col(ws, header_row, ['银行卡号', '工资卡号', '卡号'])
+    card_col = _header_col(ws, header_row, ['银行卡号', '工资卡号', '卡号', '银行卡']) or 14
     for row_idx, (_, row) in enumerate(group.iterrows(), start=start_row):
         ws.cell(row=row_idx, column=1, value=row_idx - start_row + 1)
         _write_text_cell(ws, row_idx, name_col, _excel_value(row, '姓名'))
@@ -1108,7 +1129,12 @@ def _populate_company_wage_sheet(ws, batch):
         _write_number_cell(ws, row_idx, rate_col, _excel_value(row, '日薪', '提取日薪'))
         _write_number_cell(ws, row_idx, gross_col, _excel_value(row, '应发工资'))
         _write_number_cell(ws, row_idx, pay_col, _excel_value(row, '应发工资'))
-        _write_text_cell(ws, row_idx, card_col, _excel_value(row, '银行卡号', '工资卡号', '卡号'))
+        _write_text_cell(ws, row_idx, card_col, _excel_value(row, '银行卡号', '工资卡号', '卡号', '银行卡'))
+
+    if card_col:
+        col_letter = get_column_letter(card_col)
+        ws.column_dimensions[col_letter].width = max(ws.column_dimensions[col_letter].width or 0, 26)
+
     return {'start_row': start_row, 'footer_row': footer_row, 'pay_col': pay_col}
 
 
@@ -1177,6 +1203,13 @@ def _workbook_bytes(wb):
 def build_salary_card_ledger_xlsx(salary_df):
     if not OPENPYXL_OK or salary_df is None or salary_df.empty:
         return b''
+    # 确保主表档案全量贯通补齐
+    salary_df = enrich_with_master(salary_df)
+    valid_mask = (pd.to_numeric(salary_df.get('最终核定天数', 0), errors='coerce').fillna(0) > 0) | \
+                 (pd.to_numeric(salary_df.get('应发工资', 0), errors='coerce').fillna(0) > 0)
+    if valid_mask.any():
+        salary_df = salary_df[valid_mask].copy()
+
     wb = Workbook()
     ws = wb.active
     ws.title = '工资卡台账'
@@ -1207,12 +1240,12 @@ def build_salary_card_ledger_xlsx(salary_df):
     for idx, (_, row) in enumerate(salary_df.iterrows()):
         r = start_row + idx
         project = _excel_value(row, '项目全称', '项目简称') or '科技文化中心—国际体育中心（足球场项目）'
-        company = _excel_value(row, '分包/所属企业')
+        company = _excel_value(row, '分包/所属企业', '劳务公司', '所属企业')
         name = _excel_value(row, '姓名')
         id_num = _excel_value(row, '身份证号')
         phone = _excel_value(row, '联系电话', '手机号', '电话', '手机号码')
-        bank = _excel_value(row, '开户银行')
-        card = _excel_value(row, '银行卡号', '工资卡号', '卡号')
+        bank = _excel_value(row, '开户银行', '开户行')
+        card = _excel_value(row, '银行卡号', '工资卡号', '卡号', '银行卡')
         
         vals = [idx + 1, project, company, name, id_num, phone, bank, card, '']
         for ci, v in enumerate(vals, 1):
@@ -1228,10 +1261,12 @@ def build_salary_card_ledger_xlsx(salary_df):
 
 
 
-def build_all_exports_zip(salary_df):
-    """将每个公司/月份批次分别生成四个 Excel 工作簿，并打包为 ZIP。"""
+def build_all_exports_zip(salary_df, include_ledger=False):
+    """将每个公司/月份批次分别生成公司标准考勤表与工资确认表（以 - 连接），并打包为 ZIP。"""
     if not OPENPYXL_OK:
         return b''
+    # 确保主表档案全量贯通补齐
+    salary_df = enrich_with_master(salary_df)
     batches = _export_batches(salary_df)
     if not batches:
         return b''
@@ -1239,12 +1274,13 @@ def build_all_exports_zip(salary_df):
     zip_buf = io.BytesIO()
     errors = []
     with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-        try:
-            ledger_bytes = build_salary_card_ledger_xlsx(salary_df)
-            if ledger_bytes:
-                zf.writestr('农民工工资卡登记台账.xlsx', ledger_bytes)
-        except Exception as exc:
-            errors.append(f'工资卡台账生成失败：{exc}')
+        if include_ledger:
+            try:
+                ledger_bytes = build_salary_card_ledger_xlsx(salary_df)
+                if ledger_bytes:
+                    zf.writestr('农民工工资卡登记台账.xlsx', ledger_bytes)
+            except Exception as exc:
+                errors.append(f'工资卡台账生成失败：{exc}')
 
         for batch in batches:
             c_name = _short_company(batch['company'], attendance=False)
@@ -1252,10 +1288,8 @@ def build_all_exports_zip(salary_df):
             
             company_str_gongsi = c_name
             period_str_gongsi = p_name
-            company_str_zongbao = c_name.replace('-', '_').replace('+', '_')
-            period_str_zongbao = p_name.replace('-', '_').replace('+', '_')
 
-            # 公司标准 考勤表
+            # 公司标准 考勤表（以 - 连接）
             try:
                 wb, outputs = _copy_template_sheets(
                     'load-data/muban/gongsi/附件7：务工人员（含队长、班组长、弄民工）考勤表.xlsx',
@@ -1270,7 +1304,7 @@ def build_all_exports_zip(salary_df):
             except Exception as exc:
                 errors.append(f'{c_name} 公司标准考勤表：{exc}')
 
-            # 公司标准 工资确认表
+            # 公司标准 工资确认表（以 - 连接）
             try:
                 wb, outputs = _copy_template_sheets(
                     'load-data/muban/gongsi/副本工资发放表.xlsx',
@@ -1288,36 +1322,6 @@ def build_all_exports_zip(salary_df):
             except Exception as exc:
                 errors.append(f'{c_name} 公司标准工资确认表：{exc}')
 
-            # 总包标准 考勤表
-            try:
-                wb, outputs = _copy_template_sheets(
-                    'load-data/muban/zongbao/考勤表（一式两份本人签字摁手印）.xlsx',
-                    [batch],
-                    lambda b: f"{b['period']}{_short_company(b['company'])}",
-                    company_specific=False,
-                )
-                for b, ws in outputs:
-                    _populate_zongbao_attendance_sheet(ws, b)
-                filename = f'{company_str_zongbao}_{period_str_zongbao}_考勤表.xlsx'
-                zf.writestr(filename, _workbook_bytes(wb))
-            except Exception as exc:
-                errors.append(f'{c_name} 总包标准考勤表：{exc}')
-
-            # 总包标准 工资确认表
-            try:
-                wb, outputs = _copy_template_sheets(
-                    'load-data/muban/zongbao/附件3：农民工资发放确认表(一式两份本人签字摁手印).xlsx',
-                    [batch],
-                    lambda b: f"{b['period']}{_short_company(b['company'])}",
-                    company_specific=False,
-                )
-                for b, ws in outputs:
-                    _populate_zongbao_wage_sheet(ws, b)
-                filename = f'{company_str_zongbao}_{period_str_zongbao}_工资确认表.xlsx'
-                zf.writestr(filename, _workbook_bytes(wb))
-            except Exception as exc:
-                errors.append(f'{c_name} 总包标准工资确认表：{exc}')
-
     for error in errors:
         st.error(f'导出失败：{error}')
     return zip_buf.getvalue()
@@ -1332,279 +1336,526 @@ def render():
     <div class="page-header-deco">
         <span class="header-emoji">🗂️</span>
         <div class="header-text">
-            <h2>考勤对账与工资结算</h2>
-            <p>三方差异可视化 → 领导确认 → 在线定稿 → 一键多模板导出</p>
+            <h2>劳务发薪全流程流水线</h2>
+            <p>工时核算与额度反推 → 第二批工资待发储备池管理</p>
         </div>
     </div>
     <div class="color-strip"></div>
     """, unsafe_allow_html=True)
 
-    tab_check, tab_export = st.tabs([
-        ':material/fact_check: 考勤解析与定稿',
-        ':material/payments: 考勤表与工资表导出',
+    tab_calc, tab_backlog = st.tabs([
+        ':material/calculate: 考勤核定与额度反推',
+        ':material/inventory_2: 第二批工资待发储备池'
     ])
 
-    with tab_check:
-        att_status = st.session_state.get('_att_status', None) # None, 'draft', 'finalized'
-        parsed_df = st.session_state.get('_att_parsed_df')
-        final_df  = st.session_state.get('final_attendance')
+    from services.payroll_calculation_service import (
+        filter_top_working_days,
+        calculate_budget_allocation,
+        add_to_backlog,
+        get_backlog_for_company,
+        extract_from_backlog,
+        number_to_rmb_capital,
+        parse_sanju_punch_excel,
+        reconcile_attendance,
+    )
 
-        # ── Step 1：上传与解析 ────────────────────────────
+    # ── Tab 1: 💰 考勤核定与额度反推 ──────────────────────────────────
+    with tab_calc:
+        # Step 1: 双表上传与解析
         with st.container(border=True):
             st.markdown("""
             <div class="step-indicator">
                 <span class="step-num">1</span>
-                <span>上传水印签到表并解析</span>
+                <span>上传总包系统打卡流水表 & 我的考勤表</span>
             </div>
             """, unsafe_allow_html=True)
-
-            st.caption('请上传考勤水印签到表（系统将自动识别 √ 及时间格式计算出勤天数）')
             
-            company_names = ['江苏旭之升建筑工程有限公司', '青海久昌建筑装饰工程有限公司']
-            company = st.selectbox('默认所属企业（如果文件内未写明公司）', company_names)
-            file_watermarks = st.file_uploader('水印签到表 (Excel) - 可多选', type=['xlsx', 'xls'], key='att_watermark', accept_multiple_files=True)
+            c_p1, c_p2 = st.columns([1, 1])
+            with c_p1:
+                period_input = st.text_input("发薪月份/周期 (如: 8月 或 6、7月)", value=st.session_state.get('_payroll_period', '8月'), key='payroll_period_input')
+            with c_p2:
+                company_input = st.selectbox("默认分包劳务单位", ["江苏旭之升建筑工程有限公司", "青海久昌建筑装饰工程有限公司"], key='payroll_comp_select')
 
-            if st.button(':material/document_scanner: 解析签到表', type='primary', key='btn_parse_watermark'):
-                if not file_watermarks:
-                    st.warning(':material/info: 请至少上传一份水印签到表')
+            c_u1, c_u2 = st.columns(2)
+            with c_u1:
+                file_system = st.file_uploader(
+                    "1. 【必传】总包系统考勤打卡流水 (如中建三局劳务工人考勤明细表)",
+                    type=['xlsx', 'xls'],
+                    key='payroll_file_system',
+                    help="导出自三局系统或智慧护薪系统的打卡流水表，需包含每日工作时长(小时)"
+                )
+            with c_u2:
+                file_my = st.file_uploader(
+                    "2. 【可选】我的考勤表 / 水印签到表",
+                    type=['xlsx', 'xls'],
+                    key='payroll_file_my',
+                    help="劳资员日常登记或水印拍照核对表，如未上传将以系统考勤为基础与班组长对账"
+                )
+
+            if st.button(":material/compare_arrows: 开始三方智能对账与解析", type='primary', key='btn_parse_att'):
+                if not file_system and not file_my:
+                    st.warning(":material/info: 请至少上传一份考勤文件（推荐上传总包系统考勤打卡流水）")
                 else:
-                    with st.spinner('正在解析签到表……'):
-                        all_res_dfs = []
-                        for fw in file_watermarks:
-                            df_raw = _safe_read(fw, '水印签到表')
-                            period = _infer_period(getattr(fw, 'name', ''))
-                            
-                            fname = getattr(fw, 'name', '')
-                            file_company = company
-                            if '旭之升' in fname or '江苏' in fname:
-                                file_company = '江苏旭之升建筑工程有限公司'
-                            elif '久昌' in fname or '青海' in fname:
-                                file_company = '青海久昌建筑装饰工程有限公司'
-                            else:
-                                try:
-                                    if hasattr(fw, 'seek'):
-                                        fw.seek(0)
-                                    head_df = __import__('pandas').read_excel(fw, header=None, nrows=10)
-                                    head_text = head_df.to_string(index=False, header=False)
-                                    if '旭之升' in head_text or '江苏' in head_text:
-                                        file_company = '江苏旭之升建筑工程有限公司'
-                                    elif '久昌' in head_text or '青海' in head_text:
-                                        file_company = '青海久昌建筑装饰工程有限公司'
-                                except Exception:
-                                    pass
+                    with st.spinner("正在解析总包每日打卡工时并匹配人员档案……"):
+                        if file_system:
+                            sys_df, detected_period = parse_sanju_punch_excel(file_system)
+                            if detected_period and detected_period != '8月':
+                                period_input = detected_period
 
-                            res_df = parse_watermark_attendance(df_raw, company=file_company, period=period)
-                            all_res_dfs.append(res_df)
-                        
-                        if not all_res_dfs:
-                            st.error('解析失败。')
+                            my_parsed = None
+                            if file_my:
+                                df_my_raw = _safe_read(file_my, '我的考勤表')
+                                my_parsed = parse_watermark_attendance(df_my_raw, company=company_input, period=period_input)
+
+                            enriched = enrich_with_master(sys_df)
+                            if '提取日薪' not in enriched.columns:
+                                enriched['提取日薪'] = 300.0
+                            enriched['提取日薪'] = pd.to_numeric(enriched['提取日薪'], errors='coerce').fillna(300.0)
+                            if '津贴' not in enriched.columns:
+                                enriched['津贴'] = 0.0
+                            enriched['津贴'] = pd.to_numeric(enriched['津贴'], errors='coerce').fillna(0.0)
+
+                            reconciled = reconcile_attendance(enriched, my_df=my_parsed)
+                            reconciled['锁定'] = False
+
+                            st.session_state['_payroll_working_df'] = reconciled
+                            st.session_state['_payroll_period'] = period_input
+                            st.session_state.pop('_payroll_allocated_df', None)
+                            st.success(f"✅ 三方考勤解析成功！共识别到 {len(reconciled)} 名务工人员。")
+                            st.rerun()
                         else:
-                            final_res_df = __import__('pandas').concat(all_res_dfs, ignore_index=True)
-                            if final_res_df.empty:
-                                st.error('未能识别到有效人员或考勤数据，请检查表格格式。')
-                            else:
-                                st.session_state['_att_parsed_df'] = final_res_df
-                                st.session_state['_att_status'] = 'draft'
-                                st.session_state.pop('final_attendance', None)
-                                st.session_state.pop('att_data_editor', None)
-                                st.success(f'解析成功！共识别到 {len(final_res_df)} 名人员。')
-                                st.rerun()
-        # ── Step 2：在线确认与定稿 ─────────────────────────────────
-        if att_status in ['draft', 'finalized'] and parsed_df is not None and not parsed_df.empty:
-            st.markdown('---')
+                            # 仅上传了水印签到表
+                            df_raw = _safe_read(file_my, '考勤打卡表')
+                            parsed = parse_watermark_attendance(df_raw, company=company_input, period=period_input)
+                            enriched = enrich_with_master(parsed)
+                            if '提取日薪' not in enriched.columns:
+                                enriched['提取日薪'] = 300.0
+                            enriched['提取日薪'] = pd.to_numeric(enriched['提取日薪'], errors='coerce').fillna(300.0)
+                            if '津贴' not in enriched.columns:
+                                enriched['津贴'] = 0.0
+                            enriched['津贴'] = pd.to_numeric(enriched['津贴'], errors='coerce').fillna(0.0)
+                            enriched['总包系统天数'] = enriched['解析出勤天数']
+                            enriched['我的考勤天数'] = enriched['解析出勤天数']
+                            enriched['班组长核定工日'] = enriched['解析出勤天数']
+                            enriched['最终裁定工日'] = enriched['解析出勤天数']
+                            enriched['最终核定天数'] = enriched['解析出勤天数']
+                            enriched['裁定状态'] = '✔️ 单源打卡'
+                            enriched['总工时'] = enriched['解析出勤天数'] * 8.0
+                            enriched['平均工时'] = 8.0
+                            enriched['_raw_punch_hours'] = [dict(r.get('__考勤明细__', {})) if isinstance(r.get('__考勤明细__'), dict) else {} for _, r in enriched.iterrows()]
+                            enriched['应发工资'] = (enriched['最终核定天数'] * enriched['提取日薪'] + enriched['津贴']).round(2)
+                            enriched['锁定'] = False
+
+                            st.session_state['_payroll_working_df'] = enriched
+                            st.session_state['_payroll_period'] = period_input
+                            st.session_state.pop('_payroll_allocated_df', None)
+                            st.success(f"✅ 解析成功！共识别到 {len(enriched)} 名务工人员。")
+                            st.rerun()
+
+        # Step 2: 班组长工日核对 (三方智能对账裁决工作台)
+        working_df = st.session_state.get('_payroll_working_df')
+        if working_df is not None and not working_df.empty:
+            st.markdown("---")
             with st.container(border=True):
                 st.markdown("""
                 <div class="step-indicator">
                     <span class="step-num">2</span>
-                    <span>核对考勤明细与定稿</span>
+                    <span>三方考勤智能对账与裁决工作台</span>
+                </div>
+                """, unsafe_allow_html=True)
+                st.markdown("""
+                <div class="hint-box" style="margin-bottom:12px;">
+                💡 <b>三方考勤裁决铁律</b>：系统的考勤只能减不能增。<b>最终裁定工日 = min(班组长核定工日, 总包系统打卡天数)</b>。<br>
+                当班组长核减工日时，系统自动依据总包每日真实打卡时长（小时）从高到低排序，<b>优先保留最长工时打 ✓，自动淘汰混打卡短工时</b>！
                 </div>
                 """, unsafe_allow_html=True)
 
-                if att_status == 'draft':
-                    st.markdown(
-                        '<div class="hint-box">'
-                        ':material/info: 当前为 <b>草稿 (draft)</b> 状态。<br>'
-                        '请在下方双击 <b>✏ 最终核定天数</b> 逐行人工确认和微调，确认无误后点击“考勤定稿”。'
-                        '</div>',
-                        unsafe_allow_html=True,
-                    )
-                else:
-                    st.markdown(
-                        '<div class="celebrate-banner" style="margin:0;">'
-                        '<span class="celebrate-icon">✅</span>'
-                        '考勤已定稿 (finalized)。可进入下一步计算工资或重新修改后再次定稿。'
-                        '</div>',
-                        unsafe_allow_html=True,
-                    )
-
-                # ── 构建基础 DataFrame ─────────────────────────
-                edit_base = parsed_df.copy()
-                for extra in ['工种', '班组', '联系电话', '开户银行', '银行卡号', '性别', '手机号']:
-                    if extra not in edit_base.columns:
-                        edit_base[extra] = ''
-
-                # 优先加载已保存的定稿数据
-                def _row_key(row):
-                    return f"{row.get('分包/所属企业', '')}|{row.get('身份证号', '')}|{row.get('姓名', '')}"
-
-                if final_df is not None and '最终核定天数' in final_df.columns:
-                    saved_map = {_row_key(r): r.get('最终核定天数') for _, r in final_df.iterrows()}
-                    edit_base['最终核定天数'] = edit_base.apply(
-                        lambda r: saved_map.get(_row_key(r), r.get('最终核定天数')), axis=1
-                    )
-
-                # ── 在线编辑器 ─────────────────────────────────
-                display_edit_cols = [
-                    '分包/所属企业', '姓名', '身份证号', '解析出勤天数', '最终核定天数',
-                    '工种', '班组', '联系电话', '开户银行', '银行卡号',
+                display_cols = [
+                    '姓名', '分包/所属企业', '工种', '总工时', '平均工时',
+                    '总包系统天数', '我的考勤天数', '班组长核定工日', '最终裁定工日', '裁定状态',
+                    '提取日薪', '津贴', '应发工资', '锁定'
                 ]
-                display_edit_cols = [c for c in display_edit_cols if c in edit_base.columns]
+                display_cols = [c for c in display_cols if c in working_df.columns]
 
-                col_cfg = {
-                    '姓名':         st.column_config.TextColumn('姓名', disabled=True),
-                    '分包/所属企业': st.column_config.TextColumn('公司', disabled=True),
-                    '解析出勤天数': st.column_config.NumberColumn('系统解析天数', disabled=True, format='%.1f'),
-                    '最终核定天数': st.column_config.NumberColumn(
-                        '✏ 最终核定天数',
-                        min_value=0, max_value=31, step=0.5, format='%.1f',
-                        help='双击单行进行人工确认/修改',
+                col_configs = {
+                    '姓名': st.column_config.TextColumn('姓名', disabled=True),
+                    '分包/所属企业': st.column_config.TextColumn('单位', disabled=True),
+                    '工种': st.column_config.TextColumn('工种', disabled=True),
+                    '总工时': st.column_config.NumberColumn('总工时(h)', disabled=True, format='%.1f'),
+                    '平均工时': st.column_config.NumberColumn('日均工时(h)', disabled=True, format='%.1f'),
+                    '总包系统天数': st.column_config.NumberColumn('系统打卡天数', disabled=True, format='%.1f'),
+                    '我的考勤天数': st.column_config.NumberColumn('我的考勤', disabled=True, format='%.1f'),
+                    '班组长核定工日': st.column_config.NumberColumn(
+                        '✏ 班组长核定工日',
+                        min_value=0.0, max_value=31.0, step=0.5, format='%.1f',
+                        help='双击修改班组长实际认可工日，保存后系统将自动依工时降序重新裁决并打钩'
                     ),
-                    '工种':     st.column_config.TextColumn('工种'),
-                    '班组':     st.column_config.TextColumn('班组'),
-                    '身份证号': st.column_config.TextColumn('身份证号'),
-                    '联系电话': st.column_config.TextColumn('联系电话'),
-                    '开户银行': st.column_config.TextColumn('开户银行'),
-                    '银行卡号': st.column_config.TextColumn('银行卡号'),
+                    '最终裁定工日': st.column_config.NumberColumn(
+                        '✏ 最终裁定工日',
+                        min_value=0.0, max_value=31.0, step=0.5, format='%.1f',
+                        help='支持现场特殊特批修改（断电/故障/抢工特批），不写死；超出打卡天数时自动补齐打钩'
+                    ),
+                    '裁定状态': st.column_config.TextColumn('裁定状态', disabled=True),
+                    '提取日薪': st.column_config.NumberColumn('日薪标准', min_value=0.0, format='¥%.0f'),
+                    '津贴': st.column_config.NumberColumn('✏ 津贴/补助', min_value=0.0, step=50.0, format='¥%.2f', help='带班津贴、高温补贴、岗位补贴等'),
+                    '应发工资': st.column_config.NumberColumn('应发工资', disabled=True, format='¥%.2f', help='(最终裁定工日 × 日薪) + 津贴'),
+                    '锁定': st.column_config.CheckboxColumn('锁定额度 (不削减)', default=False),
                 }
 
-                edited = st.data_editor(
-                    edit_base[display_edit_cols],
-                    column_config=col_cfg,
-                    use_container_width=True,
-                    num_rows='fixed',
-                    hide_index=True,
-                    key='att_data_editor',
-                )
+                col_flt1, col_flt2 = st.columns([3, 1])
+                with col_flt1:
+                    hide_zero_att = st.checkbox("🔍 仅显示有考勤人员（自动隐藏0考勤人员）", value=True, key='chk_hide_zero_att')
+                with col_flt2:
+                    zero_att_count = sum(1 for _, r in working_df.iterrows() if float(r.get('最终裁定工日', 0) or 0) <= 0 and float(r.get('总包系统天数', 0) or 0) <= 0)
+                    if zero_att_count > 0:
+                        st.caption(f"包含 {zero_att_count} 名 0 考勤人员 (已自动不纳入考勤表)")
 
-                c_save, c_info = st.columns([2, 5])
-                with c_save:
-                    if st.button(':material/check_circle: 考勤定稿', type='primary', key='btn_save_final', use_container_width=True):
-                        # data_editor 只返回可见列；把每日明细、月份等隐藏元数据按行补回，
-                        # 确保定稿后的工资计算和四类导出仍能追溯原始考勤日格。
-                        edited = edited.copy()
-                        for hidden_col in edit_base.columns:
-                            if hidden_col not in edited.columns:
-                                edited[hidden_col] = edit_base[hidden_col].to_numpy()
-                        st.session_state['final_attendance'] = enrich_with_master(edited)
-                        st.session_state['_att_status'] = 'finalized'
-                        st.success(':material/check_circle: 定稿成功 (finalized)！请切换至【考勤表与工资表导出】标签页进行工资计算。')
-                        st.rerun()
-                with c_info:
-                    if att_status == 'finalized':
-                        st.markdown('<div class="hint-box" style="margin:0;">:material/info: 已定稿。若重新修改并保存，将更新定稿数据。</div>', unsafe_allow_html=True)
+                if hide_zero_att:
+                    v_mask = (pd.to_numeric(working_df.get('最终裁定工日', 0), errors='coerce').fillna(0) > 0) | \
+                             (pd.to_numeric(working_df.get('总包系统天数', 0), errors='coerce').fillna(0) > 0)
+                    editor_df = working_df[v_mask].copy()
+                    if editor_df.empty:
+                        editor_df = working_df.copy()
+                else:
+                    editor_df = working_df.copy()
 
-        if att_status is not None:
-            with st.expander(':material/refresh: 重新上传 (清空当前数据)'):
-                st.warning('将清除当前的草稿和定稿数据，返回初始状态。')
-                if st.button(':material/delete_forever: 确认清空', key='btn_reset_tab1', type='secondary'):
-                    for k in ['_att_status', '_att_parsed_df', 'final_attendance']:
-                        st.session_state.pop(k, None)
+                with st.form("working_df_form", border=False):
+                    edited_working = st.data_editor(
+                        editor_df[display_cols],
+                        column_config=col_configs,
+                        use_container_width=True,
+                        num_rows='fixed',
+                        hide_index=True,
+                        key='working_data_editor'
+                    )
+                    submit_edits = st.form_submit_button("💾 保存核对工日与津贴并重新裁决", type='primary')
+
+                if submit_edits:
+                    f_map = {}
+                    fin_map = {}
+                    alw_map = {}
+                    wage_map = {}
+                    lock_map = {}
+                    for _, r in edited_working.iterrows():
+                        nm = str(r['姓名']).strip()
+                        try:
+                            f_map[nm] = float(r['班组长核定工日'])
+                        except (ValueError, TypeError):
+                            pass
+                        try:
+                            fin_map[nm] = float(r['最终裁定工日'])
+                        except (ValueError, TypeError):
+                            pass
+                        try:
+                            alw_map[nm] = float(r.get('津贴', 0.0) or 0.0)
+                        except (ValueError, TypeError):
+                            pass
+                        try:
+                            wage_map[nm] = float(r.get('提取日薪', 300.0) or 300.0)
+                        except (ValueError, TypeError):
+                            pass
+                        if '锁定' in r:
+                            lock_map[nm] = bool(r['锁定'])
+
+                    working_df_to_reconcile = working_df.copy()
+                    for idx, row in working_df_to_reconcile.iterrows():
+                        nm = str(row['姓名']).strip()
+                        if nm in wage_map:
+                            working_df_to_reconcile.at[idx, '提取日薪'] = wage_map[nm]
+                        if nm in alw_map:
+                            working_df_to_reconcile.at[idx, '津贴'] = alw_map[nm]
+                        if nm in lock_map:
+                            working_df_to_reconcile.at[idx, '锁定'] = lock_map[nm]
+
+                    re_reconciled = reconcile_attendance(
+                        working_df_to_reconcile,
+                        foreman_days_map=f_map,
+                        final_days_map=fin_map,
+                        allowance_map=alw_map
+                    )
+                    st.session_state['_payroll_working_df'] = re_reconciled
+                    st.success("✅ 已重新保存核对数据，完成智能对账与特批裁决！")
                     st.rerun()
 
-    # ============================================================
-    # Tab 2 — 导出
-    # ============================================================
-    with tab_export:
-        att_status = st.session_state.get('_att_status')
-        final_df = st.session_state.get('final_attendance')
+                current_working_df = st.session_state.get('_payroll_working_df', working_df)
 
-        if att_status != 'finalized' or final_df is None or final_df.empty:
-            st.markdown(
-                '<div class="alert-box alert-danger" style="margin-top:20px;">'
-                ':material/warning: 必须先完成【考勤定稿】(状态: finalized) 才能进行工资计算和导出。'
-                '</div>',
-                unsafe_allow_html=True,
-            )
-            return
+                total_workers = len(current_working_df)
+                sys_total_days = current_working_df['总包系统天数'].sum() if '总包系统天数' in current_working_df.columns else 0.0
+                foreman_total_days = current_working_df['班组长核定工日'].sum() if '班组长核定工日' in current_working_df.columns else 0.0
+                final_total_days = current_working_df['最终裁定工日'].sum()
+                total_allowance = current_working_df['津贴'].sum() if '津贴' in current_working_df.columns else 0.0
+                orig_salary = ((current_working_df['最终裁定工日'] * current_working_df['提取日薪']) + current_working_df.get('津贴', 0.0)).sum()
 
-        with st.container(border=True):
-            st.markdown('#### :material/calculate: 工资联动计算')
-            wage_mode = st.radio('日薪配置模式', ['使用主表日薪', '全局统一日薪', '按工种分别设置'], horizontal=True, key='wage_mode')
-            salary_df = enrich_with_master(final_df)
+                st.markdown(f"""
+                <div class="metric-container" style="margin-top:12px;">
+                    <div class="metric-card"><div class="metric-title">核对总人数</div><div class="metric-value">{total_workers} 人</div></div>
+                    <div class="metric-card"><div class="metric-title">系统打卡工日合计</div><div class="metric-value">{sys_total_days:.1f} 天</div></div>
+                    <div class="metric-card"><div class="metric-title">班组长核定工日合计</div><div class="metric-value">{foreman_total_days:.1f} 天</div></div>
+                    <div class="metric-card"><div class="metric-title">最终裁定有效工日</div><div class="metric-value" style="color:#059669;">{final_total_days:.1f} 天</div></div>
+                    <div class="metric-card"><div class="metric-title">津贴补助合计</div><div class="metric-value">¥{total_allowance:,.2f}</div></div>
+                    <div class="metric-card"><div class="metric-title">全额应发总额</div><div class="metric-value" style="color:#2563EB;">¥{orig_salary:,.2f}</div></div>
+                </div>
+                """, unsafe_allow_html=True)
 
-            if wage_mode == '使用主表日薪':
-                salary_df['日薪'] = pd.to_numeric(salary_df.get('提取日薪', 0), errors='coerce')
-                missing_wage = salary_df['日薪'].isna() | (salary_df['日薪'] <= 0)
-                if missing_wage.any():
-                    missing_names = salary_df.loc[missing_wage, '姓名'].dropna().tolist()
-                    names_str = '、'.join(missing_names[:6]) + (' 等' if len(missing_names) > 6 else '')
-                    st.warning(f'有 {int(missing_wage.sum())} 人未能从 data/master 取得有效日薪（{names_str}），请在【档案魔法整合】上传官方系统档案同步主表后再导出。')
-            elif wage_mode == '全局统一日薪':
-                global_wage = st.number_input('统一日薪（元/天）', min_value=0.0, value=300.0, step=10.0, key='global_wage')
-                salary_df['日薪'] = global_wage
-            else:
-                unique_types = [t for t in final_df.get('工种', pd.Series(dtype=str)).dropna().unique() if str(t).strip()] if '工种' in final_df.columns else []
-                if not unique_types:
-                    st.info('未检测到工种信息，将使用默认 300 元/天。')
-                    salary_df['日薪'] = 300.0
-                else:
-                    cols = st.columns(min(len(unique_types), 4))
-                    wage_map = {}
-                    for idx, wt in enumerate(unique_types):
-                        with cols[idx % 4]:
-                            w = st.number_input(f'「{wt}」日薪', min_value=0.0, value=300.0, step=10.0, key=f'wage_{wt}')
-                            wage_map[str(wt).strip()] = w
-                    salary_df['日薪'] = salary_df['工种'].apply(lambda x: wage_map.get(str(x).strip(), 300.0))
+                # 展开查看工人工时明细与打钩日历抽屉
+                with st.expander("🔍 展开查看工人工时明细与打钩日历抽屉"):
+                    st.caption("您可以选择任意务工人员，查看其 1~31 号每天的具体打卡时长（小时）及系统依据工时由长到短的裁定结果。")
+                    names_list = current_working_df['姓名'].tolist()
+                    chosen_name = st.selectbox("选择要核查的务工人员", names_list, key='inspect_worker_name')
 
-            def _calc(row):
-                try:
-                    return round(float(row['最终核定天数']) * float(row['日薪']), 2)
-                except (ValueError, TypeError):
-                    return ''
+                    worker_row = current_working_df[current_working_df['姓名'] == chosen_name].iloc[0]
+                    raw_punch_hours = worker_row.get('_raw_punch_hours')
+                    if not isinstance(raw_punch_hours, dict):
+                        raw_punch_hours = {}
 
-            salary_df['应发工资'] = salary_df.apply(_calc, axis=1)
+                    selected_marks = worker_row.get('__考勤明细__')
+                    if not isinstance(selected_marks, dict):
+                        selected_marks = {}
 
-        st.markdown('---')
-        st.markdown('#### :material/table_view: 工资预览')
-        preview_cols = [c for c in ['姓名','工种','班组','最终核定天数','日薪','应发工资'] if c in salary_df.columns]
-        st.dataframe(salary_df[preview_cols], use_container_width=True, hide_index=True)
+                    rejected_foreman = worker_row.get('_rejected_foreman')
+                    if not isinstance(rejected_foreman, dict):
+                        rejected_foreman = {}
 
-        valid_salaries = pd.to_numeric(salary_df['应发工资'], errors='coerce').dropna()
-        total_pay = valid_salaries.sum()
-        avg_days  = pd.to_numeric(salary_df['最终核定天数'], errors='coerce').mean()
+                    def _safe_float_val(v):
+                        if v is None or v == '':
+                            return 0.0
+                        try:
+                            return float(v)
+                        except (ValueError, TypeError):
+                            s = str(v).strip()
+                            if '✓' in s or '√' in s or '打卡' in s or '出勤' in s:
+                                return 8.0
+                            return 0.0
 
-        st.markdown(
-            f'''
-            <div class="metric-container">
-                <div class="metric-card"><div class="metric-title">参与结算人数</div><div class="metric-value">{len(salary_df)}</div></div>
-                <div class="metric-card"><div class="metric-title">平均核定天数</div><div class="metric-value">{avg_days:.1f} 天</div></div>
-                <div class="metric-card"><div class="metric-title">工资总额</div><div class="metric-value">¥{total_pay:,.0f}</div></div>
-            </div>
-            ''',
-            unsafe_allow_html=True,
-        )
+                    days_calendar_rows = []
+                    for d in range(1, 32):
+                        h_num = 0.0
+                        has_record = False
+                        if d in raw_punch_hours:
+                            h_num = _safe_float_val(raw_punch_hours[d])
+                            has_record = True
+                        elif d in rejected_foreman:
+                            h_num = _safe_float_val(rejected_foreman[d])
+                            has_record = True
+                        elif d in selected_marks:
+                            h_num = _safe_float_val(selected_marks[d])
+                            has_record = True
 
-        st.markdown('---')
-        st.markdown('#### :material/download: 按标准模板一键导出')
-        st.markdown('<div class="hint-box">系统已读取 `load-data/muban` 目录下的 4 套官方模板，按公司自动分拣，保留所有红头、签字栏及样式进行套打。</div>', unsafe_allow_html=True)
+                        if d in selected_marks:
+                            mark = selected_marks[d]
+                            if str(mark).strip() == '0.5':
+                                status_tag = "✅ ✓ 选入考勤 (半天 0.5工日)"
+                            else:
+                                status_tag = "✅ ✓ 选入考勤 (有效工日)"
+                        elif has_record and (h_num > 0 or d in rejected_foreman):
+                            status_tag = "❌ 淘汰短工时 (混打卡已过滤)"
+                        else:
+                            status_tag = "— 无打卡"
 
-        if not OPENPYXL_OK:
-            st.error('未安装 openpyxl，请运行 pip install openpyxl 后重启应用。')
-        else:
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M')
-            
+                        hours_display = f"{h_num:.2f} h" if h_num > 0 else "-"
+                        if h_num == 8.0 and d not in raw_punch_hours and d in selected_marks:
+                            hours_display = "打卡 (标准工日)"
+
+                        days_calendar_rows.append({
+                            '日期': f"{d} 号",
+                            '打卡工作时长(小时)': hours_display,
+                            '裁定判定状态': status_tag
+                        })
+
+                    st.dataframe(pd.DataFrame(days_calendar_rows), use_container_width=True, hide_index=True)
+
+
+            # Step 3: 资金额度反推与平账 (第二轮：比例反推与额度平齐)
+            st.markdown("---")
             with st.container(border=True):
-                st.markdown('<div style="text-align:center;padding:12px 0"><span style="font-size:40px">🗂️</span><br><b>全量台账压缩包 (ZIP)</b><br><small style="color:#64748B">内含：公司标准考勤、工资表 + 总包标准考勤、工资表<br>已按所属分公司分类整理</small></div>', unsafe_allow_html=True)
-                
-                zip_data = build_all_exports_zip(salary_df)
-                if zip_data:
-                    st.download_button(
-                        label=':material/archive: 一键打包下载全部 4 套台账',
-                        data=zip_data,
-                        file_name=f'劳务考勤发薪全套台账_{timestamp}.zip',
-                        mime='application/zip',
-                        use_container_width=True,
-                        type='primary'
+                st.markdown("""
+                <div class="step-indicator">
+                    <span class="step-num">3</span>
+                    <span>资金额度反推与平账（第二轮：比例反推与截取相对短工时）</span>
+                </div>
+                """, unsafe_allow_html=True)
+
+                col_b1, col_b2 = st.columns([2, 1])
+                with col_b1:
+                    target_budget = st.number_input(
+                        "本次可用资金总额度 (元)",
+                        min_value=0.0,
+                        value=float(st.session_state.get('_target_budget', orig_salary)),
+                        step=500.0,
+                        key='input_target_budget'
                     )
+                with col_b2:
+                    strict_half = st.checkbox("严格规整为 0.5 天整倍数 (推荐工地实战)", value=True, key='check_strict_half')
+
+                is_budget_sufficient = target_budget >= orig_salary - 0.01
+                do_calc = False
+
+                if is_budget_sufficient:
+                    st.markdown(f"""
+                    <div style="background:#ECFDF5; border:1px solid #A7F3D0; border-radius:8px; padding:12px; margin: 10px 0; color:#065F46;">
+                        <b>🟢 资金额度充足（额度 ¥{target_budget:,.2f} ≥ 全额应发 ¥{orig_salary:,.2f}）</b><br>
+                        当前资金完全可以覆盖所有工人工资，<b>无需进行工日反推缩减</b>。可直接点击下方按钮一键确认全额发放。
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    c_btn_ok, c_btn_re = st.columns(2)
+                    with c_btn_ok:
+                        if st.button("💰 额度充足，确认全额发放（无需反推）", type='primary', key='btn_full_pay_confirm', use_container_width=True):
+                            alloc_df = current_working_df.copy()
+                            alloc_df['实发天数'] = alloc_df['最终核定天数']
+                            alloc_df['实发工资'] = alloc_df['应发工资']
+                            alloc_df['扣减天数'] = 0.0
+                            alloc_df['欠发金额'] = 0.0
+                            alloc_df['_rejected_details'] = [{} for _ in range(len(alloc_df))]
+                            st.session_state['_payroll_allocated_df'] = alloc_df
+                            st.session_state['_target_budget'] = target_budget
+                            st.success("✅ 额度充足，已确认全员全额发放！无需扣减任何工日。")
+                            st.rerun()
+                    with c_btn_re:
+                        do_calc = st.button(":material/tune: 仍按此额度强制重算", type='secondary', key='btn_calc_budget_forced', use_container_width=True)
                 else:
-                    st.error("生成打包文件失败，请检查模板文件是否存在。")
+                    do_calc = st.button(":material/tune: 执行额度反推与尾差调平", type='primary', key='btn_calc_budget', use_container_width=True)
+
+                if do_calc:
+                    with st.spinner("正在根据额度智能缩减天数并筛选次长工时……"):
+                        st.session_state['_target_budget'] = target_budget
+                        alloc_df = calculate_budget_allocation(
+                            current_working_df,
+                            total_budget=target_budget,
+                            strict_half_days=strict_half
+                        )
+
+                        rejected_pool = {}
+                        new_details_list = []
+                        for _, row in alloc_df.iterrows():
+                            wk_name = row['姓名']
+                            raw_details = row.get('_raw_punch_hours')
+                            if not isinstance(raw_details, dict) or not raw_details:
+                                raw_details = row.get('__考勤明细__', {})
+                                if not isinstance(raw_details, dict):
+                                    raw_details = {}
+                            actual_days = float(row['实发天数'])
+
+                            selected_days, rejected_days = filter_top_working_days(raw_details, actual_days)
+                            new_details_list.append(selected_days)
+                            rejected_pool[wk_name] = rejected_days
+
+                        alloc_df['__考勤明细__'] = new_details_list
+                        alloc_df['扣减天数'] = (alloc_df['最终核定天数'] - alloc_df['实发天数']).round(2)
+                        alloc_df['欠发金额'] = (alloc_df['应发工资'] - alloc_df['实发工资']).round(2)
+                        alloc_df['_rejected_details'] = [rejected_pool.get(r['姓名'], {}) for _, r in alloc_df.iterrows()]
+
+                        st.session_state['_payroll_allocated_df'] = alloc_df
+                        st.success("✅ 额度反推分配完成！实发天数与金额已严格对齐。")
+                        st.rerun()
+
+                alloc_df = st.session_state.get('_payroll_allocated_df')
+                if alloc_df is not None and not alloc_df.empty:
+                    act_total = alloc_df['实发工资'].sum()
+                    rem_diff = round(target_budget - act_total, 2)
+                    deducted_count = (alloc_df['扣减天数'] > 0).sum()
+                    deducted_amount = alloc_df['欠发金额'].sum()
+
+                    st.markdown(f"""
+                    <div class="metric-container" style="margin-top:12px;">
+                        <div class="metric-card"><div class="metric-title">目标控制额度</div><div class="metric-value">¥{target_budget:,.2f}</div></div>
+                        <div class="metric-card"><div class="metric-title">本次实发总额</div><div class="metric-value" style="color:#059669;">¥{act_total:,.2f}</div></div>
+                        <div class="metric-card"><div class="metric-title">额度结余/微差</div><div class="metric-value">¥{rem_diff:,.2f}</div></div>
+                        <div class="metric-card"><div class="metric-title">涉及延发人数</div><div class="metric-value" style="color:#dc2626;">{deducted_count} 人 (欠¥{deducted_amount:,.0f})</div></div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    preview_cols = ['姓名', '分包/所属企业', '工种', '最终核定天数', '实发天数', '提取日薪', '津贴', '应发工资', '实发工资', '扣减天数', '欠发金额']
+                    preview_cols = [c for c in preview_cols if c in alloc_df.columns]
+                    st.dataframe(alloc_df[preview_cols], use_container_width=True, hide_index=True)
+
+                    col_act1, col_act2 = st.columns(2)
+                    with col_act1:
+                        if st.button(":material/save: 将延发差额存入第二批储备池", type='secondary', use_container_width=True):
+                            added_count = 0
+                            for _, r in alloc_df[alloc_df['扣减天数'] > 0].iterrows():
+                                add_to_backlog(
+                                    period=st.session_state.get('_payroll_period', '当期'),
+                                    company=r.get('分包/所属企业', company_input),
+                                    worker_id=str(r.get('身份证号', '')),
+                                    worker_name=r['姓名'],
+                                    days_deducted=float(r['扣减天数']),
+                                    amount_deducted=float(r['欠发金额']),
+                                    rejected_days=r.get('_rejected_details', {}),
+                                    daily_rate=float(r.get('提取日薪', 0))
+                                )
+                                added_count += 1
+                            st.success(f"🎉 成功将 {added_count} 名工人的欠发工时与明细记录至【第二批工资储备池】！")
+
+                    with col_act2:
+                        export_df = alloc_df.copy()
+                        export_df['最终核定天数'] = export_df['实发天数']
+                        export_df['应发工资'] = export_df['实发工资']
+                        export_df['日薪'] = export_df['提取日薪']
+                        zip_bytes = build_all_exports_zip(export_df, include_ledger=True)
+                        if zip_bytes:
+                            st.download_button(
+                                label=":material/archive: 一键下载标准考勤工资表与台账 (ZIP)",
+                                data=zip_bytes,
+                                file_name=f"劳务考勤工资表与台账_{st.session_state.get('_payroll_period', '当期')}.zip",
+                                mime="application/zip",
+                                use_container_width=True,
+                                type='primary'
+                            )
+
+    # ── Tab 2: 📋 第二批工资待发储备池 ─────────────────────────────────
+    with tab_backlog:
+        st.subheader("第二批工资待发储备池（欠薪工时精准结转）")
+        st.caption("记录因资金额度受限扣减的务工人员工时与具体打卡日期，当下批额度充裕时一键调取生成补发表。")
+
+        b_comp = st.selectbox("选择分包劳务单位", ["江苏旭之升建筑工程有限公司", "青海久昌建筑装饰工程有限公司"], key='select_backlog_comp')
+        backlog_records = get_backlog_for_company(b_comp)
+
+        if not backlog_records:
+            st.info(f"✨ 当前【{b_comp}】暂无待发留存差额，所有人员工时均已全额结清！")
+        else:
+            for p_key, p_workers in backlog_records.items():
+                with st.expander(f"📁 归档月份/周期：{p_key} (共 {len(p_workers)} 人待发)", expanded=True):
+                    b_rows = []
+                    for w_id, w_info in p_workers.items():
+                        detail_str = "、".join([f"{d}号({h}h)" for d, h in w_info.get('扣减具体日期', {}).items()])
+                        b_rows.append({
+                            '序号': len(b_rows) + 1,
+                            '姓名': w_info.get('姓名', ''),
+                            '身份证号': w_info.get('身份证号', ''),
+                            '日薪标准': w_info.get('日薪', 0.0),
+                            '欠发天数': w_info.get('扣减天数', 0.0),
+                            '欠发金额': w_info.get('欠额', 0.0),
+                            '扣减具体日期明细': detail_str if detail_str else '工时比例折算',
+                            '_key': w_id
+                        })
+                    b_df = pd.DataFrame(b_rows)
+                    st.dataframe(b_df.drop(columns=['_key']), use_container_width=True, hide_index=True)
+
+                    c_btn1, c_btn2 = st.columns(2)
+                    with c_btn1:
+                        wb_b2 = Workbook()
+                        ws_b2 = wb_b2.active
+                        ws_b2.title = f"{p_key}第二批补发工资表"
+                        ws_b2.append(["序号", "姓名", "身份证号", "日薪", "补发天数", "补发金额", "对应扣减考勤日期"])
+                        for r_item in b_rows:
+                            ws_b2.append([
+                                r_item['序号'], r_item['姓名'], r_item['身份证号'],
+                                r_item['日薪标准'], r_item['欠发天数'], r_item['欠发金额'],
+                                r_item['扣减具体日期明细']
+                            ])
+                        b2_buf = io.BytesIO()
+                        wb_b2.save(b2_buf)
+                        st.download_button(
+                            label=f":material/download: 导出【{p_key}】第二批补发工资表 (Excel)",
+                            data=b2_buf.getvalue(),
+                            file_name=f"{b_comp}_{p_key}_第二批补发工资表.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key=f"dl_b2_{p_key}",
+                            use_container_width=True
+                        )
+                    with c_btn2:
+                        if st.button(f":material/check_circle: 确认补发并核销【{p_key}】储备", key=f"clear_b2_{p_key}", use_container_width=True):
+                            extract_from_backlog(b_comp, p_key, [r['_key'] for r in b_rows])
+                            st.success(f"已核销【{p_key}】所有人员的第二批待发差额！")
+                            st.rerun()

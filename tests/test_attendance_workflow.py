@@ -132,18 +132,21 @@ def test_export_attendance_and_payroll():
         },
     ])
 
-    zip_data = build_all_exports_zip(salary_df)
+    zip_data = build_all_exports_zip(salary_df, include_ledger=True)
 
     assert isinstance(zip_data, bytes)
     assert len(zip_data) > 0
     with ZipFile(BytesIO(zip_data)) as archive:
         names = archive.namelist()
-        assert len(names) == 8
+        # 2个批次各生成2个以-连接的文件，加1个台账，共5个文件
+        assert len(names) == 5
         assert all(name.endswith('.xlsx') and '/' not in name for name in names)
         assert any('-考勤表.xlsx' in name for name in names)
         assert any('-工资确认表.xlsx' in name for name in names)
-        assert any('_考勤表.xlsx' in name for name in names)
-        assert any('_工资确认表.xlsx' in name for name in names)
+        # 严格验证：彻底删除以_连接的总包文件
+        assert not any('_考勤表.xlsx' in name for name in names)
+        assert not any('_工资确认表.xlsx' in name for name in names)
+        assert '农民工工资卡登记台账.xlsx' in names
 
         company_attendance = load_workbook(
             BytesIO(archive.read(next(name for name in names if '旭之升' in name and '-考勤表.xlsx' in name))),
@@ -152,13 +155,6 @@ def test_export_attendance_and_payroll():
         assert len(company_attendance.sheetnames) == 1
         assert company_attendance[company_attendance.sheetnames[0]]['D6'].value == '✓'
         assert company_attendance[company_attendance.sheetnames[0]]['AI6'].value == 20
-
-        zongbao_attendance = load_workbook(
-            BytesIO(archive.read(next(name for name in names if '青海久昌' in name and '_考勤表.xlsx' in name))),
-            data_only=False,
-        )
-        assert len(zongbao_attendance.sheetnames) == 1
-        assert zongbao_attendance[zongbao_attendance.sheetnames[0]]['D5'].value == 8
 
         company_wage = load_workbook(
             BytesIO(archive.read(next(name for name in names if '旭之升' in name and '-工资确认表.xlsx' in name))),
@@ -170,3 +166,9 @@ def test_export_attendance_and_payroll():
         card_col = next(cell.column for cell in detail[3] if cell.value == '银行卡号')
         assert detail.cell(row=5, column=card_col).data_type == 's'
         assert detail.cell(row=5, column=card_col).value == '6222020000000000000'
+
+        # 验证工资卡台账中包含银行卡等完整信息
+        ledger_wb = load_workbook(BytesIO(archive.read('农民工工资卡登记台账.xlsx')), data_only=True)
+        ledger_ws = ledger_wb['工资卡台账']
+        assert ledger_ws['D3'].value == '张三'
+        assert ledger_ws['H3'].value == '6222020000000000000'
