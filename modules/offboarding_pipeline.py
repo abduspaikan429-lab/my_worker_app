@@ -294,13 +294,28 @@ def render():
 
             st.markdown("<div style='margin-top: 16px;'></div>", unsafe_allow_html=True)
 
-            f1, f2 = st.columns([3, 1])
+            f1, f2 = st.columns([3, 1.2])
             with f1:
                 search_query = st.text_input(
                     "搜索离场人员",
                     placeholder="输入姓名或班组关键词快速过滤...",
                     label_visibility="collapsed"
                 )
+            with f2:
+                from pathlib import Path
+                from scripts.export_offboarded_workers import build_excel_workbook
+                excel_path = Path("退场人员信息表.xlsx")
+                if not excel_path.exists():
+                    build_excel_workbook(excel_path)
+                with open(excel_path, "rb") as f_excel:
+                    st.download_button(
+                        label=":material/download: 导出退场Excel表",
+                        data=f_excel.read(),
+                        file_name="退场人员信息表.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                        key="btn_download_offboarded_pipeline"
+                    )
 
             with st.expander(":material/chat: 智能催办引擎 (催发起/催确认)", expanded=False):
                 if st.button("生成微信群离场催办文案"):

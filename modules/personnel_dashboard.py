@@ -528,14 +528,15 @@ def render() -> None:
         with m_c2:
             st.metric("本月离场人数", f"{m_data['out_total']} 人", help="当月办结离场手续人数")
         with m_c3:
-            st.metric("报备在场总数", f"{m_data['onsite_total']} 人", help="当月月末花名册登记在场总人数")
+            st.metric("报备在场总数", f"{m_data['onsite_total']} 人", help="全月累计在册总人数（峰值，含当月离场人员；计算公式：期初在场 + 当月进场）")
         with m_c4:
             act_val = m_data.get('actual_onsite_total', m_data['onsite_total'] - m_data['out_total'])
-            st.metric("实际在场人数", f"{act_val} 人", help="扣除退场离场人员后的现场真实驻场人数")
+            st.metric("实际在场人数", f"{act_val} 人", help="月末现场真实留存人数（计算公式：报备在场 - 当月离场）")
         with m_c5:
             delta_val = m_data['net_change']
             st.metric("本月人员净变动", f"{delta_val:+d} 人", delta=f"{delta_val:+d}")
 
+        st.caption("💡 **指标勾稽规则**：**报备在场总数** 为当月全月曾驻场最高峰人数（含当月离场，期初+进场）；**实际在场人数** 为月末现场真实驻留人数（报备在场 - 当月离场）。")
         st.markdown("<div style='margin-top: 14px;'></div>", unsafe_allow_html=True)
 
         # 分包队伍月度对比
@@ -588,9 +589,105 @@ def render() -> None:
 
         st.markdown("<div style='margin-top: 20px;'></div>", unsafe_allow_html=True)
 
-        # 当月人员进出场明细表格
-        t_in_list, t_out_list = st.tabs([f"📥 {sel_month} 进场人员名单 ({m_data['in_total']}人)", f"📤 {sel_month} 离场人员名单 ({m_data['out_total']}人)"])
-        
+        # 获取该月报备在场与实际在场人员名单
+        rep_roster_df, act_roster_df = personnel_data_service.get_monthly_rosters(sel_month, data=data)
+        act_cnt = len(act_roster_df)
+        rep_cnt = len(rep_roster_df)
+
+        # 当月人员各类明细表格（实际在场、报备在场、进场、离场四维一体）
+        t_act_list, t_rep_list, t_in_list, t_out_list = st.tabs([
+            f"🏗️ {sel_month} 实际在场名单 ({act_cnt}人)",
+            f"📋 {sel_month} 报备在场名单 ({rep_cnt}人)",
+            f"📥 {sel_month} 进场人员名单 ({m_data['in_total']}人)",
+            f"📤 {sel_month} 离场人员名单 ({m_data['out_total']}人)"
+        ])
+
+        with t_act_list:
+            st.caption(f"💡 **实际在场名单**：展示截至 {sel_month} 月末现场真实留存驻场的务工人员（已剔除退场离场人员），共 **{act_cnt}** 人。")
+            if act_roster_df.empty:
+                st.info(f"{sel_month} 暂无实际在场人员数据。")
+            else:
+                col_act_s1, col_act_s2 = st.columns([1.5, 1])
+                with col_act_s1:
+                    kw_act = st.text_input("🔍 搜索实际在场人员（姓名 / 身份证 / 工种）", key=f"kw_act_{sel_month}")
+                with col_act_s2:
+                    team_act_opts = ["全部队伍"] + sorted(list(act_roster_df['Team'].dropna().unique()))
+                    sel_team_act = st.selectbox("筛选所属队伍", options=team_act_opts, key=f"team_act_{sel_month}")
+
+                f_act = act_roster_df.copy()
+                if kw_act.strip():
+                    kw = kw_act.strip()
+                    f_act = f_act[f_act['Name'].str.contains(kw, na=False) | f_act['ID'].str.contains(kw, na=False) | f_act['Job_Clean'].str.contains(kw, na=False)]
+                if sel_team_act != "全部队伍":
+                    f_act = f_act[f_act['Team'] == sel_team_act]
+
+                cols_act = ['Name', 'Team', 'Job_Clean', 'ID', 'Gender', 'Age', 'Province', 'ContractNo', 'LiveStatus']
+                display_act = f_act[[c for c in cols_act if c in f_act.columns]].rename(columns={
+                    'Name': '姓名', 'Team': '所属队伍/班组', 'Job_Clean': '工种', 'ID': '身份证号',
+                    'Gender': '性别', 'Age': '年龄', 'Province': '籍贯省份', 'ContractNo': '劳动合同编号',
+                    'LiveStatus': '系统实时状态'
+                })
+
+                st.dataframe(display_act, use_container_width=True, hide_index=True)
+
+                buf_act = io.BytesIO()
+                with pd.ExcelWriter(buf_act, engine='xlsxwriter') as writer:
+                    display_act.to_excel(writer, index=False, sheet_name=f'{sel_month}实际在场名单')
+                st.download_button(
+                    label=f"📥 导出 {sel_month} 实际在场人员名单 (Excel)",
+                    data=buf_act.getvalue(),
+                    file_name=f"{sel_month}_实际在场务工人员名单_{len(display_act)}人.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"dl_act_{sel_month}"
+                )
+
+        with t_rep_list:
+            left_cnt = rep_cnt - act_cnt
+            st.caption(f"💡 **报备在场名单**：展示 {sel_month} 全月在册曾驻场务工人员峰值底册（含当月办结离场人员），共 **{rep_cnt}** 人（其中：月末留存 **{act_cnt}** 人，当月离场 **{left_cnt}** 人）。")
+            if rep_roster_df.empty:
+                st.info(f"{sel_month} 暂无报备在场人员数据。")
+            else:
+                col_rep_s1, col_rep_s2, col_rep_s3 = st.columns([1.5, 1, 1])
+                with col_rep_s1:
+                    kw_rep = st.text_input("🔍 搜索报备在场人员（姓名 / 身份证 / 工种）", key=f"kw_rep_{sel_month}")
+                with col_rep_s2:
+                    team_rep_opts = ["全部队伍"] + sorted(list(rep_roster_df['Team'].dropna().unique()))
+                    sel_team_rep = st.selectbox("筛选所属队伍", options=team_rep_opts, key=f"team_rep_{sel_month}")
+                with col_rep_s3:
+                    stat_rep_opts = ["全部人员", "仅看月末在场留存", "仅看当月已离场"]
+                    sel_stat_rep = st.selectbox("筛选在场/离场状态", options=stat_rep_opts, key=f"stat_rep_{sel_month}")
+
+                f_rep = rep_roster_df.copy()
+                if kw_rep.strip():
+                    kw = kw_rep.strip()
+                    f_rep = f_rep[f_rep['Name'].str.contains(kw, na=False) | f_rep['ID'].str.contains(kw, na=False) | f_rep['Job_Clean'].str.contains(kw, na=False)]
+                if sel_team_rep != "全部队伍":
+                    f_rep = f_rep[f_rep['Team'] == sel_team_rep]
+                if sel_stat_rep == "仅看月末在场留存":
+                    f_rep = f_rep[f_rep['MonthStatus'] == "✅ 月末在场留存"]
+                elif sel_stat_rep == "仅看当月已离场":
+                    f_rep = f_rep[f_rep['MonthStatus'] == "🛫 当月办结离场"]
+
+                cols_rep = ['Name', 'Team', 'Job_Clean', 'ID', 'Gender', 'Age', 'Province', 'MonthStatus', 'LiveStatus']
+                display_rep = f_rep[[c for c in cols_rep if c in f_rep.columns]].rename(columns={
+                    'Name': '姓名', 'Team': '所属队伍/班组', 'Job_Clean': '工种', 'ID': '身份证号',
+                    'Gender': '性别', 'Age': '年龄', 'Province': '籍贯省份', 'MonthStatus': '当月在场状态标识',
+                    'LiveStatus': '系统实时状态'
+                })
+
+                st.dataframe(display_rep, use_container_width=True, hide_index=True)
+
+                buf_rep = io.BytesIO()
+                with pd.ExcelWriter(buf_rep, engine='xlsxwriter') as writer:
+                    display_rep.to_excel(writer, index=False, sheet_name=f'{sel_month}报备在场名单')
+                st.download_button(
+                    label=f"📥 导出 {sel_month} 报备在场人员底册 (Excel)",
+                    data=buf_rep.getvalue(),
+                    file_name=f"{sel_month}_报备在场务工人员底册_{len(display_rep)}人.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"dl_rep_{sel_month}"
+                )
+
         with t_in_list:
             sub_in = df_inflow[df_inflow['Month'] == sel_month] if not df_inflow.empty else pd.DataFrame()
             if sub_in.empty:
@@ -604,6 +701,17 @@ def render() -> None:
                 })
                 st.dataframe(display_in, use_container_width=True, hide_index=True)
 
+                buf_in = io.BytesIO()
+                with pd.ExcelWriter(buf_in, engine='xlsxwriter') as writer:
+                    display_in.to_excel(writer, index=False, sheet_name=f'{sel_month}进场名单')
+                st.download_button(
+                    label=f"📥 导出 {sel_month} 进场人员名单 (Excel)",
+                    data=buf_in.getvalue(),
+                    file_name=f"{sel_month}_进场务工人员名单_{len(display_in)}人.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"dl_in_{sel_month}"
+                )
+
         with t_out_list:
             sub_out = df_outflow[df_outflow['Month'] == sel_month] if not df_outflow.empty else pd.DataFrame()
             if sub_out.empty:
@@ -616,6 +724,17 @@ def render() -> None:
                     'WageSettled': '工资结算支付情况', 'CommitmentSigned': '退场承诺书签订'
                 })
                 st.dataframe(display_out, use_container_width=True, hide_index=True)
+
+                buf_out = io.BytesIO()
+                with pd.ExcelWriter(buf_out, engine='xlsxwriter') as writer:
+                    display_out.to_excel(writer, index=False, sheet_name=f'{sel_month}离场名单')
+                st.download_button(
+                    label=f"📥 导出 {sel_month} 离场人员名单 (Excel)",
+                    data=buf_out.getvalue(),
+                    file_name=f"{sel_month}_离场务工人员名单_{len(display_out)}人.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"dl_out_{sel_month}"
+                )
 
         # 可选：展开月度报文生成器 (向前兼容原功能)
         with st.expander("📝 查看/生成该月标准化报表文本 (用于工作汇报直贴)", expanded=False):

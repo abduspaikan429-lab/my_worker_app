@@ -131,3 +131,19 @@ def test_figure_generations():
     assert fig is not None
     import matplotlib.pyplot as plt
     plt.close(fig)
+
+
+def test_get_monthly_rosters():
+    service = PersonnelDataService()
+    data = service.load_all_data(force_reload=True)
+    summary = data["monthly_summary"]
+
+    for m in ["6月", "7月", "8月", "9月"]:
+        rep_df, act_df = service.get_monthly_rosters(m, data=data)
+        assert len(rep_df) == summary[m]["onsite_total"]
+        assert len(act_df) == summary[m]["actual_onsite_total"]
+        assert "MonthStatus" in rep_df.columns
+        assert "LiveStatus" in rep_df.columns
+        assert (rep_df["MonthStatus"] == "🛫 当月办结离场").sum() == summary[m]["out_total"]
+        assert (rep_df["MonthStatus"] == "✅ 月末在场留存").sum() == summary[m]["actual_onsite_total"]
+

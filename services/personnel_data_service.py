@@ -466,26 +466,43 @@ class PersonnelDataService:
             df_new_inflow = pd.DataFrame(new_inflow_rows)
             df_inflow = pd.concat([df_inflow, df_new_inflow], ignore_index=True)
 
-        # 5. 动态校准 9 月及各月份 monthly_summary 中的宏观流动与队伍分布（确保与 df_inflow 明细名单 100% 对齐！）
-        if "9月" in monthly_summary and not df_inflow.empty:
-            m9_inflow = df_inflow[df_inflow["Month"] == "9月"]
-            m9_actual_in = len(m9_inflow)
-            monthly_summary["9月"]["in_total"] = m9_actual_in
-            monthly_summary["9月"]["net_change"] = m9_actual_in - monthly_summary["9月"]["out_total"]
-
-            for t_name in monthly_summary["9月"]["teams"]:
-                t_count = len(m9_inflow[m9_inflow["Team"] == t_name])
-                monthly_summary["9月"]["teams"][t_name]["in_count"] = t_count
-
-        # 6. 动态在场总数计算
+        # 5. 动态校准 9 月及各月份 monthly_summary 中的宏观流动与队伍分布（确保与明细名单 100% 勾稽平衡！）
         active_cnt = len(unique_roster[unique_roster["LiveStatus"].isin(["在场正常", "进场手续在办"])])
         live_status["currently_onsite"] = active_cnt
         live_status["unpasted_count"] = len(unpasted_workers)
         live_status["unpasted_workers"] = unpasted_workers
 
-        # 同步校准 9 月的现场实际在场总数
         if "9月" in monthly_summary:
-            monthly_summary["9月"]["actual_onsite_total"] = active_cnt
+            m9_inflow = df_inflow[df_inflow["Month"] == "9月"] if not df_inflow.empty else pd.DataFrame()
+            m9_outflow = df_outflow[df_outflow["Month"] == "9月"] if not df_outflow.empty else pd.DataFrame()
+
+            # 动态更新各分包队伍的进场、离场、实际在场与报备在场
+            for t_name, t_info in monthly_summary["9月"]["teams"].items():
+                t_in = len(m9_inflow[m9_inflow["Team"] == t_name]) if not m9_inflow.empty else t_info.get("in_count", 0)
+                t_out = len(m9_outflow[m9_outflow["Team"] == t_name]) if not m9_outflow.empty else t_info.get("out_count", 0)
+                t_active = len(unique_roster[
+                    (unique_roster["Team"] == t_name) &
+                    unique_roster["LiveStatus"].isin(["在场正常", "进场手续在办"])
+                ])
+                t_onsite = t_active + t_out
+
+                t_info["in_count"] = t_in
+                t_info["out_count"] = t_out
+                t_info["actual_onsite_count"] = t_active
+                t_info["onsite_count"] = t_onsite
+
+            # 汇总层动态对齐，确保各项宏观指标与明细分包严格守恒
+            m9_teams = monthly_summary["9月"]["teams"]
+            tot_in = sum(t["in_count"] for t in m9_teams.values())
+            tot_out = sum(t["out_count"] for t in m9_teams.values())
+            tot_actual = sum(t["actual_onsite_count"] for t in m9_teams.values())
+            tot_onsite = sum(t["onsite_count"] for t in m9_teams.values())
+
+            monthly_summary["9月"]["in_total"] = tot_in
+            monthly_summary["9月"]["out_total"] = tot_out
+            monthly_summary["9月"]["actual_onsite_total"] = tot_actual
+            monthly_summary["9月"]["onsite_total"] = tot_onsite
+            monthly_summary["9月"]["net_change"] = tot_in - tot_out
 
         return df_roster, unique_roster, df_inflow, df_outflow, monthly_summary, live_status
 
@@ -1183,6 +1200,77 @@ class PersonnelDataService:
             "age": fig_age,
             "province": fig_province
         }
+
+    def get_monthly_rosters(
+        self,
+        month: str,
+        data: Optional[Dict[str, Any]] = None
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        获取指定月份的【报备在场名单】与【实际在场名单】。
+        - 报备在场名单 (reported_onsite_df)：该月全量在册务工人员，包含状态标注（“月末留存” vs “当月离场”）；
+        - 实际在场名单 (actual_onsite_df)：扣除当月办结离场人员后的月末现场真实驻留务工人员。
+        """
+        if data is None:
+            data = self.load_all_data()
+
+        df_roster = data.get("df_roster", pd.DataFrame())
+        df_outflow = data.get("df_outflow", pd.DataFrame())
+        unique_roster = data.get("unique_roster", pd.DataFrame())
+
+        if df_roster.empty:
+            return pd.DataFrame(), pd.DataFrame()
+
+        roster_m = df_roster[df_roster["Month"] == month].copy()
+        if roster_m.empty:
+            return pd.DataFrame(), pd.DataFrame()
+
+        out_m = df_outflow[df_outflow["Month"] == month] if not df_outflow.empty else pd.DataFrame()
+
+        out_ids = {
+            str(x).replace("'", "").strip()
+            for x in out_m["ID"].dropna().tolist()
+            if str(x).strip() and str(x).strip() != "nan"
+        }
+        out_names = {
+            str(x).strip()
+            for x in out_m["Name"].dropna().tolist()
+            if str(x).strip() and str(x).strip() != "nan"
+        }
+
+        # 映射实时的系统在场状态
+        id_status_map = {}
+        name_status_map = {}
+        if not unique_roster.empty and "LiveStatus" in unique_roster.columns:
+            id_status_map = {
+                str(k).replace("'", "").strip(): v
+                for k, v in zip(unique_roster["ID"], unique_roster["LiveStatus"])
+                if str(k).strip() and str(k).strip() != "nan"
+            }
+            name_status_map = {
+                str(k).strip(): v
+                for k, v in zip(unique_roster["Name"], unique_roster["LiveStatus"])
+                if str(k).strip() and str(k).strip() != "nan"
+            }
+
+        def determine_status(row):
+            cid = str(row.get("ID", "")).replace("'", "").strip()
+            nm = str(row.get("Name", "")).strip()
+            if (bool(cid) and cid in out_ids) or (bool(nm) and nm in out_names):
+                return "🛫 当月办结离场"
+            return "✅ 月末在场留存"
+
+        def get_current_live_status(row):
+            cid = str(row.get("ID", "")).replace("'", "").strip()
+            nm = str(row.get("Name", "")).strip()
+            return id_status_map.get(cid) or name_status_map.get(nm) or ("已离场归档" if determine_status(row) == "🛫 当月办结离场" else "在场正常")
+
+        roster_m["MonthStatus"] = roster_m.apply(determine_status, axis=1)
+        roster_m["LiveStatus"] = roster_m.apply(get_current_live_status, axis=1)
+
+        actual_onsite_m = roster_m[roster_m["MonthStatus"] == "✅ 月末在场留存"].copy()
+
+        return roster_m, actual_onsite_m
 
 
 # 全局单例服务

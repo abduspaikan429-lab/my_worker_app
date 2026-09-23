@@ -127,6 +127,23 @@ def extract_monthly_report(df, in_jianwei="是"):
         
     return out_df
 
+def extract_offboarded_report(df: pd.DataFrame, ensure_text: bool = True) -> pd.DataFrame:
+    """提取退场人员27列标准报表数据行（长数字强制文本保护）"""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    from scripts.export_offboarded_workers import map_row, COLUMNS
+    records = []
+    for _, r in df.iterrows():
+        row_dict = map_row(r.to_dict())
+        records.append(row_dict)
+    out_df = pd.DataFrame(records)[COLUMNS]
+    if ensure_text:
+        text_cols = ["身份证号码", "工资卡号", "劳动合同编号", "联系电话"]
+        for c in text_cols:
+            if c in out_df.columns:
+                out_df[c] = out_df[c].apply(ensure_excel_text)
+    return out_df
+
 def paste_text(df: pd.DataFrame) -> str:
     """仅输出数据行，不输出表头；直接复制后粘贴到原有 Excel 空行。"""
     if df is None or df.empty:
@@ -190,7 +207,9 @@ def render():
         unsafe_allow_html=True,
     )
 
-    tab_changes, tab_full, tab_quick = st.tabs(["🆕 本次同步直贴", "📦 主表全量提取", "⚡ 按姓名极速提取"])
+    tab_changes, tab_full, tab_quick, tab_offboarded = st.tabs([
+        "🆕 本次同步直贴", "📦 主表全量提取", "⚡ 按姓名极速提取", "🚪 退场人员标准报表"
+    ])
 
     with tab_changes:
         if changes.get("updated_at"):
@@ -275,4 +294,43 @@ def render():
                     render_copy_grid("花名册数据行", extract_roster(selected), "copy_quick_roster")
                 with q4:
                     render_copy_grid("变更月报数据行", extract_monthly_report(selected), "copy_quick_monthly")
+
+    with tab_offboarded:
+        from pathlib import Path
+        from scripts.export_offboarded_workers import build_excel_workbook
+
+        st.markdown("### 🚪 退场人员标准报表（27列对齐）")
+        st.markdown(
+            "按照官方/项目退场要求（工人姓名、性别、出生日期、年龄、籍贯、民族、政治面貌、工种、家庭住址、身份证号码、发证机关、有效起始日期、有效截止日期、开户银行、开户支行、工资卡号、单位工资、劳动合同登记、劳动合同编号、安全培训情况、进场教育、首次进场时间、进场时间、退场时间、退场工资结清情况、持上岗证情况、联系电话）自动映射主表数据。"
+        )
+
+        off_27_df = df[df["在场/进退场状态"].astype(str).str.strip().isin(["已退场", "离场", "退场", "已离场"])].copy()
+        off_37_df = df[df["退场日期"].astype(str).str.strip() != ""].copy()
+
+        c1, c2, c3 = st.columns([1, 1, 1.2])
+        with c1:
+            st.metric("当前已退场人员", f"{len(off_27_df)} 人", help="主表中当前在场/进退场状态为『已退场』或『离场』的人员")
+        with c2:
+            st.metric("含历史退场记录", f"{len(off_37_df)} 人", help="主表中包含退场时间记录的所有人员（含退场后又二次进场的10人）")
+        with c3:
+            excel_path = Path("退场人员信息表.xlsx")
+            if not excel_path.exists():
+                build_excel_workbook(excel_path)
+            with open(excel_path, "rb") as f:
+                st.download_button(
+                    label="📥 一键下载标准 Excel 表格",
+                    data=f.read(),
+                    file_name="退场人员信息表.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary",
+                    use_container_width=True,
+                    key="btn_download_offboarded_excel"
+                )
+
+        st.markdown("<div style='margin-top: 15px;'></div>", unsafe_allow_html=True)
+        sub_tab1, sub_tab2 = st.tabs(["📋 当前退场人员 (27人)", "📑 含历史退场记录人员 (37人)"])
+        with sub_tab1:
+            render_copy_grid("当前退场人员27列数据行（可一键直贴既有Excel）", extract_offboarded_report(off_27_df), "copy_off_27")
+        with sub_tab2:
+            render_copy_grid("含历史退场记录人员27列数据行", extract_offboarded_report(off_37_df), "copy_off_37")
 
