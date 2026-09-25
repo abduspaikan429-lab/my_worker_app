@@ -1337,15 +1337,16 @@ def render():
         <span class="header-emoji">🗂️</span>
         <div class="header-text">
             <h2>劳务发薪全流程流水线</h2>
-            <p>工时核算与额度反推 → 第二批工资待发储备池管理</p>
+            <p>工时核算与额度反推 → 第二批工资待发储备池管理 → 多批次工资发放总台账</p>
         </div>
     </div>
     <div class="color-strip"></div>
     """, unsafe_allow_html=True)
 
-    tab_calc, tab_backlog = st.tabs([
+    tab_calc, tab_backlog, tab_ledger = st.tabs([
         ':material/calculate: 考勤核定与额度反推',
-        ':material/inventory_2: 第二批工资待发储备池'
+        ':material/inventory_2: 第二批工资待发储备池',
+        ':material/receipt_long: 工资发放总台账 (多批次动态累计)'
     ])
 
     from services.payroll_calculation_service import (
@@ -1859,3 +1860,9 @@ def render():
                             extract_from_backlog(b_comp, p_key, [r['_key'] for r in b_rows])
                             st.success(f"已核销【{p_key}】所有人员的第二批待发差额！")
                             st.rerun()
+
+    # ── Tab 3: 📊 工资发放总台账 (多批次动态累计) ────────────────────────
+    with tab_ledger:
+        from modules.payroll_ledger_tab import render_payroll_ledger_tab
+        render_payroll_ledger_tab()
+
