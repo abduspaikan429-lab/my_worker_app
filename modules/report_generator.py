@@ -35,35 +35,129 @@ def ensure_excel_text(val):
         return val
     return ""
 
+FULL_INFO_COLUMNS = [
+    "序号",
+    "姓名",
+    "性别",
+    "民族",
+    "年龄",
+    "身份证号",
+    "手机号",
+    "详细地址",
+    "班组",
+    "工种",
+    "人员类型",
+    "进场日期",
+    "在场/进退场状态",
+    "工资卡号",
+    "开户银行",
+    "劳动合同编号",
+    "合同签订状态",
+    "项目简称",
+    "分包/所属企业",
+    "结算单价/标准",
+    "进场告知书",
+    "进场告知书编号",
+    "是否参与统计",
+    "申请原因",
+    "项目全称",
+    "退场日期",
+    "出生日期",
+    "籍贯",
+    "政治面貌",
+    "文化程度",
+    "紧急联系人",
+    "紧急联系电话",
+    "是否班组长",
+    "维权教育签订",
+    "结算方式",
+    "是否使用智慧护薪",
+    "银行卡号",
+    "协议签订",
+]
+
+COLUMN_SYNONYMS = {
+    "姓名": ["姓名", "工人姓名"],
+    "身份证号": ["身份证号", "身份证号码", "证件号码", "证件号"],
+    "手机号": ["手机号", "手机号码", "联系电话", "电话", "联系方式", "手机"],
+    "详细地址": ["详细地址", "家庭住址", "住址", "户籍地址"],
+    "班组": ["班组", "所属班组", "班组名称", "施工班组"],
+    "工种": ["工种", "工种名称", "岗位", "工种/岗位", "工种(或岗位)"],
+    "人员类型": ["人员类型", "工人类型"],
+    "进场日期": ["进场日期", "进场时间", "入场日期", "入场时间"],
+    "在场/进退场状态": ["在场/进退场状态", "在场状态", "进退场状态", "在场情况"],
+    "工资卡号": ["工资卡号", "银行卡号", "银行账号", "卡号"],
+    "开户银行": ["开户银行", "银行", "开户行", "开户支行", "发卡行", "银行名称"],
+    "劳动合同编号": ["劳动合同编号", "合同编号"],
+    "合同签订状态": ["合同签订状态", "劳动合同", "合同签订", "合同状态"],
+    "分包/所属企业": ["分包/所属企业", "所属企业", "分包单位", "劳务公司", "劳务分包单位", "所属公司", "单位名称"],
+    "结算单价/标准": ["结算单价/标准", "工资标准", "结算单价(元)", "结算单价", "日薪", "日薪(元)", "日薪标准", "日工资", "基本工资", "单价", "工价"],
+    "进场告知书": ["进场告知书", "进场告知书(纸质)"],
+    "项目全称": ["项目全称", "工程名称"],
+    "退场日期": ["退场日期", "退场时间", "离场日期", "离场时间"],
+    "银行卡号": ["银行卡号", "工资卡号", "银行账号", "卡号"],
+}
+
+
 def extract_full_info(df: pd.DataFrame, ensure_text: bool = True) -> pd.DataFrame:
-    """提取全量信息表数据行（保持标准列顺序并对长数字文本字段防科学计数法保护）"""
+    """
+    提取全量信息表数据行（严格对齐用户本地Excel的38列标准表头）
+    - 序号列默认留空（便于复制粘贴到已有Excel末尾由公式或用户自增填充）
+    - 严格保持38列标准顺序
+    - 长数字文本字段进行防科学计数法保护
+    """
     if df is None or df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=FULL_INFO_COLUMNS)
 
-    desired_order = [
-        # 1. 个人基础信息
-        "姓名", "性别", "民族", "年龄", "身份证号", "手机号", "详细地址", "家庭住址",
-        # 2. 进场与班组信息
-        "班组", "工种", "人员类型", "进场日期", "进场时间", "在场状态", "进退场状态", "在场/进退场状态",
-        # 3. 银行与发薪信息
-        "银行卡号", "工资卡号", "开户银行",
-        # 4. 合同与合规信息
-        "劳动合同编号", "合同签订状态", "劳动合同", "是否在市建委"
-    ]
-    existing_cols = [c for c in desired_order if c in df.columns]
-    remaining_cols = [c for c in df.columns if c not in existing_cols and not str(c).startswith("Unnamed")]
-    ordered_cols = existing_cols + remaining_cols
+    out_df = pd.DataFrame(index=df.index)
 
-    out_df = df[ordered_cols].copy()
+    for col in FULL_INFO_COLUMNS:
+        if col == "序号":
+            out_df[col] = ""  # 用户明确要求序号留空
+            continue
 
+        # 1. 优先取原 df 中的同名列
+        val_series = None
+        if col in df.columns:
+            val_series = df[col]
+        else:
+            # 2. 检查同义词回退
+            synonyms = COLUMN_SYNONYMS.get(col, [])
+            for syn in synonyms:
+                if syn in df.columns:
+                    val_series = df[syn]
+                    break
+
+        if val_series is not None:
+            out_df[col] = val_series
+        else:
+            out_df[col] = ""
+
+    # 从18位身份证号兜底推算年龄、出生日期、性别（若原值为空）
+    if "身份证号" in out_df.columns:
+        import datetime
+        curr_year = datetime.datetime.now().year
+        for idx in out_df.index:
+            cid = clean_val(out_df.at[idx, "身份证号"]).replace("'", "")
+            if len(cid) == 18 and cid[:17].isdigit():
+                if not clean_val(out_df.at[idx, "出生日期"]):
+                    out_df.at[idx, "出生日期"] = f"{cid[6:10]}-{cid[10:12]}-{cid[12:14]}"
+                if not clean_val(out_df.at[idx, "性别"]):
+                    out_df.at[idx, "性别"] = "男" if int(cid[16]) % 2 != 0 else "女"
+                if not clean_val(out_df.at[idx, "年龄"]):
+                    out_df.at[idx, "年龄"] = str(curr_year - int(cid[6:10]))
+
+    # 防科学计数法与格式清理
     text_keywords = ['身份证', '手机', '电话', '卡号', '银行卡', '工资卡', '编号', '代码']
     for col in out_df.columns:
-        if ensure_text and any(kw in col for kw in text_keywords):
+        if col == "序号":
+            out_df[col] = ""
+        elif ensure_text and any(kw in col for kw in text_keywords):
             out_df[col] = out_df[col].apply(ensure_excel_text)
         else:
             out_df[col] = out_df[col].apply(clean_val)
 
-    return out_df
+    return out_df[FULL_INFO_COLUMNS]
 
 def extract_roster(df):
     """花名册数据提取"""

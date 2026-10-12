@@ -70,6 +70,7 @@ def test_load_all_payroll_data_company_filter():
     assert len(data_all["sorted_workers"]) >= 35
 
 def test_export_ledger_to_folder_multi_company(tmp_path):
+    import openpyxl
     temp_dir = str(tmp_path)
     
     # 导出指定单公司
@@ -80,6 +81,17 @@ def test_export_ledger_to_folder_multi_company(tmp_path):
     )
     assert ok1 is True
     assert os.path.exists(path1)
+    
+    wb1 = openpyxl.load_workbook(path1)
+    assert "工资台账" in wb1.sheetnames
+    ws1 = wb1["工资台账"]
+    assert ws1.max_column == 28
+    assert ws1.freeze_panes == "F4"
+    assert "中建二局安装工程有限公司工资台账" in ws1["A1"].value
+    assert ws1["U4"].value == "=SUM(F4:J4)"
+    assert ws1["V4"].value == "=SUM(K4:O4)"
+    assert ws1["W4"].value == "=SUM(P4:T4)"
+    assert ws1["X4"].value == "=U4-V4"
 
     # 导出全部分包汇总
     ok2, path2, err2 = export_ledger_to_folder(
@@ -89,6 +101,15 @@ def test_export_ledger_to_folder_multi_company(tmp_path):
     )
     assert ok2 is True
     assert os.path.exists(path2)
+
+    wb2 = openpyxl.load_workbook(path2)
+    assert "工资台账" in wb2.sheetnames
+    ws2 = wb2["工资台账"]
+    assert ws2.max_column == 28
+    assert ws2.freeze_panes == "F4"
+    assert "中建二局安装工程有限公司工资台账" in ws2["A1"].value
+
+
 
 def test_parse_and_upload_excel_batch():
     import openpyxl

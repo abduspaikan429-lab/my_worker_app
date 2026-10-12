@@ -13,6 +13,7 @@ import os
 from modules import archive_export
 from modules.archive_export import extract_cscec2_archive
 from modules.report_generator import (
+    FULL_INFO_COLUMNS,
     extract_full_info,
     extract_roster,
     extract_monthly_report,
@@ -275,20 +276,10 @@ def process_and_merge(files_a, files_b):
     for c in final_df.columns:
         final_df[c] = final_df[c].apply(clean_val)
 
-    # 智能列重排
-    desired_order = [
-        # 1. 个人基础信息
-        "姓名", "性别", "民族", "年龄", "身份证号", "手机号", "详细地址", "家庭住址",
-        # 2. 进场与班组信息
-        "班组", "工种", "人员类型", "进场日期", "进场时间", "在场状态", "进退场状态", "在场/进退场状态", "分包/所属企业",
-        # 3. 银行与发薪信息
-        "结算单价/标准", "银行卡号", "工资卡号", "开户银行",
-        # 4. 合同与合规信息
-        "劳动合同编号", "合同签订状态", "劳动合同", "是否在市建委"
-    ]
-    
-    existing_cols = [c for c in desired_order if c in final_df.columns]
-    remaining_cols = [c for c in final_df.columns if c not in existing_cols]
+    # 智能列重排：严格优先对齐全量信息表38列标准顺序
+    target_order = [c for c in FULL_INFO_COLUMNS if c != "序号"]
+    existing_cols = [c for c in target_order if c in final_df.columns]
+    remaining_cols = [c for c in final_df.columns if c not in existing_cols and c != "序号"]
     ordered_df = final_df[existing_cols + remaining_cols]
 
     return ordered_df, len(set_a), overlap_count, len(set_b), conflicts
@@ -303,11 +294,15 @@ def generate_excel(df):
     default_sheet = wb.active
     wb.remove(default_sheet)
     
+    export_df = df.copy()
+    if "序号" in export_df.columns:
+        export_df = export_df.drop(columns=["序号"])
+
     # Extract unique companies (分包/所属企业) for sheet grouping
     GROUP_COL = '分包/所属企业'
     FALLBACK_NAME = "未分配企业"
-    if GROUP_COL in df.columns:
-        teams = df[GROUP_COL].fillna(FALLBACK_NAME).replace("", FALLBACK_NAME).unique()
+    if GROUP_COL in export_df.columns:
+        teams = export_df[GROUP_COL].fillna(FALLBACK_NAME).replace("", FALLBACK_NAME).unique()
     else:
         teams = [FALLBACK_NAME]
         
@@ -315,7 +310,7 @@ def generate_excel(df):
         teams = [FALLBACK_NAME]
 
     text_keywords = ['身份证', '手机', '电话', '卡号', '银行卡', '工资卡', '编号', '代码']
-    headers = list(df.columns)
+    headers = list(export_df.columns)
     # 序号列占第1列，原字段列从第2列开始，索引+2
     text_col_indices = [
         idx + 2 for idx, col in enumerate(headers)
@@ -344,13 +339,13 @@ def generate_excel(df):
             
         ws = wb.create_sheet(title=sheet_name)
         
-        if GROUP_COL in df.columns:
-            team_df = df[
-                (df[GROUP_COL] == team) |
-                (df[GROUP_COL].fillna(FALLBACK_NAME).replace("", FALLBACK_NAME) == team)
+        if GROUP_COL in export_df.columns:
+            team_df = export_df[
+                (export_df[GROUP_COL] == team) |
+                (export_df[GROUP_COL].fillna(FALLBACK_NAME).replace("", FALLBACK_NAME) == team)
             ]
         else:
-            team_df = df
+            team_df = export_df
 
         # Fix 12: 跳过空班组，避免生成无数据的空 Sheet
         if team_df.empty:

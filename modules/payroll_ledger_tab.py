@@ -30,6 +30,8 @@ from services.payroll_ledger_service import (
 )
 
 
+
+
 def render_payroll_ledger_tab():
     st.markdown("""
     <div style="margin-bottom: 16px;">
@@ -303,6 +305,8 @@ def render_payroll_ledger_tab():
             if st.session_state.get("last_saved_folder"):
                 if st.button(f":material/open_in_new: 打开所在文件夹 ({os.path.basename(st.session_state.last_saved_folder)})", key="btn_open_exp", use_container_width=True):
                     open_folder_in_explorer(st.session_state.last_saved_folder)
+
+
 
     # 5. 动态总台账数据表格与多视角检索展示
     st.markdown("---")

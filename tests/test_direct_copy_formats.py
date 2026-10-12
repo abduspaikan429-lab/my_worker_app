@@ -6,6 +6,7 @@ from modules.archive_export import (
     ensure_excel_text as cscec_ensure_text,
 )
 from modules.report_generator import (
+    FULL_INFO_COLUMNS,
     extract_full_info,
     extract_roster,
     extract_monthly_report,
@@ -82,10 +83,20 @@ def test_extract_full_info(sample_worker_df):
     assert not full_df.empty
     assert len(full_df) == 2
     
-    # 验证关键列名存在
-    expected_core_cols = ["姓名", "性别", "民族", "年龄", "身份证号", "手机号", "班组", "工种", "银行卡号"]
-    for col in expected_core_cols:
-        assert col in full_df.columns
+    # 严格验证38列标准表头顺序与列数
+    assert list(full_df.columns) == FULL_INFO_COLUMNS
+    assert len(full_df.columns) == 38
+
+    # 验证用户明确要求的「序号留空」
+    assert full_df.iloc[0]["序号"] == ""
+    assert full_df.iloc[1]["序号"] == ""
+    
+    # 验证关键列名与内容存在
+    assert full_df.iloc[0]["姓名"] == "张三"
+    assert full_df.iloc[0]["性别"] == "男"
+    assert full_df.iloc[0]["民族"] == "汉"
+    assert full_df.iloc[0]["工资卡号"].startswith("'6222021234567890123")
+    assert full_df.iloc[0]["银行卡号"].startswith("'6222021234567890123")
 
     # 验证身份证和银行卡号被添加了单引号保护
     assert full_df.iloc[0]["身份证号"].startswith("'")
@@ -124,13 +135,16 @@ def test_paste_text_format(sample_worker_df):
     full_df = extract_full_info(sample_worker_df)
     tsv_text = paste_text(full_df)
     
-    lines = tsv_text.strip().split("\n")
+    lines = [l for l in tsv_text.splitlines() if l]
     assert len(lines) == 2  # 仅2行数据，无表头
     
     # 每行应使用 tab 分隔
     cols_row1 = lines[0].split("\t")
     assert len(cols_row1) == len(full_df.columns)
-    assert cols_row1[0] == "张三"
+    assert len(cols_row1) == 38
+    # 序号留空：第一列为空字符串，第二列为姓名"张三"
+    assert cols_row1[0] == ""
+    assert cols_row1[1] == "张三"
     assert "'110101199001011234" in cols_row1
 
 
@@ -139,6 +153,7 @@ def test_empty_dataframe_handling():
     
     full_res = extract_full_info(empty_df)
     assert full_res.empty
+    assert list(full_res.columns) == FULL_INFO_COLUMNS
     
     archive_res = extract_cscec2_archive(empty_df)
     assert archive_res.empty
@@ -158,3 +173,51 @@ def test_extract_roster_and_monthly(sample_worker_df):
     assert len(monthly_df) == 2
     assert monthly_df.iloc[0]["是否签订《劳动合同》"] == "是"
     assert monthly_df.iloc[1]["是否签订《劳动合同》"] == "否"
+
+
+def test_extract_full_info_partial_official_import():
+    # 模拟官网导出仅含少量字段的新增人员
+    raw_incoming = pd.DataFrame([
+        {
+            "姓名": "李四",
+            "身份证号": "510101200001011234",
+            "电话": "13800002222",
+            "工种名称": "钢筋工",
+            "所属班组": "钢筋一组",
+            "入场日期": "2026-09-01",
+            "银行账号": "6222000011112222333",
+        }
+    ])
+    full_df = extract_full_info(raw_incoming)
+    assert list(full_df.columns) == FULL_INFO_COLUMNS
+    assert len(full_df.columns) == 38
+
+    row = full_df.iloc[0]
+    # 序号留空
+    assert row["序号"] == ""
+    # 基础信息
+    assert row["姓名"] == "李四"
+    assert row["身份证号"] == "'510101200001011234"
+    assert row["手机号"] == "'13800002222"
+    assert row["工种"] == "钢筋工"
+    assert row["班组"] == "钢筋一组"
+    assert row["进场日期"] == "2026-09-01"
+    # 同义词回退
+    assert row["工资卡号"] == "'6222000011112222333"
+    assert row["银行卡号"] == "'6222000011112222333"
+    # 身份证推算性别与出生日期
+    assert row["性别"] == "男"
+    assert row["出生日期"] == "2000-01-01"
+    assert row["年龄"] != ""
+    # 官网未提供但本地Excel要求的字段：补空字符串
+    assert row["进场告知书"] == ""
+    assert row["是否参与统计"] == ""
+    assert row["协议签订"] == ""
+
+    # TSV粘贴文本测试
+    tsv = paste_text(full_df)
+    lines = [l for l in tsv.splitlines() if l]
+    cols = lines[0].split("\t")
+    assert len(cols) == 38
+    assert cols[0] == ""  # 序号留空
+    assert cols[1] == "李四"

@@ -12,9 +12,11 @@ import os
 import re
 import glob
 import io
+import json
 import pandas as pd
 from datetime import datetime
 from collections import OrderedDict
+
 
 import openpyxl
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
@@ -540,571 +542,489 @@ def load_all_payroll_data(company_filter: str = None) -> dict:
     }
 
 
+def _load_master_personnel_map() -> dict:
+    """从本地主数据库/状态中加载工人进退场时间及档案信息"""
+    master_path = os.path.join(PROJECT_ROOT, "data", "master_state.json")
+    if not os.path.exists(master_path):
+        return {}
+    try:
+        with open(master_path, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        mapping = {}
+        for r in d.get("rows", []):
+            cid = str(r.get("身份证号", "")).strip()
+            if cid:
+                mapping[cid] = {
+                    "entry_date": str(r.get("进场日期", "") or "").strip(),
+                    "exit_date": str(r.get("退场日期", "") or "").strip(),
+                    "phone": str(r.get("手机号", "") or "").strip(),
+                    "name": str(r.get("姓名", "") or "").strip(),
+                    "status": str(r.get("在场/进退场状态", "") or "").strip()
+                }
+        return mapping
+    except Exception as e:
+        print(f"读取 master_state 失败: {e}")
+        return {}
+
+
 def build_excel_workbook(data: dict) -> openpyxl.Workbook:
     """
-    根据汇总数据构建高质感活表 Excel：
-    自动根据是否为单公司还是多分包，组织 Sheet 架构
+    根据汇总数据构建符合中建二局标准规范的【中建二局安装工程有限公司工资台账】Excel：
+    1. 主表【工资台账】：严格按照 28 列两级表头与动态公式架构组织
+       - 基础信息：序号、姓名、身份证号码、手机号码、进场时间 (A~E)
+       - 应发工资（元）：2026年6月 ~ 2026年10月 (F~J)
+       - 已发工资（元）：2026年6月 ~ 2026年10月 (K~O)
+       - 其中：班组长代付（元）：2026年6月 ~ 2026年10月 (P~T)
+       - 年度汇总：2026年应发工资、已发工资、班组长代付、未发工资、约付时间、退场时间、备注 (U~AB)
+    2. 动态公式联动：
+       - U列 (应发合计) = SUM(F{row}:J{row})
+       - V列 (已发合计) = SUM(K{row}:O{row})
+       - W列 (代付合计) = SUM(P{row}:T{row})
+       - X列 (未发差额) = U{row}-V{row}
+       - 底部合计行：整列 SUM
+    3. 冻结 F4 窗格，固定表头与工人姓名/身份证
+    4. 附表【流水明细库】：保留各批次原始流水，支持穿透核验
     """
-    unique_batch_shorts = data["batch_shorts"]
-    sorted_workers = data["sorted_workers"]
-    all_batches = data["batches"]
-    flow_records = data["flow_df"].to_dict("records") if not data["flow_df"].empty else []
     company_scope = data.get("company_scope", "全部劳务公司")
+    sorted_workers = data.get("sorted_workers", [])
+    flow_records = data["flow_df"].to_dict("records") if not data["flow_df"].empty else []
+    master_map = _load_master_personnel_map()
 
     wb = openpyxl.Workbook()
 
-    font_title = Font(name="微软雅黑", size=15, bold=True, color="1F4E79")
-    font_subtitle = Font(name="微软雅黑", size=10, italic=True, color="595959")
+    # 1. 确定台账大标题抬头
+    if company_scope and company_scope not in ("全部劳务公司", "全部分包商", "全部", ""):
+        comp_title = f"中建二局安装工程有限公司工资台账（{company_scope}）"
+    else:
+        comp_title = "中建二局安装工程有限公司工资台账"
+
+    # 2. 基础样式定义
+    font_main_title = Font(name="微软雅黑", size=16, bold=True, color="1F4E79")
     font_header = Font(name="微软雅黑", size=10, bold=True, color="FFFFFF")
     font_sub_header = Font(name="微软雅黑", size=9, bold=True, color="FFFFFF")
     font_data = Font(name="微软雅黑", size=10, color="000000")
-    font_total = Font(name="微软雅黑", size=10, bold=True, color="000000")
-    font_status_active = Font(name="微软雅黑", size=10, color="276A3C", bold=True)
-    font_status_left = Font(name="微软雅黑", size=10, color="A61C1C", bold=True)
+    font_total = Font(name="微软雅黑", size=10, bold=True, color="1F4E79")
 
-    fill_primary = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
-    fill_sub_blue = PatternFill(start_color="2F5597", end_color="2F5597", fill_type="solid")
-    fill_accent_blue = PatternFill(start_color="41719C", end_color="41719C", fill_type="solid")
-    fill_zebra = PatternFill(start_color="F2F5F9", end_color="F2F5F9", fill_type="solid")
-    fill_total = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
-    fill_status_active = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
-    fill_status_left = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid")
+    fill_title = PatternFill(start_color="F2F5F9", end_color="F2F5F9", fill_type="solid")
+    fill_h1_base = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")     # 海军蓝（基础信息）
+    fill_h1_plan = PatternFill(start_color="2F5597", end_color="2F5597", fill_type="solid")     # 稳重蓝（应发）
+    fill_h1_paid = PatternFill(start_color="165B33", end_color="165B33", fill_type="solid")     # 森林绿（已发）
+    fill_h1_agent = PatternFill(start_color="C55A11", end_color="C55A11", fill_type="solid")    # 暖棕橙（代付）
+    fill_h1_summary = PatternFill(start_color="1B365D", end_color="1B365D", fill_type="solid")  # 藏青（年度汇总）
+    fill_h2 = PatternFill(start_color="333F48", end_color="333F48", fill_type="solid")          # 子表头深灰蓝
+    fill_total = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")       # 合计浅蓝
+    fill_zebra = PatternFill(start_color="F9FBFD", end_color="F9FBFD", fill_type="solid")
 
     thin_border_side = Side(border_style="thin", color="D9D9D9")
-    double_border_bottom = Side(border_style="double", color="000000")
+    double_border_bottom = Side(border_style="double", color="1F4E79")
+    thick_border_top = Side(border_style="thin", color="1F4E79")
+
     cell_border = Border(left=thin_border_side, right=thin_border_side, top=thin_border_side, bottom=thin_border_side)
-    total_border = Border(top=Side(border_style="thin", color="000000"), bottom=double_border_bottom, left=thin_border_side, right=thin_border_side)
+    total_border = Border(left=thin_border_side, right=thin_border_side, top=thick_border_top, bottom=double_border_bottom)
 
     align_center = Alignment(horizontal="center", vertical="center", wrap_text=True)
     align_left = Alignment(horizontal="left", vertical="center")
     align_right = Alignment(horizontal="right", vertical="center")
 
-    # Sheet 1: 使用指南
-    ws_guide = wb.active
-    ws_guide.title = "使用指南(多分包如何追加)"
-    ws_guide.views.sheetView[0].showGridLines = True
-    
-    ws_guide["A1"] = f"📘 工资发放动态台账 · 永久可追加使用指南（{company_scope}）"
-    ws_guide["A1"].font = Font(name="微软雅黑", size=16, bold=True, color="1F4E79")
-    ws_guide.row_dimensions[1].height = 40
-    
-    guide_lines = [
-        ("【多分包架构原则】", "本台账支持工程项目部下辖各分包劳务公司（如江苏旭之升、青海久昌等）独立建账核算与全盘汇聚。"),
-        ("", ""),
-        ("方案 A：在系统界面一键追加新批次（最推荐）", ""),
-        ("第 1 步：选择分包公司", "在系统【考勤对账与工资结算】->【工资发放总台账】顶部，切换到对应的劳务分包商。"),
-        ("第 2 步：上传/粘贴批次", "将官方导出的工资表文本粘贴或上传，系统会自动归类至该劳务公司并归档入库。"),
-        ("第 3 步：选文件夹导出", "点击【选择文件夹并导出】，生成的台账专属于该劳务公司（或全盘汇总），账目清晰绝对不串户！"),
-        ("", ""),
-        ("方案 B：纯 Excel 离线操作追加（无需系统）", ""),
-        ("第 1 步：复制流水", "将官方导出的新工资表数据，直接追加粘贴到【流水明细库】表格的最下方。"),
-        ("第 2 步：自动计入累计", "【全员工资总台账】里的『累计实发总额』和『累计出勤天数』公式自动生效，瞬间计算！"),
-        ("第 3 步：横向加列", "在总台账表头输入新批次名，选中上一列公式向右一拖，立刻出数！"),
-    ]
-    for r_i, (colA, colB) in enumerate(guide_lines, 3):
-        ws_guide.row_dimensions[r_i].height = 24
-        c_a = ws_guide.cell(row=r_i, column=1, value=colA)
-        c_b = ws_guide.cell(row=r_i, column=2, value=colB)
-        if "【" in colA or "方案" in colA:
-            c_a.font = Font(name="微软雅黑", size=11, bold=True, color="1F4E79")
-            c_b.font = Font(name="微软雅黑", size=10, bold=True, color="1F4E79")
-        elif "第" in colA:
-            c_a.font = Font(name="微软雅黑", size=10, bold=True, color="C00000")
-            c_b.font = Font(name="微软雅黑", size=10, color="333333")
-        else:
-            c_a.font = Font(name="微软雅黑", size=10, color="555555")
-            c_b.font = Font(name="微软雅黑", size=10, color="555555")
-        c_a.alignment = Alignment(vertical="center")
-        c_b.alignment = Alignment(vertical="center", wrap_text=True)
-
-    ws_guide.column_dimensions["A"].width = 30
-    ws_guide.column_dimensions["B"].width = 85
-
-    # Sheet 2: 全员工资总台账 (SUMIFS 动态公式版)
-    is_multi_comp = (company_scope in ("全部劳务公司", "全部分包商", "全部"))
-    sheet_title = "全员工资总台账" if not is_multi_comp else "全项目各分包工资总台账"
-    ws_main = wb.create_sheet(title=sheet_title)
+    # Sheet 1: 主表【工资台账】
+    ws_main = wb.active
+    ws_main.title = "工资台账"
     ws_main.views.sheetView[0].showGridLines = True
 
-    # 包含公司列
-    num_fixed_left = 8 if is_multi_comp else 7
-    num_batch_cols = len(unique_batch_shorts) * 2
-    tot_cols = num_fixed_left + num_batch_cols + 4
+    # 3. 28 列规格定义
+    month_labels = ["2026年6月", "2026年7月", "2026年8月", "2026年9月", "2026年10月"]
+    month_keys = ["06", "07", "08", "09", "10"]
 
-    ws_main.merge_cells(start_row=1, start_column=1, end_row=1, end_column=tot_cols)
-    scope_title_str = f"【{company_scope}】" if not is_multi_comp else "【全项目各劳务分包大盘】"
-    ws_main["A1"] = f"科技文化中心-国际体育中心项目（专业足球场）工人实发工资动态总台账 {scope_title_str}"
-    ws_main["A1"].font = font_title
-    ws_main["A1"].alignment = align_center
-    ws_main.row_dimensions[1].height = 36
+    columns_spec = []
 
-    ws_main.merge_cells(start_row=2, start_column=1, end_row=2, end_column=tot_cols)
-    period_str = f"{all_batches[0]['month_range'][:7]} 至 {all_batches[-1]['month_range'][:7]}" if all_batches else "当期"
-    ws_main["A2"] = f"劳务分包归属：{company_scope} | 已归档：{len(unique_batch_shorts)} 批次 | 覆盖周期：{period_str} | 底层公式完全联动"
-    ws_main["A2"].font = font_subtitle
-    ws_main["A2"].alignment = align_center
-    ws_main.row_dimensions[2].height = 20
-
-    ws_main.row_dimensions[3].height = 24
-    ws_main.row_dimensions[4].height = 22
-
-    if is_multi_comp:
-        fixed_headers = [
-            ("序号", 1), ("姓名", 2), ("所属劳务公司", 3), ("身份证号", 4),
-            ("联系电话", 5), ("工种", 6), ("当前状态", 7), ("薪资标准", 8)
-        ]
-        col_id_idx = 4
-        col_status_idx = 7
-        cur_c = 9
-    else:
-        fixed_headers = [
-            ("序号", 1), ("姓名", 2), ("身份证号", 3), ("联系电话", 4),
-            ("工种", 5), ("当前状态", 6), ("最新薪资标准", 7)
-        ]
-        col_id_idx = 3
-        col_status_idx = 6
-        cur_c = 8
-
-    for h, col_c in fixed_headers:
-        ws_main.merge_cells(start_row=3, start_column=col_c, end_row=4, end_column=col_c)
-        c3 = ws_main.cell(row=3, column=col_c, value=h)
-        c3.font = font_header
-        c3.fill = fill_primary
-        c3.alignment = align_center
-        c3.border = cell_border
-        c4 = ws_main.cell(row=4, column=col_c)
-        c4.fill = fill_primary
-        c4.border = cell_border
-
-    batch_col_map = {}
-    for bs in unique_batch_shorts:
-        ws_main.merge_cells(start_row=3, start_column=cur_c, end_row=3, end_column=cur_c + 1)
-        c_top = ws_main.cell(row=3, column=cur_c, value=bs)
-        c_top.font = font_header
-        c_top.fill = fill_primary
-        c_top.alignment = align_center
-        c_top.border = cell_border
-        ws_main.cell(row=3, column=cur_c + 1).fill = fill_primary
-        ws_main.cell(row=3, column=cur_c + 1).border = cell_border
-        
-        c_sub1 = ws_main.cell(row=4, column=cur_c, value="出勤(天)")
-        c_sub1.font = font_sub_header
-        c_sub1.fill = fill_sub_blue
-        c_sub1.alignment = align_center
-        c_sub1.border = cell_border
-        
-        c_sub2 = ws_main.cell(row=4, column=cur_c + 1, value="实发(元)")
-        c_sub2.font = font_sub_header
-        c_sub2.fill = fill_sub_blue
-        c_sub2.alignment = align_center
-        c_sub2.border = cell_border
-        
-        batch_col_map[bs] = (cur_c, cur_c + 1)
-        cur_c += 2
-
-    right_headers = [
-        ("累计总出勤(天)", cur_c),
-        ("累计实发总额(元)", cur_c + 1),
-        ("实名制银行卡号", cur_c + 2),
-        ("开户银行及支行", cur_c + 3)
+    # 1. 基础信息列 (A~E)
+    base_cols = [
+        ("序号", 8, "center", "text"),
+        ("姓名", 12, "center", "text"),
+        ("身份证号码", 22, "center", "text"),
+        ("手机号码", 15, "center", "text"),
+        ("进场时间", 14, "center", "text"),
     ]
-    col_tot_days = cur_c
-    col_grand_pay = cur_c + 1
-    col_card = cur_c + 2
-    col_bank = cur_c + 3
+    for name, w, al, tp in base_cols:
+        columns_spec.append({
+            "key": name,
+            "h1": name,
+            "h2": "",
+            "is_merged_v": True,
+            "fill": fill_h1_base,
+            "width": w,
+            "align": al,
+            "type": tp
+        })
 
-    for h, col_c in right_headers:
-        ws_main.merge_cells(start_row=3, start_column=col_c, end_row=4, end_column=col_c)
-        c3 = ws_main.cell(row=3, column=col_c, value=h)
-        c3.font = font_header
-        c3.fill = fill_accent_blue if "累计" in h else fill_primary
-        c3.alignment = align_center
-        c3.border = cell_border
-        c4 = ws_main.cell(row=4, column=col_c)
-        c4.fill = fill_accent_blue if "累计" in h else fill_primary
-        c4.border = cell_border
+    # 2. 应发工资（元） (F~J)
+    for idx_m, m_label in enumerate(month_labels):
+        m_key = month_keys[idx_m]
+        columns_spec.append({
+            "key": f"应发_{m_key}",
+            "h1": "应发工资（元）",
+            "h2": m_label,
+            "group": "应发工资（元）",
+            "is_merged_v": False,
+            "fill": fill_h1_plan,
+            "width": 14,
+            "align": "right",
+            "type": "currency"
+        })
 
-    start_r = 5
-    for idx, w in enumerate(sorted_workers, 1):
-        r_num = start_r + idx - 1
-        ws_main.row_dimensions[r_num].height = 21
-        
-        col_ptr = 1
-        ws_main.cell(row=r_num, column=col_ptr, value=idx).alignment = align_center
-        col_ptr += 1
-        ws_main.cell(row=r_num, column=col_ptr, value=w["name"]).alignment = align_center
-        col_ptr += 1
+    # 3. 已发工资（元） (K~O)
+    for idx_m, m_label in enumerate(month_labels):
+        m_key = month_keys[idx_m]
+        columns_spec.append({
+            "key": f"已发_{m_key}",
+            "h1": "已发工资（元）",
+            "h2": m_label,
+            "group": "已发工资（元）",
+            "is_merged_v": False,
+            "fill": fill_h1_paid,
+            "width": 14,
+            "align": "right",
+            "type": "currency"
+        })
 
-        if is_multi_comp:
-            ws_main.cell(row=r_num, column=col_ptr, value=w["company"]).alignment = align_center
-            col_ptr += 1
-        
-        c_id = ws_main.cell(row=r_num, column=col_ptr, value=w["id_card"])
-        c_id.alignment = align_center
-        c_id.number_format = "@"
-        col_id_cell_coord = f"{get_column_letter(col_ptr)}{r_num}"
-        col_ptr += 1
-        
-        c_ph = ws_main.cell(row=r_num, column=col_ptr, value=w["phone"])
-        c_ph.alignment = align_center
-        c_ph.number_format = "@"
-        col_ptr += 1
-        
-        ws_main.cell(row=r_num, column=col_ptr, value=w["job_type"]).alignment = align_center
-        col_ptr += 1
-        
-        c_st = ws_main.cell(row=r_num, column=col_ptr, value=w["latest_status"])
-        c_st.alignment = align_center
-        if w["latest_status"] == "已进场":
-            c_st.fill = fill_status_active
-            c_st.font = font_status_active
+    # 4. 其中：班组长代付（元） (P~T)
+    for idx_m, m_label in enumerate(month_labels):
+        m_key = month_keys[idx_m]
+        columns_spec.append({
+            "key": f"代付_{m_key}",
+            "h1": "其中：班组长代付（元）",
+            "h2": m_label,
+            "group": "其中：班组长代付（元）",
+            "is_merged_v": False,
+            "fill": fill_h1_agent,
+            "width": 14,
+            "align": "right",
+            "type": "currency"
+        })
+
+    # 5. 年度汇总与状态 (U~AB)
+    summary_cols = [
+        ("2026年应发工资（元）", 16, "right", "currency"),
+        ("2026年已发工资（元）", 16, "right", "currency"),
+        ("2026年分包班组长自行代付工资", 18, "right", "currency"),
+        ("2026年未发工资（元）", 16, "right", "currency"),
+        ("2026年未付工资/约定支付时间", 18, "center", "text"),
+        ("人员退场时间", 14, "center", "text"),
+        ("2026年未付工资\n约定支付时间", 16, "center", "text"),
+        ("备注", 16, "left", "text")
+    ]
+    for s_name, w, al, tp in summary_cols:
+        columns_spec.append({
+            "key": s_name,
+            "h1": s_name,
+            "h2": "",
+            "is_merged_v": True,
+            "fill": fill_h1_summary,
+            "width": w,
+            "align": al,
+            "type": tp
+        })
+
+    total_cols = len(columns_spec)
+    last_col_letter = get_column_letter(total_cols)
+
+    # ── 第 1 行：大标题 ──
+    ws_main.row_dimensions[1].height = 42
+    ws_main.merge_cells(f"A1:{last_col_letter}1")
+    title_cell = ws_main["A1"]
+    title_cell.value = comp_title
+    title_cell.font = font_main_title
+    title_cell.alignment = align_center
+    title_cell.fill = fill_title
+
+    # ── 第 2 行 & 第 3 行：双层表头 ──
+    ws_main.row_dimensions[2].height = 26
+    ws_main.row_dimensions[3].height = 26
+
+    for col_idx, col in enumerate(columns_spec, 1):
+        c_letter = get_column_letter(col_idx)
+        cell_h1 = ws_main.cell(row=2, column=col_idx)
+        cell_h2 = ws_main.cell(row=3, column=col_idx)
+
+        cell_h1.value = col["h1"]
+        cell_h1.font = font_header
+        cell_h1.alignment = align_center
+        cell_h1.fill = col["fill"]
+        cell_h1.border = cell_border
+
+        cell_h2.value = col["h2"]
+        cell_h2.font = font_sub_header
+        cell_h2.alignment = align_center
+        cell_h2.fill = fill_h2
+        cell_h2.border = cell_border
+
+        ws_main.column_dimensions[c_letter].width = col["width"]
+
+    # 垂直合并（A~E 和 U~AB 列垂直合并 2~3 行）
+    for col_idx, col in enumerate(columns_spec, 1):
+        if col["is_merged_v"]:
+            c_letter = get_column_letter(col_idx)
+            ws_main.merge_cells(f"{c_letter}2:{c_letter}3")
+
+    # 水平合并（F2:J2 应发工资、K2:O2 已发工资、P2:T2 班组长代付）
+    group_spans = []
+    current_group = None
+    start_c = None
+    for col_idx, col in enumerate(columns_spec, 1):
+        grp = col.get("group")
+        if grp:
+            if grp != current_group:
+                if current_group and start_c:
+                    group_spans.append((current_group, start_c, col_idx - 1))
+                current_group = grp
+                start_c = col_idx
         else:
-            c_st.fill = fill_status_left
-            c_st.font = font_status_left
-        col_ptr += 1
-            
-        ws_main.cell(row=r_num, column=col_ptr, value=w["rate_str"].replace("基本工资：", "")).alignment = align_center
-        col_ptr += 1
+            if current_group and start_c:
+                group_spans.append((current_group, start_c, col_idx - 1))
+                current_group = None
+                start_c = None
+    if current_group and start_c:
+        group_spans.append((current_group, start_c, total_cols))
 
-        # 公式联动流水库
-        # 流水库对应列：B=发放批次, G=身份证号, L=实际出勤天数, P=实发总额(元)
-        for bs in unique_batch_shorts:
-            c_day, c_pay = batch_col_map[bs]
-            batch_cell_ref = f"{get_column_letter(c_day)}$3"
-            
-            formula_day = f'=SUMIFS(流水明细库!$L:$L, 流水明细库!$G:$G, ${col_id_cell_coord}, 流水明细库!$B:$B, {batch_cell_ref})'
-            cell_d = ws_main.cell(row=r_num, column=c_day, value=formula_day)
-            cell_d.alignment = align_center
-            
-            formula_pay = f'=SUMIFS(流水明细库!$P:$P, 流水明细库!$G:$G, ${col_id_cell_coord}, 流水明细库!$B:$B, {batch_cell_ref})'
-            cell_p = ws_main.cell(row=r_num, column=c_pay, value=formula_pay)
-            cell_p.alignment = align_right
-            cell_p.number_format = "#,##0.00"
+    for grp_name, s_col, e_col in group_spans:
+        s_let = get_column_letter(s_col)
+        e_let = get_column_letter(e_col)
+        if s_col < e_col:
+            ws_main.merge_cells(f"{s_let}2:{e_let}2")
 
-        formula_tot_day = f'=SUMIFS(流水明细库!$L:$L, 流水明细库!$G:$G, ${col_id_cell_coord})'
-        c_td = ws_main.cell(row=r_num, column=col_tot_days, value=formula_tot_day)
-        c_td.alignment = align_center
-        c_td.font = Font(name="微软雅黑", size=10, bold=True)
+    # ── 数据行填充 ──
+    start_row = 4
+    num_data_rows = max(len(sorted_workers), 78)
 
-        formula_tot_pay = f'=SUMIFS(流水明细库!$P:$P, 流水明细库!$G:$G, ${col_id_cell_coord})'
-        c_tp = ws_main.cell(row=r_num, column=col_grand_pay, value=formula_tot_pay)
-        c_tp.alignment = align_right
-        c_tp.number_format = "¥#,##0.00"
-        c_tp.font = Font(name="微软雅黑", size=10, bold=True, color="C00000")
+    for idx in range(num_data_rows):
+        curr_row = start_row + idx
+        seq = idx + 1
+        ws_main.row_dimensions[curr_row].height = 22
+        w = sorted_workers[idx] if idx < len(sorted_workers) else None
 
-        c_card = ws_main.cell(row=r_num, column=col_card, value=w["bank_card"])
-        c_card.alignment = align_center
-        c_card.number_format = "@"
-        
-        bank_str = f"{w['bank_name']}{(' - ' + w['branch_name']) if w['branch_name'] else ''}"
-        c_bank = ws_main.cell(row=r_num, column=col_bank, value=bank_str)
-        c_bank.alignment = align_left
+        # 统计工人各月份（06, 07, 08, 09, 10）的发放总额
+        worker_batch_pays = w.get("batch_pays", {}) if w else {}
+        worker_month_pays = {}
+        for b_name, p_val in worker_batch_pays.items():
+            m_found = re.search(r'(\d{2})月', b_name)
+            if m_found:
+                mm = m_found.group(1)
+                worker_month_pays[mm] = worker_month_pays.get(mm, 0.0) + p_val
 
-        for c_i in range(1, tot_cols + 1):
-            cell = ws_main.cell(row=r_num, column=c_i)
+        cid = w["id_card"] if w else ""
+        m_info = master_map.get(cid, {}) if cid else {}
+
+        for col_idx, col in enumerate(columns_spec, 1):
+            cell = ws_main.cell(row=curr_row, column=col_idx)
+            cell.font = font_data
             cell.border = cell_border
-            if c_i != col_status_idx and idx % 2 == 0:
+
+            if seq % 2 == 0:
                 cell.fill = fill_zebra
-            if c_i not in (col_status_idx, col_tot_days, col_grand_pay):
-                cell.font = font_data
 
-    tot_row = start_r + len(sorted_workers)
-    ws_main.row_dimensions[tot_row].height = 26
-    ws_main.merge_cells(start_row=tot_row, start_column=1, end_row=tot_row, end_column=num_fixed_left)
-    c_tot_lbl = ws_main.cell(row=tot_row, column=1, value=f"合计（共 {len(sorted_workers)} 人）：")
-    c_tot_lbl.font = font_total
-    c_tot_lbl.alignment = Alignment(horizontal="right", vertical="center")
-    
-    for c_i in range(1, num_fixed_left + 1):
-        ws_main.cell(row=tot_row, column=c_i).fill = fill_total
-        ws_main.cell(row=tot_row, column=c_i).border = total_border
+            col_align = col["align"]
+            if col_align == "center":
+                cell.alignment = align_center
+            elif col_align == "right":
+                cell.alignment = align_right
+            else:
+                cell.alignment = align_left
 
-    for bs in unique_batch_shorts:
-        c_d, c_p = batch_col_map[bs]
-        col_letter_d = get_column_letter(c_d)
-        col_letter_p = get_column_letter(c_p)
-        
-        c_sum_d = ws_main.cell(row=tot_row, column=c_d, value=f"=SUM({col_letter_d}{start_r}:{col_letter_d}{tot_row-1})")
-        c_sum_d.alignment = align_center
-        c_sum_d.font = font_total
-        c_sum_d.fill = fill_total
-        c_sum_d.border = total_border
-        
-        c_sum_p = ws_main.cell(row=tot_row, column=c_p, value=f"=SUM({col_letter_p}{start_r}:{col_letter_p}{tot_row-1})")
-        c_sum_p.alignment = align_right
-        c_sum_p.number_format = "#,##0.00"
-        c_sum_p.font = font_total
-        c_sum_p.fill = fill_total
-        c_sum_p.border = total_border
+            col_key = col["key"]
 
-    col_let_td = get_column_letter(col_tot_days)
-    col_let_gp = get_column_letter(col_grand_pay)
-    
-    c_tot_td = ws_main.cell(row=tot_row, column=col_tot_days, value=f"=SUM({col_let_td}{start_r}:{col_let_td}{tot_row-1})")
-    c_tot_td.alignment = align_center
-    c_tot_td.font = font_total
-    c_tot_td.fill = fill_total
-    c_tot_td.border = total_border
-    
-    c_tot_gp = ws_main.cell(row=tot_row, column=col_grand_pay, value=f"=SUM({col_let_gp}{start_r}:{col_let_gp}{tot_row-1})")
-    c_tot_gp.alignment = align_right
-    c_tot_gp.number_format = "¥#,##0.00"
-    c_tot_gp.font = font_total
-    c_tot_gp.fill = fill_total
-    c_tot_gp.border = total_border
+            # 序号
+            if col_key == "序号":
+                cell.value = seq
+                cell.number_format = "0"
+                continue
 
-    ws_main.cell(row=tot_row, column=col_card, value="").fill = fill_total
-    ws_main.cell(row=tot_row, column=col_card).border = total_border
-    ws_main.cell(row=tot_row, column=col_bank, value="").fill = fill_total
-    ws_main.cell(row=tot_row, column=col_bank).border = total_border
+            # 文本格式保护
+            if col_key in ("身份证号码", "手机号码"):
+                cell.number_format = "@"
 
-    freeze_col_letter = get_column_letter(num_fixed_left + 1)
-    ws_main.freeze_panes = f"{freeze_col_letter}5"
+            # 金额列格式
+            if col["type"] == "currency":
+                cell.number_format = "#,##0.00"
 
-    ws_main.column_dimensions["A"].width = 6
-    ws_main.column_dimensions["B"].width = 10
-    if is_multi_comp:
-        ws_main.column_dimensions["C"].width = 24
-        ws_main.column_dimensions["D"].width = 22
-        ws_main.column_dimensions["E"].width = 15
-        ws_main.column_dimensions["F"].width = 12
-        ws_main.column_dimensions["G"].width = 10
-        ws_main.column_dimensions["H"].width = 13
-    else:
-        ws_main.column_dimensions["C"].width = 22
-        ws_main.column_dimensions["D"].width = 15
-        ws_main.column_dimensions["E"].width = 12
-        ws_main.column_dimensions["F"].width = 10
-        ws_main.column_dimensions["G"].width = 13
-    for bs in unique_batch_shorts:
-        c_d, c_p = batch_col_map[bs]
-        ws_main.column_dimensions[get_column_letter(c_d)].width = 10
-        ws_main.column_dimensions[get_column_letter(c_p)].width = 13
-    ws_main.column_dimensions[get_column_letter(col_tot_days)].width = 14
-    ws_main.column_dimensions[get_column_letter(col_grand_pay)].width = 17
-    ws_main.column_dimensions[get_column_letter(col_card)].width = 24
-    ws_main.column_dimensions[get_column_letter(col_bank)].width = 38
+            # 动态公式列
+            # U列: 2026年应发工资 = SUM(F{row}:J{row})
+            if col_key == "2026年应发工资（元）":
+                cell.value = f"=SUM(F{curr_row}:J{curr_row})"
+                continue
 
-    # Sheet 3: 退场工人结算台账
-    ws_off = wb.create_sheet(title="已退场工人结算台账")
-    ws_off.views.sheetView[0].showGridLines = True
-    
-    ws_off.merge_cells("A1:L1")
-    ws_off["A1"] = f"已办理退场工人工资结清与销账台账 ({company_scope})"
-    ws_off["A1"].font = font_title
-    ws_off["A1"].alignment = align_center
-    ws_off.row_dimensions[1].height = 36
-    
-    off_headers = [
-        "序号", "姓名", "所属分包公司", "身份证号", "联系电话", "工种", "离场状态",
-        "日薪标准", "累计出勤(天)", "已结清总额(元)", "实名制银行卡号", "开户支行"
-    ]
-    ws_off.row_dimensions[2].height = 24
-    for c_i, h in enumerate(off_headers, 1):
-        cell = ws_off.cell(row=2, column=c_i, value=h)
-        cell.font = font_header
-        cell.fill = fill_primary
-        cell.alignment = align_center
-        cell.border = cell_border
+            # V列: 2026年已发工资 = SUM(K{row}:O{row})
+            if col_key == "2026年已发工资（元）":
+                cell.value = f"=SUM(K{curr_row}:O{curr_row})"
+                continue
 
-    off_workers = [w for w in sorted_workers if w["latest_status"] == "已退场"]
-    for idx, w in enumerate(off_workers, 1):
-        r_num = 2 + idx
-        ws_off.row_dimensions[r_num].height = 20
-        ws_off.cell(row=r_num, column=1, value=idx).alignment = align_center
-        ws_off.cell(row=r_num, column=2, value=w["name"]).alignment = align_center
-        ws_off.cell(row=r_num, column=3, value=w["company"]).alignment = align_center
-        
-        c_id = ws_off.cell(row=r_num, column=4, value=w["id_card"])
-        c_id.alignment = align_center
-        c_id.number_format = "@"
-        
-        c_ph = ws_off.cell(row=r_num, column=5, value=w["phone"])
-        c_ph.alignment = align_center
-        c_ph.number_format = "@"
-        
-        ws_off.cell(row=r_num, column=6, value=w["job_type"]).alignment = align_center
-        
-        c_st = ws_off.cell(row=r_num, column=7, value=w["latest_status"])
-        c_st.alignment = align_center
-        c_st.fill = fill_status_left
-        c_st.font = font_status_left
-        
-        ws_off.cell(row=r_num, column=8, value=w["rate_str"].replace("基本工资：", "")).alignment = align_center
-        
-        # 对应流水明细库列：G=身份证, L=出勤天数, P=实发总额
-        formula_td = f'=SUMIFS(流水明细库!$L:$L, 流水明细库!$G:$G, $D{r_num})'
-        c_td = ws_off.cell(row=r_num, column=9, value=formula_td)
-        c_td.alignment = align_center
-        c_td.font = Font(name="微软雅黑", size=10, bold=True)
-        
-        formula_pay = f'=SUMIFS(流水明细库!$P:$P, 流水明细库!$G:$G, $D{r_num})'
-        c_p = ws_off.cell(row=r_num, column=10, value=formula_pay)
-        c_p.alignment = align_right
-        c_p.number_format = "¥#,##0.00"
-        c_p.font = Font(name="微软雅黑", size=10, bold=True, color="C00000")
-        
-        c_bc = ws_off.cell(row=r_num, column=11, value=w["bank_card"])
-        c_bc.alignment = align_center
-        c_bc.number_format = "@"
-        
-        bank_str = f"{w['bank_name']}{(' - ' + w['branch_name']) if w['branch_name'] else ''}"
-        ws_off.cell(row=r_num, column=12, value=bank_str).alignment = align_left
-        
-        for c_i in range(1, 13):
-            cell = ws_off.cell(row=r_num, column=c_i)
-            cell.border = cell_border
-            if c_i != 7 and idx % 2 == 0:
-                cell.fill = fill_zebra
-            if c_i not in (7, 9, 10):
-                cell.font = font_data
+            # W列: 2026年分包班组长自行代付工资 = SUM(P{row}:T{row})
+            if col_key == "2026年分包班组长自行代付工资":
+                cell.value = f"=SUM(P{curr_row}:T{curr_row})"
+                continue
 
-    tot_off_r = len(off_workers) + 3
-    ws_off.row_dimensions[tot_off_r].height = 24
-    ws_off.merge_cells(start_row=tot_off_r, start_column=1, end_row=tot_off_r, end_column=8)
-    c_tot_o = ws_off.cell(row=tot_off_r, column=1, value=f"退场人员合计（共 {len(off_workers)} 人）：")
-    c_tot_o.font = font_total
-    c_tot_o.alignment = Alignment(horizontal="right", vertical="center")
-    
-    ws_off.cell(row=tot_off_r, column=9, value=f"=SUM(I3:I{tot_off_r-1})").alignment = align_center
-    c_o_pay = ws_off.cell(row=tot_off_r, column=10, value=f"=SUM(J3:J{tot_off_r-1})")
-    c_o_pay.number_format = "¥#,##0.00"
-    
-    for c_i in range(1, 13):
-        cell = ws_off.cell(row=tot_off_r, column=c_i)
-        cell.fill = fill_total
+            # X列: 2026年未发工资 = U{row}-V{row} (应发 - 已发)
+            if col_key == "2026年未发工资（元）":
+                cell.value = f"=U{curr_row}-V{curr_row}"
+                continue
+
+            # 工人数据填充
+            if w:
+                if col_key == "姓名":
+                    cell.value = w["name"]
+                elif col_key == "身份证号码":
+                    cell.value = w["id_card"]
+                elif col_key == "手机号码":
+                    cell.value = w.get("phone", "") or m_info.get("phone", "")
+                elif col_key == "进场时间":
+                    cell.value = m_info.get("entry_date", "")
+                elif col_key == "人员退场时间":
+                    cell.value = m_info.get("exit_date", "")
+                elif col_key.startswith("已发_"):
+                    mm = col_key.replace("已发_", "")
+                    p = worker_month_pays.get(mm)
+                    if p is not None:
+                        cell.value = p
+                elif col_key.startswith("应发_"):
+                    mm = col_key.replace("应发_", "")
+                    p = worker_month_pays.get(mm)
+                    if p is not None:
+                        cell.value = p
+
+    # ── 底部【合计行】 ──
+    total_row = start_row + num_data_rows
+    ws_main.row_dimensions[total_row].height = 28
+
+    # A~E 列合并为“合  计”
+    ws_main.merge_cells(f"A{total_row}:E{total_row}")
+    cell_tot_label = ws_main[f"A{total_row}"]
+    cell_tot_label.value = "合  计"
+    cell_tot_label.font = font_total
+    cell_tot_label.alignment = align_center
+    cell_tot_label.fill = fill_total
+
+    for c in range(1, 6):
+        ws_main.cell(row=total_row, column=c).border = total_border
+        ws_main.cell(row=total_row, column=c).fill = fill_total
+
+    for col_idx in range(6, total_cols + 1):
+        col = columns_spec[col_idx - 1]
+        c_letter = get_column_letter(col_idx)
+        cell = ws_main.cell(row=total_row, column=col_idx)
         cell.font = font_total
         cell.border = total_border
+        cell.fill = fill_total
 
-    ws_off.freeze_panes = "H3"
-    ws_off.column_dimensions["A"].width = 6
-    ws_off.column_dimensions["B"].width = 10
-    ws_off.column_dimensions["C"].width = 24
-    ws_off.column_dimensions["D"].width = 22
-    ws_off.column_dimensions["E"].width = 15
-    ws_off.column_dimensions["F"].width = 12
-    ws_off.column_dimensions["G"].width = 10
-    ws_off.column_dimensions["H"].width = 13
-    ws_off.column_dimensions["I"].width = 14
-    ws_off.column_dimensions["J"].width = 18
-    ws_off.column_dimensions["K"].width = 24
-    ws_off.column_dimensions["L"].width = 38
-
-    # Sheet 4: 流水明细库 (底层数据库，包含分包商列)
-    ws_flow = wb.create_sheet(title="流水明细库")
-    ws_flow.views.sheetView[0].showGridLines = True
-
-    flow_headers = [
-        "所属分包公司", "发放批次", "工资单编号", "所属月份", "原序号", "姓名", "身份证号", "电话号码",
-        "工种", "进退场状态", "工资标准", "实际出勤(天)", "扣减支出", "实发基本工资",
-        "津贴", "实发总额(元)", "实名制银行卡号", "开户银行", "开户支行"
-    ]
-    ws_flow.row_dimensions[1].height = 28
-    for c_i, h in enumerate(flow_headers, 1):
-        cell = ws_flow.cell(row=1, column=c_i, value=h)
-        cell.font = font_header
-        cell.fill = fill_primary
-        cell.alignment = align_center
-        cell.border = cell_border
-
-    for r_idx, rec in enumerate(flow_records, 2):
-        ws_flow.row_dimensions[r_idx].height = 20
-        ws_flow.cell(row=r_idx, column=1, value=rec.get("所属劳务公司", "")).alignment = align_center
-        ws_flow.cell(row=r_idx, column=2, value=rec.get("发放批次", "")).alignment = align_center
-        ws_flow.cell(row=r_idx, column=3, value=rec.get("工资单编号", "")).alignment = align_center
-        ws_flow.cell(row=r_idx, column=4, value=rec.get("所属月份", "")).alignment = align_center
-        ws_flow.cell(row=r_idx, column=5, value=rec.get("序号", "")).alignment = align_center
-        ws_flow.cell(row=r_idx, column=6, value=rec.get("姓名", "")).alignment = align_center
-        
-        c_cid = ws_flow.cell(row=r_idx, column=7, value=rec.get("身份证号", ""))
-        c_cid.alignment = align_center
-        c_cid.number_format = "@"
-        
-        c_ph = ws_flow.cell(row=r_idx, column=8, value=rec.get("电话号码", ""))
-        c_ph.alignment = align_center
-        c_ph.number_format = "@"
-        
-        ws_flow.cell(row=r_idx, column=9, value=rec.get("工种", "")).alignment = align_center
-        
-        c_st = ws_flow.cell(row=r_idx, column=10, value=rec.get("进退场状态", ""))
-        c_st.alignment = align_center
-        if rec.get("进退场状态") == "已进场":
-            c_st.fill = fill_status_active
-            c_st.font = font_status_active
+        if col["type"] == "currency":
+            cell.value = f"=SUM({c_letter}{start_row}:{c_letter}{total_row - 1})"
+            cell.number_format = "#,##0.00"
+            cell.alignment = align_right
         else:
-            c_st.fill = fill_status_left
-            c_st.font = font_status_left
+            cell.alignment = align_center
 
-        ws_flow.cell(row=r_idx, column=11, value=rec.get("工资标准", "")).alignment = align_center
-        ws_flow.cell(row=r_idx, column=12, value=rec.get("实际出勤(天)", 0)).alignment = align_center
+    # 冻结窗格：固定前 3 行与前 5 列
+    ws_main.freeze_panes = "F4"
+
+    # Sheet 2: 附表【流水明细库】
+    if flow_records:
+        ws_flow = wb.create_sheet(title="流水明细库")
+        ws_flow.views.sheetView[0].showGridLines = True
+
+        flow_headers = [
+            "所属分包公司", "发放批次", "工资单编号", "所属月份", "原序号", "姓名", "身份证号", "电话号码",
+            "工种", "进退场状态", "工资标准", "实际出勤(天)", "扣减支出", "实发基本工资",
+            "津贴", "实发总额(元)", "实名制银行卡号", "开户银行", "开户支行"
+        ]
+        ws_flow.row_dimensions[1].height = 28
+        for c_i, h in enumerate(flow_headers, 1):
+            cell = ws_flow.cell(row=1, column=c_i, value=h)
+            cell.font = font_header
+            cell.fill = fill_h1_base
+            cell.alignment = align_center
+            cell.border = cell_border
+
+        for r_idx, rec in enumerate(flow_records, 2):
+            ws_flow.row_dimensions[r_idx].height = 20
+            ws_flow.cell(row=r_idx, column=1, value=rec.get("所属劳务公司", "")).alignment = align_center
+            ws_flow.cell(row=r_idx, column=2, value=rec.get("发放批次", "")).alignment = align_center
+            ws_flow.cell(row=r_idx, column=3, value=rec.get("工资单编号", "")).alignment = align_center
+            ws_flow.cell(row=r_idx, column=4, value=rec.get("所属月份", "")).alignment = align_center
+            ws_flow.cell(row=r_idx, column=5, value=rec.get("序号", "")).alignment = align_center
+            ws_flow.cell(row=r_idx, column=6, value=rec.get("姓名", "")).alignment = align_center
+            
+            c_cid = ws_flow.cell(row=r_idx, column=7, value=rec.get("身份证号", ""))
+            c_cid.alignment = align_center
+            c_cid.number_format = "@"
+            
+            c_ph = ws_flow.cell(row=r_idx, column=8, value=rec.get("电话号码", ""))
+            c_ph.alignment = align_center
+            c_ph.number_format = "@"
+            
+            ws_flow.cell(row=r_idx, column=9, value=rec.get("工种", "")).alignment = align_center
+            ws_flow.cell(row=r_idx, column=10, value=rec.get("进退场状态", ""))
+            ws_flow.cell(row=r_idx, column=10).alignment = align_center
+            if rec.get("进退场状态") == "已进场":
+                ws_flow.cell(row=r_idx, column=10).fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+                ws_flow.cell(row=r_idx, column=10).font = Font(name="微软雅黑", size=10, color="276A3C", bold=True)
+            else:
+                ws_flow.cell(row=r_idx, column=10).fill = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid")
+                ws_flow.cell(row=r_idx, column=10).font = Font(name="微软雅黑", size=10, color="A61C1C", bold=True)
+
+            ws_flow.cell(row=r_idx, column=11, value=rec.get("工资标准", "")).alignment = align_center
+            ws_flow.cell(row=r_idx, column=12, value=rec.get("实际出勤(天)", 0)).alignment = align_center
+            
+            c_exp = ws_flow.cell(row=r_idx, column=13, value=rec.get("扣减支出", 0))
+            c_exp.alignment = align_right
+            c_exp.number_format = "#,##0.00"
+            
+            c_bp = ws_flow.cell(row=r_idx, column=14, value=rec.get("实发基本工资", 0))
+            c_bp.alignment = align_right
+            c_bp.number_format = "#,##0.00"
+            
+            c_al = ws_flow.cell(row=r_idx, column=15, value=rec.get("津贴", 0))
+            c_al.alignment = align_right
+            c_al.number_format = "#,##0.00"
+            
+            c_tot = ws_flow.cell(row=r_idx, column=16, value=rec.get("实发总额(元)", 0))
+            c_tot.alignment = align_right
+            c_tot.number_format = "#,##0.00"
+            c_tot.font = Font(name="微软雅黑", size=10, bold=True)
+            
+            c_bc = ws_flow.cell(row=r_idx, column=17, value=rec.get("实名制银行卡号", ""))
+            c_bc.alignment = align_center
+            c_bc.number_format = "@"
+            
+            ws_flow.cell(row=r_idx, column=18, value=rec.get("开户银行", "")).alignment = align_left
+            ws_flow.cell(row=r_idx, column=19, value=rec.get("开户支行", "")).alignment = align_left
+
+            for c_i in range(1, 20):
+                cell = ws_flow.cell(row=r_idx, column=c_i)
+                cell.border = cell_border
+                if r_idx % 2 == 1:
+                    cell.fill = fill_zebra
+
+        tot_flow_r = len(flow_records) + 2
+        ws_flow.row_dimensions[tot_flow_r].height = 24
+        ws_flow.merge_cells(start_row=tot_flow_r, start_column=1, end_row=tot_flow_r, end_column=11)
+        c_tf = ws_flow.cell(row=tot_flow_r, column=1, value="流水全量合计：")
+        c_tf.font = font_total
+        c_tf.alignment = Alignment(horizontal="right", vertical="center")
         
-        c_exp = ws_flow.cell(row=r_idx, column=13, value=rec.get("扣减支出", 0))
-        c_exp.alignment = align_right
-        c_exp.number_format = "#,##0.00"
-        
-        c_bp = ws_flow.cell(row=r_idx, column=14, value=rec.get("实发基本工资", 0))
-        c_bp.alignment = align_right
-        c_bp.number_format = "#,##0.00"
-        
-        c_al = ws_flow.cell(row=r_idx, column=15, value=rec.get("津贴", 0))
-        c_al.alignment = align_right
-        c_al.number_format = "#,##0.00"
-        
-        c_tot = ws_flow.cell(row=r_idx, column=16, value=rec.get("实发总额(元)", 0))
-        c_tot.alignment = align_right
-        c_tot.number_format = "¥#,##0.00"
-        c_tot.font = Font(name="微软雅黑", size=10, bold=True)
-        
-        c_bc = ws_flow.cell(row=r_idx, column=17, value=rec.get("实名制银行卡号", ""))
-        c_bc.alignment = align_center
-        c_bc.number_format = "@"
-        
-        ws_flow.cell(row=r_idx, column=18, value=rec.get("开户银行", "")).alignment = align_left
-        ws_flow.cell(row=r_idx, column=19, value=rec.get("开户支行", "")).alignment = align_left
+        ws_flow.cell(row=tot_flow_r, column=12, value=f"=SUM(L2:L{tot_flow_r-1})").alignment = align_center
+        ws_flow.cell(row=tot_flow_r, column=13, value=f"=SUM(M2:M{tot_flow_r-1})").number_format = "#,##0.00"
+        ws_flow.cell(row=tot_flow_r, column=14, value=f"=SUM(N2:N{tot_flow_r-1})").number_format = "#,##0.00"
+        ws_flow.cell(row=tot_flow_r, column=15, value=f"=SUM(O2:O{tot_flow_r-1})").number_format = "#,##0.00"
+        ws_flow.cell(row=tot_flow_r, column=16, value=f"=SUM(P2:P{tot_flow_r-1})").number_format = "#,##0.00"
 
         for c_i in range(1, 20):
-            cell = ws_flow.cell(row=r_idx, column=c_i)
-            cell.border = cell_border
-            if c_i != 10 and r_idx % 2 == 1:
-                cell.fill = fill_zebra
-            if c_i not in (10, 16):
-                cell.font = font_data
+            cell = ws_flow.cell(row=tot_flow_r, column=c_i)
+            cell.border = total_border
+            cell.fill = fill_total
+            cell.font = font_total
 
-    tot_flow_r = len(flow_records) + 2
-    ws_flow.row_dimensions[tot_flow_r].height = 24
-    ws_flow.merge_cells(start_row=tot_flow_r, start_column=1, end_row=tot_flow_r, end_column=11)
-    c_tf = ws_flow.cell(row=tot_flow_r, column=1, value="流水全量合计：")
-    c_tf.font = font_total
-    c_tf.alignment = Alignment(horizontal="right", vertical="center")
-    
-    ws_flow.cell(row=tot_flow_r, column=12, value=f"=SUM(L2:L{tot_flow_r-1})").alignment = align_center
-    ws_flow.cell(row=tot_flow_r, column=13, value=f"=SUM(M2:M{tot_flow_r-1})").number_format = "#,##0.00"
-    ws_flow.cell(row=tot_flow_r, column=14, value=f"=SUM(N2:N{tot_flow_r-1})").number_format = "#,##0.00"
-    ws_flow.cell(row=tot_flow_r, column=15, value=f"=SUM(O2:O{tot_flow_r-1})").number_format = "#,##0.00"
-    c_s_tot = ws_flow.cell(row=tot_flow_r, column=16, value=f"=SUM(P2:P{tot_flow_r-1})")
-    c_s_tot.number_format = "¥#,##0.00"
-
-    for c_i in range(1, 20):
-        cell = ws_flow.cell(row=tot_flow_r, column=c_i)
-        cell.border = total_border
-        cell.fill = fill_total
-        cell.font = font_total
-
-    ws_flow.freeze_panes = "G2"
-    for c_i in range(1, 20):
-        ws_flow.column_dimensions[get_column_letter(c_i)].width = 16
-    ws_flow.column_dimensions["A"].width = 24
-    ws_flow.column_dimensions["B"].width = 16
-    ws_flow.column_dimensions["C"].width = 22
-    ws_flow.column_dimensions["D"].width = 24
-    ws_flow.column_dimensions["F"].width = 10
-    ws_flow.column_dimensions["G"].width = 22
-    ws_flow.column_dimensions["H"].width = 15
-    ws_flow.column_dimensions["Q"].width = 24
-    ws_flow.column_dimensions["R"].width = 26
-    ws_flow.column_dimensions["S"].width = 30
+        ws_flow.freeze_panes = "G2"
 
     return wb
+
 
 
 def export_ledger_to_folder(target_folder: str, filename: str = None, company_scope: str = None) -> tuple:

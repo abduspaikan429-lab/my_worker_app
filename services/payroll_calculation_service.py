@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # services/payroll_calculation_service.py
 # ================================================================
 # 劳务发薪核算核心服务：工时降序漏斗筛选、额度反推与储备池管理
@@ -375,22 +376,57 @@ def extract_from_backlog(company: str, period: str, worker_keys: List[str]) -> L
 
 def parse_sanju_punch_excel(file_input) -> Tuple[pd.DataFrame, str]:
     """
-    解析中建三局劳务工人考勤明细表（带每日打卡时间及工时）。
+    解析总包系统考勤打卡流水/出勤统计表。
+    自适应支持：
+    1. 最新横向月度出勤统计宽表（表头含1日~31日各日工时、出勤天数、有效工天、总工时，严格按有效工天核算系统考勤）
+    2. 旧版纵向明细流水表（包含工人姓名、考勤日期、工作时长）
     返回:
         (workers_df, period_str)
     """
     if hasattr(file_input, 'seek'):
         file_input.seek(0)
 
-    head_raw = pd.read_excel(file_input, header=None, nrows=6)
+    # 读取前 10 行用于探测表头格式与业务周期
+    try:
+        head_raw = pd.read_excel(file_input, header=None, nrows=10, dtype=str)
+    except Exception:
+        if hasattr(file_input, 'seek'):
+            file_input.seek(0)
+        # 兼容 CSV 输入
+        head_raw = pd.read_csv(file_input, header=None, nrows=10, dtype=str)
+
     period_str = '8月'
     for _, row in head_raw.iterrows():
-        row_text = ' '.join(str(v) for v in row.values)
-        m = re.search(r'(\d{4}年\d{1,2}月|\d{1,2}月)', row_text)
+        row_text = ' '.join(str(v) for v in row.dropna().values)
+        m = re.search(r'(\d{4}年\s*\d{1,2}月|\d{1,2}\s*月)', row_text)
         if m:
-            period_str = m.group(1)
+            period_str = m.group(1).replace(' ', '')
             break
 
+    # 判断是否为最新横向月度出勤统计宽表
+    is_wide_table = False
+    for _, row in head_raw.iterrows():
+        cells = [str(v).strip() for v in row.values]
+        has_name = any('姓名' in c for c in cells)
+        has_days = any(re.match(r'^\d{1,2}\s*日?$', c) for c in cells)
+        has_stats = any(c in ['出勤天数', '有效工天', '总工时', '出勤情况'] for c in cells)
+        if has_name and (has_days or has_stats):
+            is_wide_table = True
+            break
+
+    if hasattr(file_input, 'seek'):
+        file_input.seek(0)
+
+    if is_wide_table:
+        try:
+            raw_full = pd.read_excel(file_input, header=None, dtype=str)
+        except Exception:
+            if hasattr(file_input, 'seek'):
+                file_input.seek(0)
+            raw_full = pd.read_csv(file_input, header=None, dtype=str)
+        return _parse_wide_attendance_excel(raw_full, period_str)
+
+    # 兼容处理旧版纵向明细流水表
     header_idx = 2
     for i, row in head_raw.iterrows():
         cells = [str(v) for v in row.values]
@@ -398,9 +434,12 @@ def parse_sanju_punch_excel(file_input) -> Tuple[pd.DataFrame, str]:
             header_idx = i
             break
 
-    if hasattr(file_input, 'seek'):
-        file_input.seek(0)
-    df = pd.read_excel(file_input, header=header_idx)
+    try:
+        df = pd.read_excel(file_input, header=header_idx)
+    except Exception:
+        if hasattr(file_input, 'seek'):
+            file_input.seek(0)
+        df = pd.read_csv(file_input, header=header_idx)
 
     col_map = {
         '工人姓名': '姓名',
@@ -445,7 +484,6 @@ def parse_sanju_punch_excel(file_input) -> Tuple[pd.DataFrame, str]:
             h = float(row['工作时长'])
             daily_records[d] = round(h, 2)
 
-        # 统计有效打卡天数（大于0工时）
         punch_days = sum(1 for h in daily_records.values() if h > 0.0)
         total_hours = sum(daily_records.values())
         avg_hours = total_hours / punch_days if punch_days > 0 else 0.0
@@ -457,6 +495,8 @@ def parse_sanju_punch_excel(file_input) -> Tuple[pd.DataFrame, str]:
             '工种': str(row_meta.get('工种', '普工')).strip(),
             '班组': str(row_meta.get('班组', '')).strip(),
             '总包系统天数': float(punch_days),
+            '有效工天': float(punch_days),
+            '出勤天数': float(punch_days),
             '总工时': round(total_hours, 2),
             '平均工时': round(avg_hours, 2),
             '_raw_punch_hours': dict(daily_records),
@@ -468,18 +508,185 @@ def parse_sanju_punch_excel(file_input) -> Tuple[pd.DataFrame, str]:
     return res_df, period_str
 
 
+def _parse_wide_attendance_excel(raw_df: pd.DataFrame, period_str: str) -> Tuple[pd.DataFrame, str]:
+    """
+    解析横向月度出勤统计宽表：
+    表头可能跨1~2行（包含姓名、身份证号、参建单位、1日~31日打卡工时、出勤天数、有效工天、总工时）。
+    业务铁律：总包系统考勤严格按【有效工天】核算！
+    """
+    # 查找表头起始行
+    h_start = 0
+    for r in range(min(8, len(raw_df))):
+        row_vals = [str(v).strip() for v in raw_df.iloc[r].values]
+        if any('姓名' in v for v in row_vals) and any(('身份证' in v or '单位' in v or '参建' in v) for v in row_vals):
+            h_start = r
+            break
+
+    # 支持多行组合表头（如第1行含月份/出勤情况，第2行含具体1日~30日）
+    header_rows = [raw_df.iloc[h_start].tolist()]
+    data_start = h_start + 1
+    if h_start + 1 < len(raw_df):
+        r1_vals = [str(v).strip() for v in raw_df.iloc[h_start + 1].values]
+        if any('姓名' in v or '身份证' in v or '1日' in v or '2日' in v or '有效工天' in v for v in r1_vals):
+            header_rows.append(r1_vals)
+            data_start = h_start + 2
+
+    name_col = None
+    id_col = None
+    comp_col = None
+    gender_col = None
+    punch_days_col = None
+    effective_days_col = None
+    total_hours_col = None
+    day_cols: Dict[int, int] = {}  # col_idx -> day (1..31)
+
+    num_cols = raw_df.shape[1]
+    for c in range(num_cols):
+        c_texts = [str(hr[c]).strip() for hr in header_rows if c < len(hr)]
+        if name_col is None and any(t == '姓名' or '工人姓名' in t for t in c_texts):
+            name_col = c
+            continue
+        if id_col is None and any('身份证' in t for t in c_texts):
+            id_col = c
+            continue
+        if comp_col is None and any(k in t for t in c_texts for k in ['参建单位', '分包', '所属企业', '单位']):
+            comp_col = c
+            continue
+        if gender_col is None and any(t == '性别' for t in c_texts):
+            gender_col = c
+            continue
+        if effective_days_col is None and any(t in ['有效工天', '有效天数', '实际工天'] for t in c_texts):
+            effective_days_col = c
+            continue
+        if punch_days_col is None and any(t in ['出勤天数', '打卡天数', '系统天数'] for t in c_texts):
+            punch_days_col = c
+            continue
+        if total_hours_col is None and any(t in ['总工时', '工作时长'] for t in c_texts):
+            total_hours_col = c
+            continue
+
+        day = None
+        for t in reversed(c_texts):
+            m = re.match(r'^(\d{1,2})\s*日?$', t)
+            if m:
+                d_val = int(m.group(1))
+                if 1 <= d_val <= 31:
+                    day = d_val
+                    break
+        if day is not None:
+            day_cols[c] = day
+
+    # 兜底识别第1日：如果某列上表头为年月份且下一列为2日
+    for c in range(num_cols):
+        if c not in day_cols:
+            c_texts = [str(hr[c]).strip() for hr in header_rows if c < len(hr)]
+            if any(re.search(r'\d{4}年\d{1,2}月', t) for t in c_texts):
+                if (c + 1) in day_cols and day_cols[c + 1] == 2:
+                    day_cols[c] = 1
+
+    workers = []
+    for r in range(data_start, len(raw_df)):
+        row = raw_df.iloc[r]
+        name = str(row[name_col]).strip() if name_col is not None else ''
+        if not name or name in ['姓名', '合计', '小计', '平均', 'nan', 'None', '']:
+            continue
+        id_card = str(row[id_col]).strip() if id_col is not None else ''
+        if id_card.endswith('.0'):
+            id_card = id_card[:-2]
+        comp = str(row[comp_col]).strip() if comp_col is not None else ''
+        gender = str(row[gender_col]).strip() if gender_col is not None else ''
+
+        daily_records: Dict[int, float] = {}
+        for c, day in day_cols.items():
+            val = str(row[c]).strip()
+            if not val or val in ['--', '—', '-', '/', '请假', '休', 'nan', 'None']:
+                continue
+            try:
+                h = float(val)
+                if h > 0:
+                    daily_records[day] = round(h, 2)
+            except (ValueError, TypeError):
+                continue
+
+        # 解析有效工天（业务核心：考勤严格按出勤统计表的有效工天算）
+        eff_days = None
+        if effective_days_col is not None:
+            try:
+                val = float(str(row[effective_days_col]).strip())
+                if pd.notna(val):
+                    eff_days = val
+            except Exception:
+                pass
+
+        # 解析出勤天数（打卡天数）
+        punch_days = None
+        if punch_days_col is not None:
+            try:
+                val = float(str(row[punch_days_col]).strip())
+                if pd.notna(val):
+                    punch_days = val
+            except Exception:
+                pass
+
+        if punch_days is None:
+            punch_days = float(len(daily_records))
+
+        # 若未提供有效工天列，回退到出勤天数
+        if eff_days is None:
+            eff_days = punch_days
+
+        # 解析总工时
+        total_hours = None
+        if total_hours_col is not None:
+            try:
+                val = float(str(row[total_hours_col]).strip())
+                if pd.notna(val):
+                    total_hours = val
+            except Exception:
+                pass
+
+        if total_hours is None:
+            total_hours = round(sum(daily_records.values()), 2)
+
+        avg_hours = round(total_hours / eff_days, 2) if eff_days > 0 else 0.0
+
+        workers.append({
+            '姓名': name,
+            '性别': gender,
+            '身份证号': id_card,
+            '分包/所属企业': comp,
+            '工种': '普工',
+            '班组': '',
+            '总包系统天数': float(eff_days),      # 严格按有效工天算作为系统对账天数
+            '有效工天': float(eff_days),          # 保留原始有效工天
+            '出勤天数': float(punch_days),        # 保留原始打卡天数
+            '总工时': round(total_hours, 2),
+            '平均工时': round(avg_hours, 2),
+            '_raw_punch_hours': dict(daily_records),
+            '__考勤明细__': dict(daily_records),
+            '月份': period_str
+        })
+
+    res_df = pd.DataFrame(workers)
+    return res_df, period_str
+
+
 def reconcile_attendance(
     system_df: pd.DataFrame,
     my_df: Optional[pd.DataFrame] = None,
-    foreman_days_map: Optional[Dict[str, float]] = None,
     final_days_map: Optional[Dict[str, float]] = None,
-    allowance_map: Optional[Dict[str, float]] = None
+    allowance_map: Optional[Dict[str, float]] = None,
+    foreman_days_map: Optional[Dict[str, float]] = None
 ) -> pd.DataFrame:
     """
-    三方考勤智能对账与裁决引擎：
-    基准铁律：系统考勤为核查基线，默认最终有效工日 = min(班组长核定工日, 总包系统打卡天数)。
-    实战特批：支持劳资员人工调整最终裁定工日（不锁死，应对断电故障与特批补卡）。
-    当核减时，依据每日工时降序筛选打 ✓；当特批超额时，自动在空缺日补齐打钩。
+    考勤智能对账与阶段性结算裁决引擎：
+    两方极简直通比对：【水印照片天数】 VS 【总包系统有效工天】。
+    1. 业务核心：以【水印照片】为主（真实上班证明，防代打卡防空刷），系统考勤按【有效工天】核算。
+    2. 当系统有效工天 < 水印照片：
+       以水印照片为主！系统有效打卡走正常工资发放；
+       水印照片多出的天数（水印天数 - 系统有效工天）走【阶段性结算】，并做特殊标记与金额统计！
+    3. 当系统有效工天 > 水印照片：
+       以水印照片为主核减！按每日真实工时降序筛选最长工时打 ✓，自动剔除空刷/短工时。
     """
     df = system_df.copy()
     if '_raw_punch_hours' not in df.columns:
@@ -488,13 +695,13 @@ def reconcile_attendance(
             for _, r in df.iterrows()
         ]
 
-    # 1. 匹配【我的考勤】
-    my_map = {}
-    if my_df is not None and not my_df.empty:
+    # 1. 匹配【水印照片核对表】
+    my_map: Dict[str, float] = {}
+    has_watermark_source = (my_df is not None and not my_df.empty)
+    if has_watermark_source:
         id_col = next((c for c in my_df.columns if any(k in c for k in ['身份证', '证件号'])), None)
         name_col = next((c for c in my_df.columns if any(k in c for k in ['姓名', '人员'])), None)
 
-        # 优先精确查找代表天数的列，严格避开 '__考勤明细__' 等字典列
         day_cands = [
             '最终核定天数', '解析出勤天数', '出勤天数', '实际出勤天数',
             '考勤天数', '实际天数', '核定天数', '天数', '出勤工日', '工日'
@@ -512,7 +719,6 @@ def reconcile_attendance(
                 k_name = str(r.get(name_col, '')).strip() if name_col else ''
                 raw_val = r.get(days_col, 0)
 
-                # 防御性解析：如果单元格是字典（如考勤明细），统计有效出勤天数；否则转为浮点数
                 if isinstance(raw_val, dict):
                     val = float(sum(1 for v in raw_val.values() if v and str(v).strip() not in ['', '0', '0.0', '休', '-']))
                 else:
@@ -526,6 +732,19 @@ def reconcile_attendance(
                         my_map[k_id] = float(val)
                     if k_name:
                         my_map[f"name:{k_name}"] = float(val)
+    elif foreman_days_map:
+        has_watermark_source = True
+        for k, v in foreman_days_map.items():
+            k_str = str(k).strip()
+            try:
+                f_val = float(v)
+                if len(k_str) >= 15:
+                    my_map[k_str] = f_val
+                else:
+                    my_map[f"name:{k_str}"] = f_val
+                    my_map[k_str] = f_val
+            except (ValueError, TypeError):
+                continue
 
     def _get_my_days(row):
         id_card = str(row.get('身份证号', '')).strip()
@@ -534,41 +753,60 @@ def reconcile_attendance(
             return my_map[id_card]
         if f"name:{name}" in my_map:
             return my_map[f"name:{name}"]
-        return float(row.get('总包系统天数', 0.0))
+        # 若未传入水印表，直接取系统有效工天
+        return float(row.get('有效工天', row.get('总包系统天数', 0.0)))
 
     df['我的考勤天数'] = df.apply(_get_my_days, axis=1)
+    df['水印照片天数'] = df['我的考勤天数']
 
-    # 2. 匹配【班组长核定工日】
-    f_map = foreman_days_map or {}
-    def _get_foreman_days(row):
-        id_card = str(row.get('身份证号', '')).strip()
-        name = str(row.get('姓名', '')).strip()
-        if id_card in f_map:
-            return float(f_map[id_card])
-        if f"name:{name}" in f_map:
-            return float(f_map[f"name:{name}"])
-        if name in f_map:
-            return float(f_map[name])
-        return float(row['我的考勤天数'])
+    # 2. 计算【阶段性结算天数】与【正常打卡天数】
+    # 业务铁律：
+    # ① 阶段性结算：只有当【水印照片天数 > 系统打卡天数(出勤天数)】时，超出打卡记录的部分才做阶段性结算！
+    # ② 正常打卡天数：在系统打卡容量范围内按有效工天发；若水印照片小于有效工天则核减！即 min(水印天数, 有效工天)
+    def _calc_stage_settle_days(row):
+        punch_d = float(row.get('出勤天数', row.get('总包系统天数', 0.0)))
+        w_d = float(row['水印照片天数'])
+        return round(float(max(0.0, w_d - punch_d)), 2)
 
-    df['班组长核定工日'] = df.apply(_get_foreman_days, axis=1)
+    def _calc_normal_days(row):
+        eff_d = float(row.get('有效工天', row.get('总包系统天数', 0.0)))
+        w_d = float(row['水印照片天数'])
+        return round(float(min(w_d, eff_d)), 2)
 
-    # 3. 匹配【最终裁定工日】：支持现场特殊特批修改，不写死
-    fin_map = final_days_map or {}
+    df['阶段性结算天数'] = df.apply(_calc_stage_settle_days, axis=1)
+    df['正常打卡天数'] = df.apply(_calc_normal_days, axis=1)
+
+    # 3. 最终核定天数（总工天）
+    # 支持现场特批覆盖修改（final_days_map 或 foreman_days_map 兼容）
+    override_map = final_days_map or foreman_days_map or {}
     def _get_final_days(row):
         id_card = str(row.get('身份证号', '')).strip()
         name = str(row.get('姓名', '')).strip()
-        # 优先使用人工调整的裁定工日
-        if id_card in fin_map:
-            return float(fin_map[id_card])
-        if f"name:{name}" in fin_map:
-            return float(fin_map[f"name:{name}"])
-        if name in fin_map:
-            return float(fin_map[name])
-        # 默认基准裁决：min(班组长核定工日, 总包系统天数)
-        return float(min(row['班组长核定工日'], row['总包系统天数']))
+        if id_card in override_map:
+            return float(override_map[id_card])
+        if f"name:{name}" in override_map:
+            return float(override_map[f"name:{name}"])
+        if name in override_map:
+            return float(override_map[name])
+        # 默认：正常打卡天数 + 阶段性结算天数
+        return round(float(row['正常打卡天数'] + row['阶段性结算天数']), 2)
 
-    df['最终裁定工日'] = df.apply(_get_final_days, axis=1)
+    df['最终核定天数'] = df.apply(_get_final_days, axis=1)
+    df['最终裁定工日'] = df['最终核定天数']  # 保持字段兼容
+    df['班组长核定工日'] = df['最终核定天数']  # 保持旧字段兼容
+
+    # 若有人工特批最终核定天数，重新联动阶段性结算与正常打卡天数
+    if override_map:
+        for idx in df.index:
+            row = df.loc[idx]
+            id_card = str(row.get('身份证号', '')).strip()
+            name = str(row.get('姓名', '')).strip()
+            if (id_card in override_map) or (f"name:{name}" in override_map) or (name in override_map):
+                fin_d = float(df.loc[idx, '最终核定天数'])
+                punch_d = float(row.get('出勤天数', row.get('总包系统天数', 0.0)))
+                eff_d = float(row.get('有效工天', row.get('总包系统天数', 0.0)))
+                df.loc[idx, '阶段性结算天数'] = round(float(max(0.0, fin_d - punch_d)), 2)
+                df.loc[idx, '正常打卡天数'] = round(float(min(fin_d, eff_d)), 2)
 
     # 4. 匹配【津贴】
     alw_map = allowance_map or {}
@@ -585,48 +823,55 @@ def reconcile_attendance(
 
     df['津贴'] = df.apply(_get_allowance, axis=1).round(2)
 
-    # 5. 状态标记与工时降序筛选打钩
+    # 5. 计算各部分工资
+    if '提取日薪' not in df.columns:
+        df['提取日薪'] = 300.0
+    df['提取日薪'] = pd.to_numeric(df['提取日薪'], errors='coerce').fillna(300.0)
+
+    df['正常打卡工资'] = (df['正常打卡天数'] * df['提取日薪']).round(2)
+    df['阶段性结算金额'] = (df['阶段性结算天数'] * df['提取日薪']).round(2)
+    df['应发工资'] = (df['最终核定天数'] * df['提取日薪'] + df['津贴']).round(2)
+
+    # 6. 裁定状态特殊标记与每日打钩排布
     status_list = []
     selected_details = []
     rejected_details = []
 
     for _, row in df.iterrows():
-        sys_d = float(row['总包系统天数'])
-        f_d = float(row['班组长核定工日'])
-        fin_d = float(row['最终裁定工日'])
+        punch_d = float(row.get('出勤天数', row.get('总包系统天数', 0.0)))
+        eff_d = float(row.get('有效工天', row.get('总包系统天数', 0.0)))
+        w_d = float(row['水印照片天数'])
+        fin_d = float(row['最终核定天数'])
+        stage_d = float(row['阶段性结算天数'])
         raw_hours = row.get('_raw_punch_hours')
         if not isinstance(raw_hours, dict) or not raw_hours:
             raw_hours = row.get('__考勤明细__', {})
             if not isinstance(raw_hours, dict):
                 raw_hours = {}
 
-        if fin_d <= 0:
+        if fin_d <= 0 and punch_d <= 0:
             status = "⚪ 0考勤 (不纳入考勤表)"
-        elif fin_d > sys_d:
-            diff = fin_d - sys_d
-            status = f"⚡ 特殊特批工日 (超出系统{diff:.1f}天)"
-        elif fin_d < sys_d:
-            diff = sys_d - fin_d
-            status = f"✂️ 班组长核减{diff:.1f}天 (剔除短工时)"
-        elif f_d > sys_d:
-            status = f"⚠️ 受限系统打卡 (系统仅{sys_d:.1f}天)"
+        elif stage_d > 0:
+            status = f"🚨 水印超打卡 {stage_d:.1f} 天 (走阶段性结算)"
+        elif (w_d < eff_d) or (fin_d < eff_d):
+            diff = round(eff_d - min(w_d, fin_d), 1)
+            status = f"✂️ 水印核减 {diff:.1f} 天 (代打卡/空刷剔除)"
+        elif has_watermark_source:
+            status = "✔️ 正常有效工天发放"
         else:
-            status = "✔️ 完全一致"
+            status = "✔️ 单源系统有效工天"
         status_list.append(status)
 
-        # 依据真实工时由长到短排布打 ✓，若特批超额则补齐打钩
+        # 打钩排布：按工时由长到短排布打 ✓，超额部分自动补齐
         sel, rej = filter_top_working_days(raw_hours, fin_d)
         selected_details.append(sel)
         rejected_details.append(rej)
 
     df['裁定状态'] = status_list
     df['__考勤明细__'] = selected_details
-    df['最终核定天数'] = df['最终裁定工日']
     df['解析出勤天数'] = df['总包系统天数']
     df['_rejected_foreman'] = rejected_details
-    if '提取日薪' in df.columns:
-        df['提取日薪'] = pd.to_numeric(df['提取日薪'], errors='coerce').fillna(300.0)
-        df['应发工资'] = (df['最终核定天数'] * df['提取日薪'] + df['津贴']).round(2)
 
     return df
+
 

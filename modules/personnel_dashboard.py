@@ -514,10 +514,24 @@ def render() -> None:
     with tab_monthly:
         st.markdown("### 📅 项目月度变动深度钻取")
         
-        all_months_options = ['6月', '7月', '8月', '9月']
+        # 动态获取月份并按自然月升序排序，默认定位到最新月份
+        months_from_data = data.get("months") or list(summary.keys())
+        if months_from_data:
+            try:
+                all_months_options = sorted(
+                    list(dict.fromkeys(months_from_data)),
+                    key=lambda x: int(re.search(r'\d+', str(x)).group()) if re.search(r'\d+', str(x)) else 0
+                )
+            except Exception:
+                all_months_options = list(dict.fromkeys(months_from_data))
+        else:
+            all_months_options = ['6月', '7月', '8月', '9月']
+
+        default_month_idx = max(0, len(all_months_options) - 1)
+
         col_m_sel, col_m_info = st.columns([1, 2])
         with col_m_sel:
-            sel_month = st.selectbox("选择查看月份", options=all_months_options, index=1)
+            sel_month = st.selectbox("选择查看月份", options=all_months_options, index=default_month_idx, key="drilldown_selected_month")
             
         m_data = summary.get(sel_month, {"in_total": 0, "out_total": 0, "onsite_total": 0, "actual_onsite_total": 0, "net_change": 0, "teams": {}})
         
