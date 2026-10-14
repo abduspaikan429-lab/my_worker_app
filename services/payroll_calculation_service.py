@@ -875,3 +875,166 @@ def reconcile_attendance(
     return df
 
 
+def parse_worker_sort_order(raw_text: str, available_names: Optional[List[str]] = None) -> List[str]:
+    """
+    智能解析用户输入的工人排序文本。
+    支持格式：
+    1. 每行一个姓名（可带序号如 "1. 张三" 或 "1、张三" 或 "1 张三" 或 "(1) 张三"）
+    2. 逗号、顿号、分号分隔的一行或多行姓名列表
+    3. 从 Excel 直接复制的多列（如 "1\\t张三\\t木工"），整行只提取匹配的工人姓名
+    """
+    if not raw_text or not str(raw_text).strip():
+        return []
+
+    avail_set = set(str(n).strip() for n in available_names) if available_names else set()
+    lines = str(raw_text).strip().splitlines()
+    result = []
+    seen = set()
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        # 场景 A: 如果当前行是用制表符 \\t 分隔（典型从 Excel 复制的多列数据）
+        if '\t' in line:
+            cols = [c.strip() for c in line.split('\t') if c.strip()]
+            matched_name = None
+            if avail_set:
+                for c in cols:
+                    cleaned_c = re.sub(r'^(?:No\.?|\d+[\.、\s\-_]*|[\(\[（【]\d+[\)\]）】]\s*)', '', c).strip()
+                    if cleaned_c in avail_set:
+                        matched_name = cleaned_c
+                        break
+            if not matched_name:
+                for c in cols:
+                    cleaned_c = re.sub(r'^(?:No\.?|\d+[\.、\s\-_]*|[\(\[（【]\d+[\)\]）】]\s*)', '', c).strip()
+                    if cleaned_c and not cleaned_c.isdigit() and len(cleaned_c) <= 6:
+                        if cleaned_c not in {'木工', '钢筋工', '瓦工', '油漆工', '架子工', '普工', '电工', '焊工', '水暖工'}:
+                            matched_name = cleaned_c
+                            break
+                if not matched_name and cols:
+                    matched_name = cols[0]
+            if matched_name and matched_name not in seen:
+                result.append(matched_name)
+                seen.add(matched_name)
+            continue
+
+        # 场景 B: 包含逗号、顿号、分号的姓名列表（可能一行写了多个名字，如：张三, 李四, 王五）
+        if any(sep in line for sep in [',', '，', '、', ';', '；']):
+            parts = re.split(r'[,，、;；]+', line)
+            for part in parts:
+                part = part.strip()
+                if not part:
+                    continue
+                cleaned = re.sub(r'^(?:No\.?|\d+[\.、\s\-_]*|[\(\[（【]\d+[\)\]）】]\s*)', '', part).strip()
+                cleaned = re.sub(r'[\s\u3000]+', '', cleaned)
+                if cleaned and cleaned not in seen:
+                    result.append(cleaned)
+                    seen.add(cleaned)
+            continue
+
+        # 场景 C: 单行单人（可能带序号、空格如 "1 张三" 或 "1. 张三 木工"）
+        cleaned_line = re.sub(r'^(?:No\.?|\d+[\.、\s\-_]*|[\(\[（【]\d+[\)\]）】]\s*|[一二三四五六七八九十]+[、\.]\s*)', '', line).strip()
+        matched_name = None
+        if avail_set:
+            if cleaned_line in avail_set:
+                matched_name = cleaned_line
+            else:
+                words = cleaned_line.split()
+                for w in words:
+                    w_clean = re.sub(r'[\s\u3000]+', '', w)
+                    if w_clean in avail_set:
+                        matched_name = w_clean
+                        break
+        if not matched_name:
+            words = cleaned_line.split()
+            first_w = words[0] if words else cleaned_line
+            matched_name = re.sub(r'[\s\u3000]', '', first_w)
+
+        if matched_name and matched_name not in seen:
+            result.append(matched_name)
+            seen.add(matched_name)
+
+    return result
+
+
+def sort_workers_df_by_order(
+    df: pd.DataFrame,
+    custom_order: List[str],
+    name_col: str = '姓名'
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    根据用户指定的姓名列表对工人员 DataFrame 进行重排。
+    - custom_order 中的工人员严格按照输入顺序排在前面；
+    - 未在 custom_order 中指定的工人员自动按原相对顺序追加在末尾（确保不漏人）；
+    - 返回 (排序后的 DataFrame, 统计诊断信息字典)。
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(), {
+            'matched': [],
+            'unmatched': custom_order or [],
+            'appended': [],
+            'total_count': 0
+        }
+
+    work_df = df.copy()
+    if name_col not in work_df.columns:
+        found_col = None
+        for col in ['姓名', '名', '人员姓名', 'Name']:
+            if col in work_df.columns:
+                found_col = col
+                break
+        if found_col:
+            name_col = found_col
+        else:
+            return work_df, {
+                'matched': [],
+                'unmatched': custom_order or [],
+                'appended': [],
+                'total_count': len(work_df)
+            }
+
+    work_df['_orig_idx'] = list(range(len(work_df)))
+    current_names = [str(n).strip() for n in work_df[name_col].tolist()]
+    current_names_set = set(current_names)
+
+    clean_custom_order = []
+    seen = set()
+    for name in custom_order:
+        s_name = str(name).strip()
+        if s_name and s_name not in seen:
+            clean_custom_order.append(s_name)
+            seen.add(s_name)
+
+    matched_names = [n for n in clean_custom_order if n in current_names_set]
+    unmatched_names = [n for n in clean_custom_order if n not in current_names_set]
+
+    order_map = {n: i for i, n in enumerate(matched_names)}
+
+    def _calc_rank(row):
+        nm = str(row[name_col]).strip()
+        orig_i = row['_orig_idx']
+        if nm in order_map:
+            return (0, order_map[nm], orig_i)
+        else:
+            return (1, orig_i, orig_i)
+
+    work_df['_rank'] = work_df.apply(_calc_rank, axis=1)
+    work_df = work_df.sort_values(by='_rank').reset_index(drop=True)
+    work_df = work_df.drop(columns=['_orig_idx', '_rank'])
+
+    final_names = [str(n).strip() for n in work_df[name_col].tolist()]
+    appended_names = [n for n in final_names if n not in set(matched_names)]
+
+    stats = {
+        'matched': matched_names,
+        'unmatched': unmatched_names,
+        'appended': appended_names,
+        'total_count': len(work_df)
+    }
+
+    return work_df, stats
+
+
+

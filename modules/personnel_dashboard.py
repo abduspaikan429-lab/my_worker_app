@@ -19,17 +19,46 @@ SWITCHOVER_MONTH = "2026-09"
 START_MONTH = "2026-06"
 
 
-def _get_report_date_str(month_str: str) -> str:
-    if not month_str or "-" not in month_str:
+def _get_report_date_str(month_val: str, as_of_today: bool = False) -> str:
+    """
+    根据选择的月份（如 '10月', '2026-10', '9月' 等）自动计算标准化报表日期范围：
+    默认上月最后一日至本月最后一日（如：2026 年 9 月 30 日至 2026 年 10 月 31 日）。
+    若 as_of_today=True 且所选月份为当前自然月，则截止日期自动捕捉为当前系统日期（如：截至 2026 年 10 月 12 日）。
+    """
+    if not month_val:
         return ""
-    y, m = map(int, month_str.split('-'))
+    now = datetime.now()
+    cur_year = now.year
+    cur_month = now.month
+    cur_day = now.day
+
+    y = cur_year
+    m = cur_month
+
+    ym_match = re.search(r'(\d{4})[-/.](\d{1,2})', str(month_val))
+    if ym_match:
+        y = int(ym_match.group(1))
+        m = int(ym_match.group(2))
+    else:
+        d_match = re.search(r'(\d+)', str(month_val))
+        if d_match:
+            m = int(d_match.group(1))
+            if m >= 6:
+                y = 2026
+            else:
+                y = cur_year if cur_year > 2026 else 2027
+
     pm = m - 1
     py = y
     if pm == 0:
         pm = 12
         py -= 1
+
     _, p_days = calendar.monthrange(py, pm)
     _, c_days = calendar.monthrange(y, m)
+
+    if as_of_today and y == cur_year and m == cur_month:
+        return f"{py} 年 {pm} 月 {p_days} 日至 {y} 年 {m} 月 {cur_day} 日"
     return f"{py} 年 {pm} 月 {p_days} 日至 {y} 年 {m} 月 {c_days} 日"
 
 
@@ -381,7 +410,7 @@ def render() -> None:
         <div style="display: flex; align-items: center; gap: 14px; font-size: 0.84rem; color: #CBD5E1; flex-wrap: wrap;">
             <span>系统主表: <strong style="color: #60A5FA;">{master_count}</strong> 人</span>
             <span style="opacity: 0.4;">|</span>
-            <span>进场在办: <strong style="color: #34D399;">{onboard_pending}</strong> 人 <span style="font-size: 0.76rem; color: #94A3B8;">(全周期卡片/9月5人)</span></span>
+            <span>进场在办: <strong style="color: #34D399;">{onboard_pending}</strong> 人</span>
             <span style="opacity: 0.4;">|</span>
             <span>离场结算中: <strong style="color: #F87171;">{offboard_pending}</strong> 人</span>
             <span style="opacity: 0.4;">|</span>
@@ -425,13 +454,15 @@ def render() -> None:
                 st.dataframe(unpasted_df, use_container_width=True, hide_index=True)
 
     # 4. 顶部 Executive KPI Banner (核心规模与合规达标率)
+    all_m = data.get("months", ["6月", "10月"])
+    m_range_str = f"{all_m[0]}-{all_m[-1]}" if len(all_m) > 1 else all_m[0]
     col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
         _render_executive_card("累计参建劳务工", f"{demo['total_unique']} 人", "去重实名制人员基数", "👥", "#3B82F6")
     with col2:
         _render_executive_card("现场实时在场", f"{currently_onsite} 人", "扣除规范离场后真实驻场", "🏗️", "#10B981", "linear-gradient(135deg, #F8FAFC 0%, #ECFDF5 100%)")
     with col3:
-        _render_executive_card("累计进场人次", f"{comp['inflow_total']} 人次", "6-9月爬坡及增量进场", "🚀", "#6366F1")
+        _render_executive_card("累计进场人次", f"{comp['inflow_total']} 人次", f"{m_range_str}全周期及增量进场", "🚀", "#6366F1")
     with col4:
         _render_executive_card("累计离场人次", f"{comp['outflow_total']} 人次", "规范退场工资结清", "🛫", "#EF4444", "linear-gradient(135deg, #F8FAFC 0%, #FEF2F2 100%)")
     with col5:
@@ -517,15 +548,15 @@ def render() -> None:
         # 动态获取月份并按自然月升序排序，默认定位到最新月份
         months_from_data = data.get("months") or list(summary.keys())
         if months_from_data:
-            try:
-                all_months_options = sorted(
-                    list(dict.fromkeys(months_from_data)),
-                    key=lambda x: int(re.search(r'\d+', str(x)).group()) if re.search(r'\d+', str(x)) else 0
-                )
-            except Exception:
-                all_months_options = list(dict.fromkeys(months_from_data))
+            def _m_sort_key(m_str: Any) -> int:
+                match = re.search(r'(\d+)', str(m_str))
+                if match:
+                    val = int(match.group(1))
+                    return val if val >= 6 else (val + 12)
+                return 0
+            all_months_options = sorted(list(dict.fromkeys(months_from_data)), key=_m_sort_key)
         else:
-            all_months_options = ['6月', '7月', '8月', '9月']
+            all_months_options = ['6月', '7月', '8月', '9月', '10月']
 
         default_month_idx = max(0, len(all_months_options) - 1)
 
@@ -750,13 +781,31 @@ def render() -> None:
                     key=f"dl_out_{sel_month}"
                 )
 
-        # 可选：展开月度报文生成器 (向前兼容原功能)
-        with st.expander("📝 查看/生成该月标准化报表文本 (用于工作汇报直贴)", expanded=False):
-            date_str = _get_report_date_str(f"2026-0{sel_month[0]}")
+        # 展开月度标准化报文生成器 (自动捕捉日期，支持全月考核周期与截至今日实时直贴)
+        with st.expander(f"📝 查看/生成 {sel_month} 标准化报表文本 (用于工作汇报直贴)", expanded=False):
+            st.markdown(f"#### 📋 {sel_month} 标准化人员流动汇报文本生成器")
+
+            c_rm1, c_rm2 = st.columns([1.6, 1.4])
+            with c_rm1:
+                date_mode = st.radio(
+                    "📅 报表统计周期口径",
+                    options=["全月考核周期 (上月最后一日至本月最后一日)", "截至今日实时 (自动捕捉当前系统日期)"],
+                    index=0,
+                    horizontal=True,
+                    key=f"rep_date_mode_{sel_month}"
+                )
+            with c_rm2:
+                as_of_today = ("截至今日" in date_mode)
+                date_str = _get_report_date_str(sel_month, as_of_today=as_of_today)
+                st.caption(f"💡 自动捕捉报表日期范围：**{date_str}**")
+
             text_total = f"①总：劳务（专业）分包单位： 中建二局安装工程有限公司        班组名称：  金属屋面         日期： {date_str}  本月进场务工人员总数:    {m_data['in_total']}          本月离场务工人员总数:   {m_data['out_total']}         本月现场务工人员总数：   {m_data['onsite_total']}"
             text_wang = f"②分：劳务（专业）分包单位： 中建二局安装工程有限公司        班组名称：  汪佩沾其它班组         日期： {date_str}  本月进场务工人员总数:    {team_wang_stats['in_count']}         本月离场务工人员总数:   {team_wang_stats['out_count']}         本月现场务工人员总数：   {team_wang_stats['onsite_count']}"
             text_yi = f"③分：劳务（专业）分包单位： 中建二局安装工程有限公司        班组名称：  王宜强施工班组         日期： {date_str}  本月进场务工人员总数:    {team_yi_stats['in_count']}          本月离场务工人员总数:   {team_yi_stats['out_count']}         本月现场务工人员总数：   {team_yi_stats['onsite_count']}"
-            st.code(f"{text_total}\n{text_wang}\n{text_yi}", language="text")
+
+            full_report_text = f"{text_total}\n{text_wang}\n{text_yi}"
+            st.code(full_report_text, language="text")
+            st.caption("💡 提示：点击代码框右上角小图标即可一键复制纯文本，直接粘贴至工作群汇报或官方系统台账！")
 
     # ==========================================
     # Tab 3: 全员参建档案总库 (多源透视)

@@ -15,7 +15,9 @@ import os
 import io
 import json
 import copy
-from datetime import datetime
+import re
+import calendar
+from datetime import datetime, date
 from typing import Dict, Any, List, Optional, Tuple
 
 import pandas as pd
@@ -62,6 +64,75 @@ def clean_job_title(job_val: Any) -> str:
             return '其他'
         return '普工'
     return s
+
+
+def parse_date_to_month_label(d: Any, default_month: Optional[str] = None) -> str:
+    """
+    通用日期解析提取月份标签（如 '6月', '10月', '11月' 等）。
+    自动识别 YYYY-MM-DD, YYYY/MM/DD, YYYY.MM.DD, 中文日期等格式。
+    """
+    if d is None:
+        return default_month or f"{datetime.now().month}月"
+    if isinstance(d, (datetime, date)):
+        return f"{d.month}月"
+    s = str(d).strip()
+    if not s or s.lower() in ("nan", "none", "nat", ""):
+        return default_month or f"{datetime.now().month}月"
+
+    # 匹配 YYYY-MM-DD, YYYY/MM/DD, YYYY.MM.DD
+    m_ym = re.search(r'\d{4}[-/.](\d{1,2})', s)
+    if m_ym:
+        return f"{int(m_ym.group(1))}月"
+
+    # 匹配 "10月", "6月"
+    m_cn = re.search(r'(\d{1,2})\s*月', s)
+    if m_cn:
+        return f"{int(m_cn.group(1))}月"
+
+    # 匹配纯数字月份
+    if s.isdigit() and 1 <= int(s) <= 12:
+        return f"{int(s)}月"
+
+    return default_month or f"{datetime.now().month}月"
+
+
+def generate_project_months_sequence(start_year: int = 2026, start_month: int = 6, extra_months: Optional[List[str]] = None) -> List[str]:
+    """
+    根据项目起始年月（默认 2026年6月）至当前系统年月（自动捕捉），以及数据源中出现的额外月份，
+    生成按时间先后排序的连续月份标签列表（例如 ['6月', '7月', '8月', '9月', '10月']）。
+    当未来自然月份推进时（如11月、12月），全自动顺延生成！
+    """
+    now = datetime.now()
+    cur_year = now.year
+    cur_month = now.month
+
+    months_seq = []
+    cy, cm = start_year, start_month
+    while (cy < cur_year) or (cy == cur_year and cm <= cur_month):
+        months_seq.append(f"{cm}月")
+        cm += 1
+        if cm > 12:
+            cm = 1
+            cy += 1
+
+    if extra_months:
+        for m_str in extra_months:
+            if not m_str:
+                continue
+            m_match = re.search(r'(\d+)', str(m_str))
+            if m_match:
+                lbl = f"{int(m_match.group(1))}月"
+                if lbl not in months_seq:
+                    months_seq.append(lbl)
+
+    def month_sort_key(m_str: str) -> int:
+        match = re.search(r'(\d+)', str(m_str))
+        if match:
+            val = int(match.group(1))
+            return val if val >= 6 else (val + 12)
+        return 0
+
+    return sorted(list(dict.fromkeys(months_seq)), key=month_sort_key)
 
 
 class PersonnelDataService:
@@ -134,7 +205,7 @@ class PersonnelDataService:
             "demographics": demographics,
             "compliance": compliance,
             "live_status": live_status,
-            "months": ['6月', '7月', '8月', '9月'],
+            "months": generate_project_months_sequence(extra_months=list(monthly_summary.keys())),
             "teams": ['江苏旭之升 (王宜强施工班组)', '青海久昌 (汪佩沾其他班组)']
         }
         self._cached_data = data
@@ -231,17 +302,7 @@ class PersonnelDataService:
         existing_ids = {clean_id(x) for x in unique_roster["ID"] if clean_id(x)}
         existing_names = set(unique_roster["Name"].str.strip()) if not unique_roster.empty else set()
 
-        def _parse_month(d: str) -> str:
-            s = str(d).strip()
-            if "06" in s or "-6-" in s or "/6/" in s or "6月" in s:
-                return "6月"
-            elif "07" in s or "-7-" in s or "/7/" in s or "7月" in s:
-                return "7月"
-            elif "08" in s or "-8-" in s or "/8/" in s or "8月" in s:
-                return "8月"
-            elif "09" in s or "-9-" in s or "/9/" in s or "9月" in s:
-                return "9月"
-            return "9月"
+        _parse_month = parse_date_to_month_label
 
         unpasted_workers = []
         new_roster_rows = []
@@ -472,37 +533,164 @@ class PersonnelDataService:
         live_status["unpasted_count"] = len(unpasted_workers)
         live_status["unpasted_workers"] = unpasted_workers
 
+        # 获取全周期月份序列（如 ['6月', '7月', '8月', '9月', '10月']）
+        all_months_seq = generate_project_months_sequence(
+            extra_months=list(monthly_summary.keys()) + list(df_inflow["Month"].dropna().unique())
+        )
+
+        team_yi = '江苏旭之升 (王宜强施工班组)'
+        team_wang = '青海久昌 (汪佩沾其他班组)'
+
+        # 校准 9月 结合系统数据精准对齐
         if "9月" in monthly_summary:
             m9_inflow = df_inflow[df_inflow["Month"] == "9月"] if not df_inflow.empty else pd.DataFrame()
             m9_outflow = df_outflow[df_outflow["Month"] == "9月"] if not df_outflow.empty else pd.DataFrame()
 
-            # 动态更新各分包队伍的进场、离场、实际在场与报备在场
-            for t_name, t_info in monthly_summary["9月"]["teams"].items():
-                t_in = len(m9_inflow[m9_inflow["Team"] == t_name]) if not m9_inflow.empty else t_info.get("in_count", 0)
-                t_out = len(m9_outflow[m9_outflow["Team"] == t_name]) if not m9_outflow.empty else t_info.get("out_count", 0)
-                t_active = len(unique_roster[
-                    (unique_roster["Team"] == t_name) &
-                    unique_roster["LiveStatus"].isin(["在场正常", "进场手续在办"])
-                ])
-                t_onsite = t_active + t_out
+            # 9月期初在场来自8月实际留存
+            m8_summary = monthly_summary.get("8月", {}).get("teams", {})
+            m8_yi_act = m8_summary.get(team_yi, {}).get("actual_onsite_count", 28)
+            m8_wang_act = m8_summary.get(team_wang, {}).get("actual_onsite_count", 29)
 
-                t_info["in_count"] = t_in
-                t_info["out_count"] = t_out
-                t_info["actual_onsite_count"] = t_active
-                t_info["onsite_count"] = t_onsite
+            m9_yi_in = len(m9_inflow[m9_inflow["Team"] == team_yi])
+            m9_yi_out = len(m9_outflow[m9_outflow["Team"] == team_yi])
+            m9_yi_onsite = m8_yi_act + m9_yi_in
+            m9_yi_act = m9_yi_onsite - m9_yi_out
 
-            # 汇总层动态对齐，确保各项宏观指标与明细分包严格守恒
-            m9_teams = monthly_summary["9月"]["teams"]
-            tot_in = sum(t["in_count"] for t in m9_teams.values())
-            tot_out = sum(t["out_count"] for t in m9_teams.values())
-            tot_actual = sum(t["actual_onsite_count"] for t in m9_teams.values())
-            tot_onsite = sum(t["onsite_count"] for t in m9_teams.values())
+            m9_wang_in = len(m9_inflow[m9_inflow["Team"] == team_wang])
+            m9_wang_out = len(m9_outflow[m9_outflow["Team"] == team_wang])
+            m9_wang_onsite = m8_wang_act + m9_wang_in
+            m9_wang_act = m9_wang_onsite - m9_wang_out
+
+            monthly_summary["9月"]["teams"][team_yi] = {
+                "company": "江苏旭之升",
+                "in_count": m9_yi_in,
+                "out_count": m9_yi_out,
+                "onsite_count": m9_yi_onsite,
+                "actual_onsite_count": m9_yi_act
+            }
+            monthly_summary["9月"]["teams"][team_wang] = {
+                "company": "青海久昌",
+                "in_count": m9_wang_in,
+                "out_count": m9_wang_out,
+                "onsite_count": m9_wang_onsite,
+                "actual_onsite_count": m9_wang_act
+            }
+
+            tot_in = m9_yi_in + m9_wang_in
+            tot_out = m9_yi_out + m9_wang_out
+            tot_onsite = m9_yi_onsite + m9_wang_onsite
+            tot_actual = m9_yi_act + m9_wang_act
 
             monthly_summary["9月"]["in_total"] = tot_in
             monthly_summary["9月"]["out_total"] = tot_out
             monthly_summary["9月"]["actual_onsite_total"] = tot_actual
             monthly_summary["9月"]["onsite_total"] = tot_onsite
             monthly_summary["9月"]["net_change"] = tot_in - tot_out
+
+        # 从 10月 起（即 9月 之后的各月份），执行标准账本滚存计算与花名册动态接力
+        m9_idx = all_months_seq.index("9月") if "9月" in all_months_seq else -1
+        subsequent_months = all_months_seq[m9_idx + 1:] if m9_idx >= 0 else []
+
+        for idx, m_curr in enumerate(subsequent_months):
+            prev_m = all_months_seq[all_months_seq.index(m_curr) - 1]
+            prev_m_data = monthly_summary.get(prev_m, {"teams": {}})
+            prev_teams = prev_m_data.get("teams", {})
+
+            m_inflow_sub = df_inflow[df_inflow["Month"] == m_curr] if not df_inflow.empty else pd.DataFrame()
+            m_outflow_sub = df_outflow[df_outflow["Month"] == m_curr] if not df_outflow.empty else pd.DataFrame()
+
+            teams_calc = {}
+            for t_name, c_name in [(team_yi, "江苏旭之升"), (team_wang, "青海久昌")]:
+                prev_act = prev_teams.get(t_name, {}).get("actual_onsite_count", 0)
+                t_in = len(m_inflow_sub[m_inflow_sub["Team"] == t_name]) if not m_inflow_sub.empty else 0
+                t_out = len(m_outflow_sub[m_outflow_sub["Team"] == t_name]) if not m_outflow_sub.empty else 0
+                t_onsite = prev_act + t_in
+                t_act = t_onsite - t_out
+                teams_calc[t_name] = {
+                    "company": c_name,
+                    "in_count": t_in,
+                    "out_count": t_out,
+                    "onsite_count": t_onsite,
+                    "actual_onsite_count": t_act
+                }
+
+            in_tot = sum(t["in_count"] for t in teams_calc.values())
+            out_tot = sum(t["out_count"] for t in teams_calc.values())
+            onsite_tot = sum(t["onsite_count"] for t in teams_calc.values())
+            actual_tot = sum(t["actual_onsite_count"] for t in teams_calc.values())
+
+            monthly_summary[m_curr] = {
+                "in_total": in_tot,
+                "out_total": out_tot,
+                "onsite_total": onsite_tot,
+                "actual_onsite_total": actual_tot,
+                "net_change": in_tot - out_tot,
+                "teams": teams_calc
+            }
+
+            # 为该动态月份生成/补齐 df_roster 中的在场人员名单
+            # 规则：结转上月在场未离场人员 + 本月新进场人员
+            prev_roster = df_roster[df_roster["Month"] == prev_m] if not df_roster.empty else pd.DataFrame()
+            prev_out_cids = {clean_id(x) for x in df_outflow[df_outflow["Month"] == prev_m]["ID"]} if not df_outflow.empty else set()
+            prev_out_names = {str(x).strip() for x in df_outflow[df_outflow["Month"] == prev_m]["Name"]} if not df_outflow.empty else set()
+
+            curr_m_roster_rows = []
+            curr_existing_cids = set()
+            curr_existing_names = set()
+
+            # 1. 结转上月在场未离场人员
+            if not prev_roster.empty:
+                for _, r_prev in prev_roster.iterrows():
+                    cid = clean_id(r_prev.get("ID"))
+                    nm = str(r_prev.get("Name") or "").strip()
+                    if (cid and cid in prev_out_cids) or (nm and nm in prev_out_names):
+                        continue
+                    if (cid and cid in curr_existing_cids) or (nm and nm in curr_existing_names):
+                        continue
+
+                    r_dict = r_prev.to_dict()
+                    r_dict["Month"] = m_curr
+                    curr_m_roster_rows.append(r_dict)
+                    if cid: curr_existing_cids.add(cid)
+                    if nm: curr_existing_names.add(nm)
+
+            # 2. 并入本月新进场人员
+            if not m_inflow_sub.empty:
+                for _, r_in in m_inflow_sub.iterrows():
+                    cid = clean_id(r_in.get("ID"))
+                    nm = str(r_in.get("Name") or "").strip()
+                    if (cid and cid in curr_existing_cids) or (nm and nm in curr_existing_names):
+                        continue
+
+                    u_match = unique_roster[(unique_roster["ID"] == cid) | (unique_roster["Name"] == nm)] if not unique_roster.empty else pd.DataFrame()
+                    if not u_match.empty:
+                        r_dict = u_match.iloc[0].to_dict()
+                    else:
+                        r_dict = {
+                            "Team": r_in.get("Team", "金属屋面班组"),
+                            "Name": nm,
+                            "ID": cid,
+                            "Gender": "男",
+                            "Job": r_in.get("Job", "普工"),
+                            "Job_Clean": r_in.get("Job_Clean", "普工"),
+                            "Address": "",
+                            "ContractNo": "",
+                            "Province": get_province_from_id(cid),
+                            "Age": calculate_age_from_id(cid),
+                            "AgeGroup": "其他",
+                            "Source": "进场流水线在办",
+                            "LiveStatus": "在场正常"
+                        }
+                    r_dict["Month"] = m_curr
+                    curr_m_roster_rows.append(r_dict)
+                    if cid: curr_existing_cids.add(cid)
+                    if nm: curr_existing_names.add(nm)
+
+            # 完整更新当前动态月份在 df_roster 中的在场人员总名单
+            if curr_m_roster_rows:
+                df_roster = df_roster[df_roster["Month"] != m_curr]
+                df_m_roster = pd.DataFrame(curr_m_roster_rows)
+                df_roster = pd.concat([df_roster, df_m_roster], ignore_index=True)
 
         return df_roster, unique_roster, df_inflow, df_outflow, monthly_summary, live_status
 
@@ -515,9 +703,10 @@ class PersonnelDataService:
         roster_rows = []
 
         for s in xls.sheet_names:
-            if '总' in s:
+            if '总' in s or s == '合计':
                 continue
-            month = '6月' if '6' in s else ('7月' if '7' in s else ('8月' if '8' in s else '9月'))
+            m_match = re.search(r'(\d+)', s)
+            month = f"{m_match.group(1)}月" if m_match else "6月"
             team = '江苏旭之升 (王宜强施工班组)' if ('江苏旭之升' in s or '江' in s) else '青海久昌 (汪佩沾其他班组)'
             df = pd.read_excel(self.roster_path, sheet_name=s)
 
@@ -591,10 +780,11 @@ class PersonnelDataService:
 
         xls = pd.ExcelFile(self.inflow_path)
         in_records = []
-        target_sheets = [s for s in xls.sheet_names if any(s.startswith(m) for m in ['6', '7', '8', '9']) and '总' not in s and s != '合计']
+        target_sheets = [s for s in xls.sheet_names if re.match(r'^\d+', s.strip()) and '总' not in s and s != '合计']
 
         for s in target_sheets:
-            month = s[0] + '月'
+            m_match = re.match(r'^\d+', s.strip())
+            month = f"{m_match.group()}月" if m_match else "6月"
             team = '江苏旭之升 (王宜强施工班组)' if ('江' in s or '旭之升' in s) else '青海久昌 (汪佩沾其他班组)'
             df = pd.read_excel(self.inflow_path, sheet_name=s)
 
@@ -653,7 +843,10 @@ class PersonnelDataService:
         out_records = []
 
         for s in xls.sheet_names:
-            month = '6月' if '6' in s else ('7月' if '7' in s else ('8月' if '8' in s else '9月'))
+            if '总' in s or s == '合计':
+                continue
+            m_match = re.search(r'(\d+)', s)
+            month = f"{m_match.group(1)}月" if m_match else "6月"
             team = '江苏旭之升 (王宜强施工班组)' if ('旭之升' in s or '江' in s) else '青海久昌 (汪佩沾其他班组)'
             df = pd.read_excel(self.outflow_path, sheet_name=s)
 
@@ -704,14 +897,12 @@ class PersonnelDataService:
         return pd.DataFrame(out_records)
 
     def _compute_monthly_summary(self, df_roster: pd.DataFrame, df_inflow: pd.DataFrame, df_outflow: pd.DataFrame) -> Dict[str, Any]:
-        """计算月度指标：进场、离场、月末在场人数、各分包队伍分布"""
-        months = ['6月', '7月', '8月', '9月']
-        summary = {}
-
+        """计算月度指标：进场、离场、月末在场人数、各分包队伍分布（支持多月自动顺延滚存）"""
         team_yi = '江苏旭之升 (王宜强施工班组)'
         team_wang = '青海久昌 (汪佩沾其他班组)'
 
-        # 优先读取进场月报表中官方核准的【合计】汇总基准表
+        # 1. 优先读取进场月报表中官方核准的【合计】汇总基准表
+        official_summary = {}
         if os.path.exists(self.inflow_path):
             try:
                 xls_in = pd.ExcelFile(self.inflow_path)
@@ -719,14 +910,13 @@ class PersonnelDataService:
                     df_sum = pd.read_excel(self.inflow_path, sheet_name='合计')
                     if '月份' in df_sum.columns and '进场' in df_sum.columns:
                         df_sum['月份'] = df_sum['月份'].ffill().astype(int)
-                        official_summary = {}
                         for m_num, grp in df_sum.groupby('月份'):
                             m_key = f'{m_num}月'
                             in_sum = int(grp['进场'].sum())
                             out_sum = int(grp['离场'].sum())
                             onsite_sum = int(grp['在场'].sum())
                             actual_onsite_sum = int(grp['实际在场'].sum()) if '实际在场' in grp.columns else (onsite_sum - out_sum)
-                            
+
                             teams_dict = {}
                             for _, r in grp.iterrows():
                                 c_name = str(r['公司'])
@@ -746,48 +936,50 @@ class PersonnelDataService:
                                 "net_change": in_sum - out_sum,
                                 "teams": teams_dict
                             }
-                        return official_summary
             except Exception:
                 pass
 
-        for m in months:
+        months = generate_project_months_sequence(extra_months=list(official_summary.keys()))
+        summary = copy.deepcopy(official_summary)
+
+        # 2. 对尚不在官方汇总中的月份（如 10月 及后续月份），采用账本滚存法则初始化
+        for i, m in enumerate(months):
+            if m in summary:
+                continue
+            prev_m = months[i - 1] if i > 0 else None
+            prev_data = summary.get(prev_m, {"teams": {}}) if prev_m else {"teams": {}}
+            prev_teams = prev_data.get("teams", {})
+
             in_sub = df_inflow[df_inflow['Month'] == m] if not df_inflow.empty else pd.DataFrame()
             out_sub = df_outflow[df_outflow['Month'] == m] if not df_outflow.empty else pd.DataFrame()
-            roster_sub = df_roster[df_roster['Month'] == m] if not df_roster.empty else pd.DataFrame()
 
-            in_total = len(in_sub)
-            out_total = len(out_sub)
-            onsite_total = len(roster_sub)
+            teams_dict = {}
+            for t_name, c_name in [(team_yi, "江苏旭之升"), (team_wang, "青海久昌")]:
+                p_act = prev_teams.get(t_name, {}).get("actual_onsite_count", 0)
+                t_in = len(in_sub[in_sub['Team'] == t_name]) if not in_sub.empty else 0
+                t_out = len(out_sub[out_sub['Team'] == t_name]) if not out_sub.empty else 0
+                t_onsite = p_act + t_in
+                t_act = t_onsite - t_out
+                teams_dict[t_name] = {
+                    'company': c_name,
+                    'in_count': t_in,
+                    'out_count': t_out,
+                    'onsite_count': t_onsite,
+                    'actual_onsite_count': t_act
+                }
 
-            in_yi = len(in_sub[in_sub['Team'] == team_yi])
-            in_wang = len(in_sub[in_sub['Team'] == team_wang])
-
-            out_yi = len(out_sub[out_sub['Team'] == team_yi])
-            out_wang = len(out_sub[out_sub['Team'] == team_wang])
-
-            onsite_yi = len(roster_sub[roster_sub['Team'] == team_yi])
-            onsite_wang = len(roster_sub[roster_sub['Team'] == team_wang])
+            in_tot = sum(t['in_count'] for t in teams_dict.values())
+            out_tot = sum(t['out_count'] for t in teams_dict.values())
+            onsite_tot = sum(t['onsite_count'] for t in teams_dict.values())
+            actual_tot = sum(t['actual_onsite_count'] for t in teams_dict.values())
 
             summary[m] = {
-                "in_total": in_total,
-                "out_total": out_total,
-                "onsite_total": onsite_total,
-                "actual_onsite_total": onsite_total - out_total,
-                "net_change": in_total - out_total,
-                "teams": {
-                    team_yi: {
-                        "in_count": in_yi,
-                        "out_count": out_yi,
-                        "onsite_count": onsite_yi,
-                        "actual_onsite_count": onsite_yi - out_yi
-                    },
-                    team_wang: {
-                        "in_count": in_wang,
-                        "out_count": out_wang,
-                        "onsite_count": onsite_wang,
-                        "actual_onsite_count": onsite_wang - out_wang
-                    }
-                }
+                "in_total": in_tot,
+                "out_total": out_tot,
+                "onsite_total": onsite_tot,
+                "actual_onsite_total": actual_tot,
+                "net_change": in_tot - out_tot,
+                "teams": teams_dict
             }
 
         return summary
@@ -986,14 +1178,20 @@ class PersonnelDataService:
         ax6 = axes[1, 2]
         ax6.axis('off')
         ax6.set_title('合规管控与人员基础信息指标卡', fontsize=13, fontweight='bold', pad=12)
+        peak_month = max(months, key=lambda m: summary.get(m, {}).get("onsite_total", 0)) if months else "8月"
+        peak_cnt = summary.get(peak_month, {}).get("onsite_total", 60) if peak_month in summary else 60
+        latest_month = months[-1] if months else "10月"
+        latest_m_data = summary.get(latest_month, {"in_total": 0, "out_total": 0, "onsite_total": 0})
+        latest_act = latest_m_data.get("actual_onsite_total", latest_m_data.get("onsite_total", 0))
+
         summary_text = (
             f"【核心规模指标】\n"
             f"• 累计参建总劳务工人数：{demographics['total_unique']} 人\n"
             f"• 男女性别比：男 {demographics['gender_counts'].get('男', 0)} 人 / 女 {demographics['gender_counts'].get('女', 0)} 人\n"
-            f"• 施工高峰月度：8月 (现场共 60 人)\n\n"
-            f"【流动管控特征】\n"
-            f"• 6-7月为集中进场爬坡期（进场达 58 人次）\n"
-            f"• 9月收尾退场为主（离场 10 人，仅增 1 人）\n\n"
+            f"• 施工高峰月度：{peak_month} (报备峰值共 {peak_cnt} 人)\n\n"
+            f"【最新流动态势】\n"
+            f"• 最新{latest_month}进场 {latest_m_data['in_total']} 人，离场 {latest_m_data['out_total']} 人\n"
+            f"• {latest_month}现场实际驻留：{latest_act} 人\n\n"
             f"【合规与履约状况】\n"
             f"• 劳动合同签订率：100% (全员覆盖)\n"
             f"• 离场工资结算支付：100% 已结算已支付\n"

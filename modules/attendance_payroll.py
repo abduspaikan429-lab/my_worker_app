@@ -16,6 +16,7 @@ import numpy as np
 import io
 import re
 import os
+import zipfile
 from copy import copy
 from pathlib import Path
 from datetime import datetime
@@ -1547,6 +1548,177 @@ def build_all_exports_zip(salary_df, include_ledger=False):
 # 展示层
 # ================================================================
 
+def get_dialog_decorator():
+    if hasattr(st, "dialog"):
+        return st.dialog
+    if hasattr(st, "experimental_dialog"):
+        return st.experimental_dialog
+    return lambda *args, **kwargs: lambda f: f
+
+
+@get_dialog_decorator()("📋 制作考勤与工资表 - 自定义工人排序", width="large")
+def export_payroll_with_custom_order_dialog(base_df, period_str):
+    if base_df is None or base_df.empty:
+        st.warning("⚠️ 当前暂无待发放的人员数据，无法制作工资表和考勤表。")
+        return
+
+    from services.payroll_calculation_service import (
+        parse_worker_sort_order,
+        sort_workers_df_by_order,
+    )
+
+    # 过滤出实发出勤天数 > 0 的有效人员（考勤为0的不做进考勤表和工资表）
+    valid_mask = pd.to_numeric(
+        base_df.get('实发天数', base_df.get('最终核定天数', 0)),
+        errors='coerce'
+    ).fillna(0) > 0
+    active_df = base_df[valid_mask].copy().reset_index(drop=True)
+
+    if active_df.empty:
+        st.warning("⚠️ 当前所有人员的实发出勤天数均为 0，无有效发薪人员！")
+        return
+
+    default_names = [str(n).strip() for n in active_df['姓名'].tolist()]
+
+    st.markdown("""
+    <div style="background:#F0FDFA; border:1px solid #99F6E4; border-radius:8px; padding:10px 14px; margin-bottom:12px; color:#0F766E; font-size:13px;">
+        <b>💡 操作说明</b>：<br>
+        1. 在左侧文本框中输入或粘贴您期望的工人排列顺序（一行一人，支持直接从 Excel 复制一整列姓名粘贴）。<br>
+        2. 系统将<b>严格按照您的顺序</b>同步生成【考勤表】与【工资确认表】（两表人员姓名与次序 100% 严密对齐）。<br>
+        3. 若名单中部分人员未在输入中指定，系统将<b>自动追加在末尾</b>，确保绝不漏掉任何工人。
+    </div>
+    """, unsafe_allow_html=True)
+
+    col_input, col_preview = st.columns([1, 1.2])
+
+    with col_input:
+        st.markdown(f"**📝 输入工人排序 (当前出勤共 {len(default_names)} 人)**")
+
+        # 辅助快捷操作按钮
+        c_btn_a, c_btn_b, c_btn_c, c_btn_d = st.columns(4)
+        with c_btn_a:
+            if st.button("📋 填入当前", key="btn_fill_curr_order", use_container_width=True, help="将系统当前的工人名单填入下方文本框"):
+                st.session_state['_payroll_order_text'] = "\n".join(default_names)
+                st.session_state.pop('_generated_custom_zip', None)
+                st.rerun()
+        with c_btn_b:
+            if st.button("💰 金额降序", key="btn_fill_amount_order", use_container_width=True, help="按实发工资从高到低填入名单"):
+                amt_col = '实发工资' if '实发工资' in active_df.columns else '应发工资'
+                sorted_by_amt = active_df.sort_values(by=amt_col, ascending=False)
+                st.session_state['_payroll_order_text'] = "\n".join([str(n).strip() for n in sorted_by_amt['姓名'].tolist()])
+                st.session_state.pop('_generated_custom_zip', None)
+                st.rerun()
+        with c_btn_c:
+            if st.button("🛠️ 工种归类", key="btn_fill_job_order", use_container_width=True, help="按工种归类填入名单"):
+                job_col = '工种' if '工种' in active_df.columns else '姓名'
+                sorted_by_job = active_df.sort_values(by=[job_col, '姓名'])
+                st.session_state['_payroll_order_text'] = "\n".join([str(n).strip() for n in sorted_by_job['姓名'].tolist()])
+                st.session_state.pop('_generated_custom_zip', None)
+                st.rerun()
+        with c_btn_d:
+            if st.button("🔄 清空重置", key="btn_clear_order_input", use_container_width=True, help="清空输入框，恢复系统原顺序"):
+                st.session_state['_payroll_order_text'] = ""
+                st.session_state.pop('_generated_custom_zip', None)
+                st.rerun()
+
+        if "_payroll_order_text" not in st.session_state:
+            st.session_state["_payroll_order_text"] = ""
+
+        raw_input = st.text_area(
+            "输入工人姓名顺序",
+            key="_payroll_order_text",
+            height=250,
+            placeholder="请在此粘贴或输入工人姓名顺序，例如：\n张三\n李四\n王五\n……\n（支持直接从 Excel 复制整列姓名粘贴；若留空，则默认按系统当前顺序导出）",
+            label_visibility="collapsed"
+        )
+
+        # 实时解析
+        parsed_order = parse_worker_sort_order(raw_input, default_names)
+        sorted_df, stats = sort_workers_df_by_order(active_df, parsed_order)
+
+        # 匹配情况提示
+        if stats['matched']:
+            st.markdown(f"""
+            <div style="background:#ECFDF5; border:1px solid #A7F3D0; border-radius:6px; padding:6px 10px; margin-top:6px; color:#065F46; font-size:12px;">
+                ✅ 已按输入指定前 <b>{len(stats['matched'])}</b> 人顺序
+            </div>
+            """, unsafe_allow_html=True)
+            if stats['appended']:
+                appended_preview = '、'.join(stats['appended'][:4]) + ('...' if len(stats['appended']) > 4 else '')
+                st.markdown(f"""
+                <div style="background:#EFF6FF; border:1px solid #BFDBFE; border-radius:6px; padding:6px 10px; margin-top:4px; color:#1E40AF; font-size:12px;">
+                    ℹ️ 余下 <b>{len(stats['appended'])}</b> 人未在输入中指定，已自动排在末尾：{appended_preview}
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            if raw_input.strip():
+                st.markdown(f"""
+                <div style="background:#FFFBEB; border:1px solid #FDE68A; border-radius:6px; padding:6px 10px; margin-top:6px; color:#92400E; font-size:12px;">
+                    ⚠️ 输入中未匹配到当前实发名单中的工人，将使用系统默认顺序。
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.caption("ℹ️ 当前未输入自定义顺序，将按系统默认顺序生成。")
+
+        if stats['unmatched']:
+            unmatched_preview = '、'.join(stats['unmatched'][:6]) + ('...' if len(stats['unmatched']) > 6 else '')
+            st.markdown(f"""
+            <div style="background:#FEF2F2; border:1px solid #FECACA; border-radius:6px; padding:6px 10px; margin-top:4px; color:#991B1B; font-size:12px;">
+                ⚠️ 未在当前名单中找到以下姓名（已跳过）：{unmatched_preview}
+            </div>
+            """, unsafe_allow_html=True)
+
+    with col_preview:
+        st.markdown(f"**📊 导出顺序实时预览 (总计 {len(sorted_df)} 人)**")
+        preview_data = []
+        for idx, (_, r) in enumerate(sorted_df.iterrows(), start=1):
+            preview_data.append({
+                '序号': idx,
+                '姓名': r['姓名'],
+                '工种': r.get('工种', ''),
+                '核定天数': r.get('实发天数', r.get('最终核定天数', 0.0)),
+                '日薪标准': f"¥{float(r.get('提取日薪', r.get('日薪', 0.0))):.0f}",
+                '实发金额': f"¥{float(r.get('实发工资', r.get('应发工资', 0.0))):,.2f}",
+            })
+        st.dataframe(pd.DataFrame(preview_data), use_container_width=True, hide_index=True, height=310)
+
+    st.markdown("---")
+
+    # 底部生成与下载区域
+    col_act_gen, col_act_down = st.columns([1, 1])
+    with col_act_gen:
+        if st.button("🚀 确认此顺序，立即生成考勤与工资表", type="primary", use_container_width=True, key="btn_confirm_sort_generate"):
+            with st.spinner("正在按指定顺序生成考勤表与工资确认表（写入标准模板并封装 ZIP）……"):
+                export_data = sorted_df.copy()
+                export_data['最终核定天数'] = export_data.get('实发天数', export_data.get('最终核定天数', 0))
+                export_data['应发工资'] = export_data.get('实发工资', export_data.get('应发工资', 0))
+                export_data['日薪'] = export_data.get('提取日薪', export_data.get('日薪', 0))
+                zip_bytes = build_all_exports_zip(export_data, include_ledger=False)
+                if zip_bytes:
+                    st.session_state['_generated_custom_zip'] = zip_bytes
+                    st.session_state['_generated_custom_zip_filename'] = f"劳务考勤与工资确认表_{period_str}.zip"
+                    st.session_state['_payroll_allocated_df'] = sorted_df
+                    st.toast("🎉 工资表与考勤表已成功按您的顺序生成！", icon="✅")
+                    st.rerun()
+                else:
+                    st.error("生成失败，请检查模板文件或数据是否合规。")
+
+    with col_act_down:
+        zip_bytes = st.session_state.get('_generated_custom_zip')
+        if zip_bytes:
+            st.download_button(
+                label=f":material/download: 📥 下载考勤与工资表 (ZIP压缩包)",
+                data=zip_bytes,
+                file_name=st.session_state.get('_generated_custom_zip_filename', f"劳务考勤与工资确认表_{period_str}.zip"),
+                mime="application/zip",
+                use_container_width=True,
+                type="primary",
+                key="btn_download_sorted_zip_modal"
+            )
+        else:
+            st.button("📥 等待生成（请先点击左侧生成）", disabled=True, use_container_width=True, key="btn_wait_gen_placeholder")
+
+
 def render():
     st.markdown("""
     <div class="page-header-deco">
@@ -1916,6 +2088,22 @@ def render():
 
                     st.dataframe(pd.DataFrame(days_calendar_rows), use_container_width=True, hide_index=True)
 
+                st.markdown("<div style='margin-top: 14px;'></div>", unsafe_allow_html=True)
+                _, c_s2_right = st.columns([1, 1])
+                with c_s2_right:
+                    period_tag = st.session_state.get('_payroll_period', '当期')
+                    if st.button(
+                        ":material/format_list_numbered: 📋 制作工资表与考勤表 (自定义工人排序并导出)",
+                        type='primary',
+                        use_container_width=True,
+                        key='btn_open_custom_sort_dialog_s2',
+                        help="弹出弹窗自定义工人排序并生成考勤表与工资确认表"
+                    ):
+                        step2_export_df = current_working_df.copy()
+                        step2_export_df['实发天数'] = step2_export_df['最终核定天数']
+                        step2_export_df['实发工资'] = step2_export_df['应发工资']
+                        export_payroll_with_custom_order_dialog(step2_export_df, period_tag)
+
 
             # Step 3: 资金额度反推与平账 (第二轮：比例反推与额度平齐)
             st.markdown("---")
@@ -2040,20 +2228,43 @@ def render():
                             st.success(f"🎉 成功将 {added_count} 名工人的欠发工时与明细记录至【第二批工资储备池】！")
 
                     with col_act2:
-                        export_df = alloc_df.copy()
-                        export_df['最终核定天数'] = export_df['实发天数']
-                        export_df['应发工资'] = export_df['实发工资']
-                        export_df['日薪'] = export_df['提取日薪']
-                        zip_bytes = build_all_exports_zip(export_df, include_ledger=False)
+                        period_tag = st.session_state.get('_payroll_period', '当期')
+                        if st.button(
+                            label=":material/format_list_numbered: 📋 制作工资表与考勤表 (自定义工人排序导出)",
+                            type='primary',
+                            use_container_width=True,
+                            key='btn_open_custom_sort_dialog_s3',
+                            help="弹出弹窗自定义工人排序并生成考勤表与工资确认表"
+                        ):
+                            export_payroll_with_custom_order_dialog(alloc_df, period_tag)
+
+                        zip_bytes = st.session_state.get('_generated_custom_zip')
                         if zip_bytes:
                             st.download_button(
-                                label=":material/archive: 一键下载标准考勤表与工资确认表 (ZIP)",
+                                label=":material/archive: 📥 下载最新已排好序的考勤与工资表 (ZIP)",
                                 data=zip_bytes,
-                                file_name=f"劳务考勤与工资确认表_{st.session_state.get('_payroll_period', '当期')}.zip",
+                                file_name=st.session_state.get('_generated_custom_zip_filename', f"劳务考勤与工资确认表_{period_tag}.zip"),
                                 mime="application/zip",
                                 use_container_width=True,
-                                type='primary'
+                                type='secondary',
+                                key='btn_download_sorted_zip_s3'
                             )
+                        else:
+                            export_df = alloc_df.copy()
+                            export_df['最终核定天数'] = export_df['实发天数']
+                            export_df['应发工资'] = export_df['实发工资']
+                            export_df['日薪'] = export_df['提取日薪']
+                            default_zip = build_all_exports_zip(export_df, include_ledger=False)
+                            if default_zip:
+                                st.download_button(
+                                    label=":material/archive: 一键按默认顺序下载 (ZIP)",
+                                    data=default_zip,
+                                    file_name=f"劳务考勤与工资确认表_{period_tag}.zip",
+                                    mime="application/zip",
+                                    use_container_width=True,
+                                    type='secondary',
+                                    key='btn_download_default_zip_s3'
+                                )
 
     # ── Tab 2: 📋 第二批工资待发储备池 ─────────────────────────────────
     with tab_backlog:
