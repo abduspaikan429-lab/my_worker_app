@@ -132,3 +132,38 @@ def test_task_engine_onboarding_next_action():
     res = get_onboarding_status("李四_王宜强", worker_data, master_ids, master_name_phones, master_name_teams)
     assert res["category"] == "orange"
     assert res["action"] == "等待录入门禁"
+
+
+def test_onboarding_toggle_category(tmp_path: Path):
+    """验证进场分类一键全选与取消全选功能。"""
+    test_file = tmp_path / "onboarding_test_toggle.json"
+    service = OnboardingService(file_path=test_file)
+
+    worker_id = "测试工人_全选组"
+    service.create_onboarding({
+        "info": {"姓名": "测试工人", "班组": "全选组"}
+    })
+
+    # 1. 全选纸质材料 (10类)
+    rec = service.toggle_category(worker_id, "paper", True)
+    assert are_all_items_done(rec["paper"], PAPER_ITEMS) is True
+    # 别名也同步被设置为 True
+    assert rec["paper"].get("劳动合同(纸质)") is True
+
+    # 2. 取消全选纸质材料
+    rec = service.toggle_category(worker_id, "paper", False)
+    assert any(is_item_done(rec["paper"], it) for it in PAPER_ITEMS) is False
+    assert rec["paper"].get("劳动合同(纸质)") is False
+
+    # 3. 全选门禁与移动端
+    rec = service.toggle_category(worker_id, "access", True)
+    assert are_all_items_done(rec["access"], ACCESS_ITEMS) is True
+
+    # 4. 全选必须留存合规影像
+    rec = service.toggle_category(worker_id, "photo", True)
+    assert are_all_items_done(rec["photo"], PHOTO_ITEMS) is True
+
+    # 5. 全选本地 Excel 台账更新
+    rec = service.toggle_category(worker_id, "system", True)
+    assert are_all_items_done(rec["system"], SYSTEM_ITEMS) is True
+

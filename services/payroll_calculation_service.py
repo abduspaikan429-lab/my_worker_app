@@ -370,6 +370,29 @@ def extract_from_backlog(company: str, period: str, worker_keys: List[str]) -> L
     return extracted
 
 
+def calc_3hours_rule_days(daily_records: Dict[Any, Any]) -> float:
+    """
+    按总包系统打卡工时：3小时以下不算工天，3小时以上算一天。
+    遍历每日打卡工时，若工时 >= 3.0 则计 1 天，< 3.0 则计 0 天。
+    若非数值（如 '✓'、'√'、'打卡' 等），工程上视为有效出勤，计 1 天。
+    """
+    if not isinstance(daily_records, dict) or not daily_records:
+        return 0.0
+    days = 0.0
+    for day, val in daily_records.items():
+        if val is None or val == '':
+            continue
+        try:
+            h = float(val)
+            if h >= 3.0:
+                days += 1.0
+        except (ValueError, TypeError):
+            s = str(val).strip()
+            if any(k in s for k in ['✓', '√', '打卡', '出勤', '班', '4', '8']):
+                days += 1.0
+    return float(days)
+
+
 # ================================================================
 # 总包系统打卡流水解析与三方智能裁决引擎
 # ================================================================
@@ -497,6 +520,7 @@ def parse_sanju_punch_excel(file_input) -> Tuple[pd.DataFrame, str]:
             '总包系统天数': float(punch_days),
             '有效工天': float(punch_days),
             '出勤天数': float(punch_days),
+            '3小时规则天数': float(calc_3hours_rule_days(daily_records)),
             '总工时': round(total_hours, 2),
             '平均工时': round(avg_hours, 2),
             '_raw_punch_hours': dict(daily_records),
@@ -660,6 +684,7 @@ def _parse_wide_attendance_excel(raw_df: pd.DataFrame, period_str: str) -> Tuple
             '总包系统天数': float(eff_days),      # 严格按有效工天算作为系统对账天数
             '有效工天': float(eff_days),          # 保留原始有效工天
             '出勤天数': float(punch_days),        # 保留原始打卡天数
+            '3小时规则天数': float(calc_3hours_rule_days(daily_records)),
             '总工时': round(total_hours, 2),
             '平均工时': round(avg_hours, 2),
             '_raw_punch_hours': dict(daily_records),
@@ -676,17 +701,16 @@ def reconcile_attendance(
     my_df: Optional[pd.DataFrame] = None,
     final_days_map: Optional[Dict[str, float]] = None,
     allowance_map: Optional[Dict[str, float]] = None,
-    foreman_days_map: Optional[Dict[str, float]] = None
+    foreman_days_map: Optional[Dict[str, float]] = None,
+    calc_mode: str = 'watermark'
 ) -> pd.DataFrame:
     """
     考勤智能对账与阶段性结算裁决引擎：
-    两方极简直通比对：【水印照片天数】 VS 【总包系统有效工天】。
-    1. 业务核心：以【水印照片】为主（真实上班证明，防代打卡防空刷），系统考勤按【有效工天】核算。
-    2. 当系统有效工天 < 水印照片：
-       以水印照片为主！系统有效打卡走正常工资发放；
-       水印照片多出的天数（水印天数 - 系统有效工天）走【阶段性结算】，并做特殊标记与金额统计！
-    3. 当系统有效工天 > 水印照片：
-       以水印照片为主核减！按每日真实工时降序筛选最长工时打 ✓，自动剔除空刷/短工时。
+    支持四种灵活考勤计算模式，且最终考勤始终支持人工特批修改（绝不锁死）：
+    1. 'watermark' / '按水印照片'：按水印照片来算最终考勤（以现场水印照片核对为准，超出系统打卡部分走阶段性结算）
+    2. 'effective_days' / '按有效工天'：按有效工天来算最终考勤（总包出勤统计表有效工天）
+    3. 'punch_days' / '按打卡天数'：按打卡天数来算最终考勤（总包系统打卡有记录的天数）
+    4. 'hours_ge_3' / '按3小时规则'：按总包系统表中，3小时以下不算工天，3小时以上算一天来算最终考勤
     """
     df = system_df.copy()
     if '_raw_punch_hours' not in df.columns:
@@ -750,35 +774,113 @@ def reconcile_attendance(
         id_card = str(row.get('身份证号', '')).strip()
         name = str(row.get('姓名', '')).strip()
         if id_card in my_map:
-            return my_map[id_card]
+            return float(my_map[id_card])
         if f"name:{name}" in my_map:
-            return my_map[f"name:{name}"]
-        # 若未传入水印表，直接取系统有效工天
+            return float(my_map[f"name:{name}"])
+        if name in my_map:
+            return float(my_map[name])
+        # 若未传入水印表或人员未匹配，回退取系统有效工天
         return float(row.get('有效工天', row.get('总包系统天数', 0.0)))
 
-    df['我的考勤天数'] = df.apply(_get_my_days, axis=1)
-    df['水印照片天数'] = df['我的考勤天数']
+    # 计算 4 种维度的参考天数
+    watermark_days_list = []
+    eff_days_list = []
+    punch_days_list = []
+    three_hours_days_list = []
 
-    # 2. 计算【阶段性结算天数】与【正常打卡天数】
-    # 业务铁律：
-    # ① 阶段性结算：只有当【水印照片天数 > 系统打卡天数(出勤天数)】时，超出打卡记录的部分才做阶段性结算！
-    # ② 正常打卡天数：在系统打卡容量范围内按有效工天发；若水印照片小于有效工天则核减！即 min(水印天数, 有效工天)
-    def _calc_stage_settle_days(row):
-        punch_d = float(row.get('出勤天数', row.get('总包系统天数', 0.0)))
+    for _, row in df.iterrows():
+        raw_hours = row.get('_raw_punch_hours')
+        if not isinstance(raw_hours, dict) or not raw_hours:
+            raw_hours = row.get('__考勤明细__', {})
+            if not isinstance(raw_hours, dict):
+                raw_hours = {}
+
+        w_d = _get_my_days(row)
+        e_d = float(row.get('有效工天', row.get('总包系统天数', 0.0)))
+        p_d = float(row.get('出勤天数', row.get('总包系统天数', 0.0)))
+        if p_d <= 0.0 and raw_hours:
+            p_d = float(len([h for h in raw_hours.values() if h and float(h) > 0]))
+
+        th_d = calc_3hours_rule_days(raw_hours)
+        # 若无每日打卡明细则回退至有效工天
+        if not raw_hours and th_d == 0.0 and e_d > 0:
+            th_d = e_d
+
+        watermark_days_list.append(round(w_d, 2))
+        eff_days_list.append(round(e_d, 2))
+        punch_days_list.append(round(p_d, 2))
+        three_hours_days_list.append(round(th_d, 2))
+
+    df['我的考勤天数'] = watermark_days_list
+    df['水印照片天数'] = watermark_days_list
+    df['有效工天'] = eff_days_list
+    df['出勤天数'] = punch_days_list
+    df['打卡天数'] = punch_days_list  # 别名
+    df['3小时规则天数'] = three_hours_days_list
+
+    # 标准化 calc_mode 字符串
+    mode_str = str(calc_mode).strip().lower()
+    if any(k in mode_str for k in ['watermark', '水印']):
+        norm_mode = 'watermark'
+    elif any(k in mode_str for k in ['effective', '有效']):
+        norm_mode = 'effective_days'
+    elif any(k in mode_str for k in ['punch', '打卡']):
+        norm_mode = 'punch_days'
+    elif any(k in mode_str for k in ['hours_ge_3', '3小时', '3h']):
+        norm_mode = 'hours_ge_3'
+    else:
+        norm_mode = 'watermark'
+
+    # 2. 计算各模式基准的【阶段性结算天数】、【正常打卡天数】与【基准核定天数】
+    base_final_days = []
+    base_normal_days = []
+    base_stage_days = []
+
+    for idx, row in df.iterrows():
         w_d = float(row['水印照片天数'])
-        return round(float(max(0.0, w_d - punch_d)), 2)
+        eff_d = float(row['有效工天'])
+        punch_d = float(row['出勤天数'])
+        th_d = float(row['3小时规则天数'])
 
-    def _calc_normal_days(row):
-        eff_d = float(row.get('有效工天', row.get('总包系统天数', 0.0)))
-        w_d = float(row['水印照片天数'])
-        return round(float(min(w_d, eff_d)), 2)
+        if norm_mode == 'watermark':
+            # 水印模式业务铁律：
+            # ① 阶段性结算：水印照片天数 > 系统打卡天数，超出部分走阶段性结算
+            # ② 正常打卡天数：系统打卡容量内按有效工天发；若水印照片小于有效工天则核减
+            s_d = round(float(max(0.0, w_d - punch_d)), 2)
+            n_d = round(float(min(w_d, eff_d)), 2)
+            f_d = round(float(n_d + s_d), 2)
+        elif norm_mode == 'effective_days':
+            # 有效工天模式：直接按有效工天作为核定出勤天数
+            f_d = round(float(eff_d), 2)
+            s_d = round(float(max(0.0, f_d - punch_d)), 2)
+            n_d = round(float(min(f_d, punch_d)), 2)
+        elif norm_mode == 'punch_days':
+            # 打卡天数模式：直接按打卡有记录的天数作为出勤天数
+            f_d = round(float(punch_d), 2)
+            s_d = 0.0
+            n_d = f_d
+        elif norm_mode == 'hours_ge_3':
+            # 3小时规则模式：工时 < 3h 不算，>= 3h 算一天
+            f_d = round(float(th_d), 2)
+            s_d = round(float(max(0.0, f_d - punch_d)), 2)
+            n_d = round(float(min(f_d, punch_d)), 2)
+        else:
+            f_d = round(float(eff_d), 2)
+            s_d = 0.0
+            n_d = f_d
 
-    df['阶段性结算天数'] = df.apply(_calc_stage_settle_days, axis=1)
-    df['正常打卡天数'] = df.apply(_calc_normal_days, axis=1)
+        base_final_days.append(f_d)
+        base_normal_days.append(n_d)
+        base_stage_days.append(s_d)
+
+    df['_base_calc_days'] = base_final_days
+    df['阶段性结算天数'] = base_stage_days
+    df['正常打卡天数'] = base_normal_days
 
     # 3. 最终核定天数（总工天）
-    # 支持现场特批覆盖修改（final_days_map 或 foreman_days_map 兼容）
+    # 支持现场特批覆盖修改（final_days_map 或 foreman_days_map 兼容，绝不锁死！）
     override_map = final_days_map or foreman_days_map or {}
+
     def _get_final_days(row):
         id_card = str(row.get('身份证号', '')).strip()
         name = str(row.get('姓名', '')).strip()
@@ -788,14 +890,13 @@ def reconcile_attendance(
             return float(override_map[f"name:{name}"])
         if name in override_map:
             return float(override_map[name])
-        # 默认：正常打卡天数 + 阶段性结算天数
-        return round(float(row['正常打卡天数'] + row['阶段性结算天数']), 2)
+        return round(float(row['_base_calc_days']), 2)
 
     df['最终核定天数'] = df.apply(_get_final_days, axis=1)
     df['最终裁定工日'] = df['最终核定天数']  # 保持字段兼容
     df['班组长核定工日'] = df['最终核定天数']  # 保持旧字段兼容
 
-    # 若有人工特批最终核定天数，重新联动阶段性结算与正常打卡天数
+    # 若有人工特批修改最终核定天数，重新联动阶段性结算与正常打卡天数
     if override_map:
         for idx in df.index:
             row = df.loc[idx]
@@ -838,8 +939,8 @@ def reconcile_attendance(
     rejected_details = []
 
     for _, row in df.iterrows():
-        punch_d = float(row.get('出勤天数', row.get('总包系统天数', 0.0)))
-        eff_d = float(row.get('有效工天', row.get('总包系统天数', 0.0)))
+        punch_d = float(row.get('出勤天数', 0.0))
+        eff_d = float(row.get('有效工天', 0.0))
         w_d = float(row['水印照片天数'])
         fin_d = float(row['最终核定天数'])
         stage_d = float(row['阶段性结算天数'])
@@ -856,6 +957,15 @@ def reconcile_attendance(
         elif (w_d < eff_d) or (fin_d < eff_d):
             diff = round(eff_d - min(w_d, fin_d), 1)
             status = f"✂️ 水印核减 {diff:.1f} 天 (代打卡/空刷剔除)"
+        elif fin_d > eff_d and stage_d == 0:
+            diff = round(fin_d - eff_d, 1)
+            status = f"➕ 较有效工天多 {diff:.1f} 天 (打卡范围内实发)"
+        elif norm_mode == 'hours_ge_3':
+            status = "⏱️ 3小时规则裁定 (≥3h计1天)"
+        elif norm_mode == 'punch_days':
+            status = "📅 按打卡天数发放"
+        elif norm_mode == 'effective_days':
+            status = "⚖️ 按系统有效工天发放"
         elif has_watermark_source:
             status = "✔️ 正常有效工天发放"
         else:

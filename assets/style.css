@@ -1159,4 +1159,26 @@ div[data-baseweb="select"]:focus-within {
     color: #94A3B8;
 }
 
+/* === 15. 手续办理面板分类标题与紧凑全选按钮 === */
+div[data-testid="stDialog"] div[data-testid="stHorizontalBlock"] div[data-testid="column"] .stButton > button {
+    padding: 2px 8px !important;
+    font-size: 12px !important;
+    min-height: 26px !important;
+    height: 26px !important;
+    line-height: 1.2 !important;
+    border-radius: 8px !important;
+    font-weight: 600 !important;
+    white-space: nowrap !important;
+    border: 1px solid #E2E8F0 !important;
+    background-color: #F8FAFC !important;
+    color: #475569 !important;
+    transition: all 0.2s ease !important;
+    box-shadow: none !important;
+}
 
+div[data-testid="stDialog"] div[data-testid="stHorizontalBlock"] div[data-testid="column"] .stButton > button:hover {
+    background-color: #EEF2FF !important;
+    border-color: #A5B4FC !important;
+    color: #4F46E5 !important;
+    transform: translateY(-1px) !important;
+}

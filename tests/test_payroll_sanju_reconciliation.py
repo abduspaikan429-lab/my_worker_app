@@ -320,6 +320,76 @@ class TestPayrollSanjuReconciliation(unittest.TestCase):
         self.assertEqual(r_wmf['阶段性结算天数'], 0.0)
         self.assertIn("水印核减 3.0 天", r_wmf['裁定状态'])
 
+    def test_flexible_attendance_modes_and_editable(self):
+        """测试 4 种灵活考勤计算模式及人工可自由特批修改不锁死特性"""
+        # 构造工人测试数据：
+        # 张三：打卡天数 20 天，有效工天 18.0 天，
+        # 其中 15 天工时 >= 3h (8.0h)，5 天工时 < 3h (1.5h 或 2.0h)
+        # 水印照片天数：22 天
+        daily_hours = {**{d: 8.0 for d in range(1, 16)}, **{d: 2.0 for d in range(16, 21)}}
+        test_df = pd.DataFrame([{
+            '姓名': '张三',
+            '身份证号': '110101199001011234',
+            '分包/所属企业': '江苏旭之升建筑工程有限公司',
+            '总包系统天数': 18.0,
+            '有效工天': 18.0,
+            '出勤天数': 20.0,
+            '总工时': 130.0,
+            '平均工时': 6.5,
+            '_raw_punch_hours': daily_hours,
+            '__考勤明细__': daily_hours
+        }])
+        watermark_df = pd.DataFrame([{
+            '姓名': '张三',
+            '身份证号': '110101199001011234',
+            '最终核定天数': 22.0
+        }])
+
+        # 1. 选项 1：按水印照片来算最终考勤
+        # 水印 22 > 打卡 20 -> 阶段性结算 2 天，正常有效 18 天，最终核定 20 天
+        res_watermark = reconcile_attendance(test_df, my_df=watermark_df, calc_mode='watermark')
+        r_wm = res_watermark.iloc[0]
+        self.assertEqual(r_wm['水印照片天数'], 22.0)
+        self.assertEqual(r_wm['阶段性结算天数'], 2.0)
+        self.assertEqual(r_wm['正常打卡天数'], 18.0)
+        self.assertEqual(r_wm['最终核定天数'], 20.0)
+
+        # 2. 选项 2：按有效工天来算最终考勤
+        res_eff = reconcile_attendance(test_df, my_df=watermark_df, calc_mode='effective_days')
+        r_eff = res_eff.iloc[0]
+        self.assertEqual(r_eff['最终核定天数'], 18.0)
+        self.assertEqual(r_eff['正常打卡天数'], 18.0)
+        self.assertEqual(r_eff['阶段性结算天数'], 0.0)
+
+        # 3. 选项 3：按打卡天数来算最终考勤
+        res_punch = reconcile_attendance(test_df, my_df=watermark_df, calc_mode='punch_days')
+        r_punch = res_punch.iloc[0]
+        self.assertEqual(r_punch['最终核定天数'], 20.0)
+        self.assertEqual(r_punch['正常打卡天数'], 20.0)
+        self.assertEqual(r_punch['阶段性结算天数'], 0.0)
+
+        # 4. 选项 4：按总包系统表中，3小时以下不算工天，3小时以上算一天来算最终考勤
+        # 1~15号是8h (>=3h)，16~20号是2h (<3h)，符合3小时规则的天数正好是 15 天！
+        res_3h = reconcile_attendance(test_df, my_df=watermark_df, calc_mode='hours_ge_3')
+        r_3h = res_3h.iloc[0]
+        self.assertEqual(r_3h['3小时规则天数'], 15.0)
+        self.assertEqual(r_3h['最终核定天数'], 15.0)
+        self.assertEqual(r_3h['正常打卡天数'], 15.0)
+        self.assertEqual(r_3h['阶段性结算天数'], 0.0)
+
+        # 5. 验证“最终考勤的状态依然是可以修改的，不能锁死”
+        # 即使选了 3小时规则模式（基准15天），用户特批修改张三为 19.5 天：
+        res_override = reconcile_attendance(
+            test_df,
+            my_df=watermark_df,
+            calc_mode='hours_ge_3',
+            final_days_map={'张三': 19.5}
+        )
+        r_ov = res_override.iloc[0]
+        self.assertEqual(r_ov['最终核定天数'], 19.5, "用户特批修改应生效，绝不锁死！")
+        self.assertEqual(r_ov['正常打卡天数'], 18.0)  # 在有效工天内
+        self.assertEqual(r_ov['阶段性结算天数'], 0.0)
+
 
 if __name__ == '__main__':
     unittest.main()

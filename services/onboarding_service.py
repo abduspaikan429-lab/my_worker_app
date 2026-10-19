@@ -222,6 +222,35 @@ class OnboardingService:
 
         return records[record_id]
 
+    def toggle_category(
+        self,
+        worker_id: str,
+        category: str,
+        target_state: bool,
+    ) -> Dict[str, Any]:
+        """批量全选/取消全选指定分类下的所有项目。"""
+        records = self.get_records()
+        if worker_id not in records:
+            return {}
+        record = records[worker_id]
+        if category not in record:
+            record[category] = {}
+
+        items_map = {
+            "paper": PAPER_ITEMS,
+            "access": ACCESS_ITEMS,
+            "photo": PHOTO_ITEMS,
+            "system": SYSTEM_ITEMS,
+        }
+        items = items_map.get(category, [])
+        for item in items:
+            record[category][item] = target_state
+            for alias in ITEM_ALIASES.get(item, []):
+                record[category][alias] = target_state
+
+        self.save_records(records)
+        return record
+
     def mark_completed(self, record_id: str, is_completed: bool = True) -> None:
         """Mark an onboarding record as completed/active without deleting it."""
         records = self.get_records()

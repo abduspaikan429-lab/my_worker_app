@@ -143,3 +143,35 @@ def test_revoke_offboarding_restores_onsite(
     assert len(onsite_restored) == 2
     assert set(onsite_restored["姓名"].values) == {"张三", "李四"}
 
+
+def test_offboarding_toggle_category(temp_offboarding_service: OffboardingService):
+    """验证离场分类一键全选与取消全选功能。"""
+    data = {
+        "info": {
+            "姓名": "赵六",
+            "班组": "油漆组",
+            "身份证号": "330101198501019999",
+        }
+    }
+    rec = temp_offboarding_service.create_offboarding(data)
+    worker_id = "330101198501019999"
+
+    from services.offboarding_service import OFFBOARDING_STEPS, OFF_PAPER, OFF_SYSTEM
+
+    # 1. 全选小灵光及财务流程 (steps)
+    res = temp_offboarding_service.toggle_category(worker_id, "steps", True)
+    assert all(res["steps"].get(k) is True for k in OFFBOARDING_STEPS)
+
+    # 2. 取消全选 steps
+    res = temp_offboarding_service.toggle_category(worker_id, "steps", False)
+    assert all(res["steps"].get(k) is False for k in OFFBOARDING_STEPS)
+
+    # 3. 全选纸质与证明材料 (paper)
+    res = temp_offboarding_service.toggle_category(worker_id, "paper", True)
+    assert all(res["paper"].get(k) is True for k in OFF_PAPER)
+
+    # 4. 全选台账更新 (system)
+    res = temp_offboarding_service.toggle_category(worker_id, "system", True)
+    assert all(res["system"].get(k) is True for k in OFF_SYSTEM)
+
+

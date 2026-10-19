@@ -156,6 +156,53 @@ def get_dialog_decorator():
     if hasattr(st, "experimental_dialog"): return st.experimental_dialog
     return lambda x: lambda f: f
 
+def toggle_onboarding_category(worker_id: str, category_key: str, items: list, target_val: bool):
+    """进场大类全选/全部确认回调，同步更新数据与 session_state 复选框状态。"""
+    if "onboarding_data" not in st.session_state or worker_id not in st.session_state.onboarding_data:
+        return
+    data = st.session_state.onboarding_data[worker_id]
+    if category_key not in data:
+        data[category_key] = {}
+        
+    prefix_map = {
+        "paper": "d_p",
+        "system": "d_s",
+        "access": "d_a",
+        "photo": "d_ph",
+    }
+    prefix = prefix_map.get(category_key, f"d_{category_key}")
+    for item in items:
+        data[category_key][item] = target_val
+        st.session_state[f"{prefix}_{worker_id}_{item}"] = target_val
+        for alias in ITEM_ALIASES.get(item, []):
+            data[category_key][alias] = target_val
+            
+    save_data()
+
+
+def render_category_header(label_html: str, worker_id: str, category_key: str, items: list):
+    """渲染带有一键全选/取消全选操作的大类标题栏。"""
+    if "onboarding_data" not in st.session_state or worker_id not in st.session_state.onboarding_data:
+        return
+    data = st.session_state.onboarding_data[worker_id]
+    data_cat = data.get(category_key, {})
+    all_done = are_all_items_done(data_cat, items)
+    
+    col_t, col_b = st.columns([3, 1.2], vertical_alignment="center")
+    with col_t:
+        st.markdown(label_html, unsafe_allow_html=True)
+    with col_b:
+        btn_label = "取消全选" if all_done else "全选确认"
+        st.button(
+            btn_label,
+            key=f"btn_toggle_on_{worker_id}_{category_key}",
+            on_click=toggle_onboarding_category,
+            args=(worker_id, category_key, items, not all_done),
+            use_container_width=True,
+            help="直接将该大类下所有手续设为已完成" if not all_done else "取消该大类下的全部勾选",
+        )
+
+
 @get_dialog_decorator()("进场手续办理面板")
 def worker_dialog(worker_id):
     if "onboarding_data" not in st.session_state:
@@ -190,26 +237,26 @@ def worker_dialog(worker_id):
 
     col_left, col_right = st.columns(2)
     with col_left:
-        st.markdown('<span class="tag-badge badge-blue">📄 纸质版审查材料 (10类)</span>', unsafe_allow_html=True)
+        render_category_header('<span class="tag-badge badge-blue">📄 纸质版审查材料 (10类)</span>', worker_id, "paper", PAPER_ITEMS)
         for item in PAPER_ITEMS:
             curr_val = is_item_done(data["paper"], item)
             data["paper"][item] = st.checkbox(item, value=curr_val, key=f"d_p_{worker_id}_{item}")
 
         st.markdown("<div style='margin-top: 14px;'></div>", unsafe_allow_html=True)
-        st.markdown('<span class="tag-badge badge-green">📑 本地 Excel 台账更新 (3项)</span>', unsafe_allow_html=True)
+        render_category_header('<span class="tag-badge badge-green">📑 本地 Excel 台账更新 (3项)</span>', worker_id, "system", SYSTEM_ITEMS)
         for item in SYSTEM_ITEMS:
             curr_val = is_item_done(data["system"], item)
             data["system"][item] = st.checkbox(item, value=curr_val, key=f"d_s_{worker_id}_{item}")
 
     with col_right:
-        st.markdown('<span class="tag-badge badge-orange">📱 门禁与移动端办理 (5项)</span>', unsafe_allow_html=True)
+        render_category_header('<span class="tag-badge badge-orange">📱 门禁与移动端办理 (5项)</span>', worker_id, "access", ACCESS_ITEMS)
         for item in ACCESS_ITEMS:
             curr_val = is_item_done(data["access"], item)
             label = f"**{item}**" if ("百工聚" in item or "人社小灵光" in item) else item
             data["access"][item] = st.checkbox(label, value=curr_val, key=f"d_a_{worker_id}_{item}")
 
         st.markdown("<div style='margin-top: 14px;'></div>", unsafe_allow_html=True)
-        st.markdown('<span class="tag-badge badge-pink">📸 必须留存合规影像 (4张)</span>', unsafe_allow_html=True)
+        render_category_header('<span class="tag-badge badge-pink">📸 必须留存合规影像 (4张)</span>', worker_id, "photo", PHOTO_ITEMS)
         for item in PHOTO_ITEMS:
             curr_val = is_item_done(data["photo"], item)
             data["photo"][item] = st.checkbox(item, value=curr_val, key=f"d_ph_{worker_id}_{item}")

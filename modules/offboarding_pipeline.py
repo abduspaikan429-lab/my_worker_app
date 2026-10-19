@@ -128,6 +128,50 @@ def get_dialog_decorator():
     if hasattr(st, "experimental_dialog"): return st.experimental_dialog
     return lambda x: lambda f: f
 
+def toggle_offboarding_category(worker_id: str, category_key: str, items: list, target_val: bool):
+    """离场大类全选/全部确认回调，同步更新数据与 session_state 复选框状态。"""
+    if "offboarding_data" not in st.session_state or worker_id not in st.session_state.offboarding_data:
+        return
+    data = st.session_state.offboarding_data[worker_id]
+    if category_key not in data:
+        data[category_key] = {}
+        
+    prefix_map = {
+        "steps": "d_off",
+        "paper": "d_op",
+        "system": "d_os",
+    }
+    prefix = prefix_map.get(category_key, f"d_{category_key}")
+    for item in items:
+        data[category_key][item] = target_val
+        st.session_state[f"{prefix}_{worker_id}_{item}"] = target_val
+            
+    save_data()
+
+
+def render_category_header(label_html: str, worker_id: str, category_key: str, items: list):
+    """渲染带有一键全选/取消全选操作的大类标题栏。"""
+    if "offboarding_data" not in st.session_state or worker_id not in st.session_state.offboarding_data:
+        return
+    data = st.session_state.offboarding_data[worker_id]
+    data_cat = data.get(category_key, {})
+    all_done = all(data_cat.get(it, False) for it in items)
+    
+    col_t, col_b = st.columns([2.2, 1.2], vertical_alignment="center")
+    with col_t:
+        st.markdown(label_html, unsafe_allow_html=True)
+    with col_b:
+        btn_label = "取消全选" if all_done else "全选确认"
+        st.button(
+            btn_label,
+            key=f"btn_toggle_off_{worker_id}_{category_key}",
+            on_click=toggle_offboarding_category,
+            args=(worker_id, category_key, items, not all_done),
+            use_container_width=True,
+            help="直接将该大类下所有手续设为已完成" if not all_done else "取消该大类下的全部勾选",
+        )
+
+
 @get_dialog_decorator()("离场手续办理面板")
 def worker_dialog(worker_id):
     if "offboarding_data" not in st.session_state:
@@ -154,15 +198,15 @@ def worker_dialog(worker_id):
     
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.markdown('<span class="tag-badge badge-orange">小灵光及财务流程</span>', unsafe_allow_html=True)
+        render_category_header('<span class="tag-badge badge-orange">小灵光及财务流程</span>', worker_id, "steps", OFFBOARDING_STEPS)
         for item in OFFBOARDING_STEPS:
             data["steps"][item] = st.checkbox(item, value=data["steps"].get(item, False), key=f"d_off_{worker_id}_{item}")
     with col2:
-        st.markdown('<span class="tag-badge badge-blue">纸质与证明材料</span>', unsafe_allow_html=True)
+        render_category_header('<span class="tag-badge badge-blue">纸质与证明材料</span>', worker_id, "paper", OFF_PAPER)
         for item in OFF_PAPER:
             data["paper"][item] = st.checkbox(item, value=data["paper"].get(item, False), key=f"d_op_{worker_id}_{item}")
     with col3:
-        st.markdown('<span class="tag-badge badge-green">台账更新（尾项）</span>', unsafe_allow_html=True)
+        render_category_header('<span class="tag-badge badge-green">台账更新（尾项）</span>', worker_id, "system", OFF_SYSTEM)
         for item in OFF_SYSTEM:
             data["system"][item] = st.checkbox(item, value=data["system"].get(item, False), key=f"d_os_{worker_id}_{item}")
 

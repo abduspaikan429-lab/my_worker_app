@@ -1746,7 +1746,27 @@ def render():
         number_to_rmb_capital,
         parse_sanju_punch_excel,
         reconcile_attendance,
+        calc_3hours_rule_days,
     )
+
+    ATTENDANCE_MODE_OPTIONS = [
+        "📸 按水印照片来算最终考勤",
+        "⚖️ 按有效工天来算最终考勤",
+        "📅 按打卡天数来算最终考勤",
+        "⏱️ 按总包3小时规则来算最终考勤 (＜3h不算，≥3h算一天)"
+    ]
+    ATTENDANCE_MODE_MAP = {
+        "📸 按水印照片来算最终考勤": "watermark",
+        "⚖️ 按有效工天来算最终考勤": "effective_days",
+        "📅 按打卡天数来算最终考勤": "punch_days",
+        "⏱️ 按总包3小时规则来算最终考勤 (＜3h不算，≥3h算一天)": "hours_ge_3"
+    }
+    ATTENDANCE_MODE_REVERSE = {
+        "watermark": "📸 按水印照片来算最终考勤",
+        "effective_days": "⚖️ 按有效工天来算最终考勤",
+        "punch_days": "📅 按打卡天数来算最终考勤",
+        "hours_ge_3": "⏱️ 按总包3小时规则来算最终考勤 (＜3h不算，≥3h算一天)"
+    }
 
     # ── Tab 1: 💰 考勤核定与额度反推 ──────────────────────────────────
     with tab_calc:
@@ -1771,7 +1791,7 @@ def render():
                     "1. 【必传】总包系统考勤打卡流水 / 月度出勤统计表",
                     type=['xlsx', 'xls', 'csv'],
                     key='payroll_file_system',
-                    help="支持导出自总包系统/三局/护薪系统的出勤统计表（横向月度宽表或流水明细），系统考勤严格按【有效工天】自动核算"
+                    help="支持导出自总包系统/三局/护薪系统的出勤统计表（横向月度宽表或流水明细），支持多种灵活考勤核算选项"
                 )
             with c_u2:
                 file_my = st.file_uploader(
@@ -1781,11 +1801,24 @@ def render():
                     help="劳资员水印照片核对表（以水印照片为主，防止代打卡；若系统考勤小于水印照片，多出天数自动转为阶段性结算）"
                 )
 
+            # 初始考勤计算基准规则选择（解析后仍可在工作台随时自由无损切换）
+            cur_init_mode_key = st.session_state.get('_payroll_calc_mode', 'effective_days' if not file_my else 'watermark')
+            cur_init_label = ATTENDANCE_MODE_REVERSE.get(cur_init_mode_key, ATTENDANCE_MODE_OPTIONS[1])
+            init_idx = ATTENDANCE_MODE_OPTIONS.index(cur_init_label) if cur_init_label in ATTENDANCE_MODE_OPTIONS else 1
+            init_mode = st.radio(
+                "⚙️ 选择考勤计算基准规则 (解析后可在工作台随时切换对比，且最终考勤始终可人工自由修改，绝不锁死)：",
+                ATTENDANCE_MODE_OPTIONS,
+                index=init_idx,
+                horizontal=True,
+                key='rad_init_calc_mode'
+            )
+
             if st.button(":material/compare_arrows: 开始三方智能对账与解析", type='primary', key='btn_parse_att'):
                 if not file_system and not file_my:
                     st.warning(":material/info: 请至少上传一份考勤文件（推荐上传总包系统考勤打卡流水）")
                 else:
-                    with st.spinner("正在解析总包每日打卡工时（按有效工天）并匹配人员档案……"):
+                    selected_mode_key = ATTENDANCE_MODE_MAP[init_mode]
+                    with st.spinner("正在解析总包每日打卡工时并匹配人员档案……"):
                         if file_system:
                             sys_df, detected_period = parse_sanju_punch_excel(file_system)
                             if detected_period and detected_period != '8月':
@@ -1804,13 +1837,14 @@ def render():
                                 enriched['津贴'] = 0.0
                             enriched['津贴'] = pd.to_numeric(enriched['津贴'], errors='coerce').fillna(0.0)
 
-                            reconciled = reconcile_attendance(enriched, my_df=my_parsed)
+                            reconciled = reconcile_attendance(enriched, my_df=my_parsed, calc_mode=selected_mode_key)
                             reconciled['锁定'] = False
 
+                            st.session_state['_payroll_calc_mode'] = selected_mode_key
                             st.session_state['_payroll_working_df'] = reconciled
                             st.session_state['_payroll_period'] = period_input
                             st.session_state.pop('_payroll_allocated_df', None)
-                            st.success(f"✅ 考勤解析成功！共识别到 {len(reconciled)} 名务工人员（已严格按有效工天核算）。")
+                            st.success(f"✅ 考勤解析成功！共识别到 {len(reconciled)} 名务工人员（已按【{init_mode}】核算，可随时切换修改）。")
                             st.rerun()
                         else:
                             # 仅上传了水印签到表
@@ -1826,6 +1860,8 @@ def render():
                             enriched['总包系统天数'] = enriched['解析出勤天数']
                             enriched['有效工天'] = enriched['解析出勤天数']
                             enriched['出勤天数'] = enriched['解析出勤天数']
+                            enriched['打卡天数'] = enriched['解析出勤天数']
+                            enriched['3小时规则天数'] = enriched['解析出勤天数']
                             enriched['我的考勤天数'] = enriched['解析出勤天数']
                             enriched['水印照片天数'] = enriched['解析出勤天数']
                             enriched['班组长核定工日'] = enriched['解析出勤天数']
@@ -1842,6 +1878,7 @@ def render():
                             enriched['应发工资'] = (enriched['最终核定天数'] * enriched['提取日薪'] + enriched['津贴']).round(2)
                             enriched['锁定'] = False
 
+                            st.session_state['_payroll_calc_mode'] = selected_mode_key
                             st.session_state['_payroll_working_df'] = enriched
                             st.session_state['_payroll_period'] = period_input
                             st.session_state.pop('_payroll_allocated_df', None)
@@ -1856,16 +1893,64 @@ def render():
                 st.markdown("""
                 <div class="step-indicator">
                     <span class="step-num">2</span>
-                    <span>考勤智能核对与阶段性结算工作台（水印照片 VS 总包有效工天）</span>
+                    <span>考勤智能核对与阶段性结算工作台（多规则对比与灵活裁决）</span>
                 </div>
                 """, unsafe_allow_html=True)
+
+                # ── 考勤计算模式灵活切换控制器 ──
+                active_mode_key = st.session_state.get('_payroll_calc_mode', 'watermark')
+                active_mode_label = ATTENDANCE_MODE_REVERSE.get(active_mode_key, ATTENDANCE_MODE_OPTIONS[0])
+                current_mode_index = ATTENDANCE_MODE_OPTIONS.index(active_mode_label) if active_mode_label in ATTENDANCE_MODE_OPTIONS else 0
+
+                c_mode_ctrl1, c_mode_ctrl2 = st.columns([3, 1])
+                with c_mode_ctrl1:
+                    chosen_workbench_mode = st.radio(
+                        "🛠️ 考勤核算基准规则切换 (选定后可一键批量核定；最终考勤状态绝不锁死，仍可在表格中随时双击人工修改)：",
+                        ATTENDANCE_MODE_OPTIONS,
+                        index=current_mode_index,
+                        horizontal=True,
+                        key='rad_workbench_calc_mode'
+                    )
+                with c_mode_ctrl2:
+                    st.markdown("<div style='margin-top: 24px;'></div>", unsafe_allow_html=True)
+                    btn_reapply_mode = st.button("🔄 应用此规则重新核定考勤", type='secondary', use_container_width=True, key='btn_reapply_calc_mode')
+
+                target_mode_key = ATTENDANCE_MODE_MAP[chosen_workbench_mode]
+                if btn_reapply_mode or (target_mode_key != active_mode_key):
+                    st.session_state['_payroll_calc_mode'] = target_mode_key
+                    st.session_state['_editor_ver'] = st.session_state.get('_editor_ver', 0) + 1
+                    # 保留原有的日薪与津贴及锁定
+                    wage_cached = {str(r['姓名']).strip(): float(r.get('提取日薪', 300.0) or 300.0) for _, r in working_df.iterrows()}
+                    alw_cached = {str(r['姓名']).strip(): float(r.get('津贴', 0.0) or 0.0) for _, r in working_df.iterrows()}
+                    lock_cached = {str(r['姓名']).strip(): bool(r.get('锁定', False)) for _, r in working_df.iterrows()}
+
+                    re_calculated = reconcile_attendance(
+                        working_df,
+                        calc_mode=target_mode_key,
+                        allowance_map=alw_cached
+                    )
+                    for idx, row in re_calculated.iterrows():
+                        nm = str(row['姓名']).strip()
+                        if nm in wage_cached:
+                            re_calculated.at[idx, '提取日薪'] = wage_cached[nm]
+                        if nm in lock_cached:
+                            re_calculated.at[idx, '锁定'] = lock_cached[nm]
+                    re_calculated['正常打卡工资'] = (re_calculated['正常打卡天数'] * re_calculated['提取日薪']).round(2)
+                    re_calculated['阶段性结算金额'] = (re_calculated['阶段性结算天数'] * re_calculated['提取日薪']).round(2)
+                    re_calculated['应发工资'] = (re_calculated['最终核定天数'] * re_calculated['提取日薪'] + re_calculated['津贴']).round(2)
+
+                    st.session_state['_payroll_working_df'] = re_calculated
+                    st.success(f"✅ 已切换为【{chosen_workbench_mode}】！全体人员出勤天数已按新规则刷新。您仍可在下方表格中双击修改任意人员的最终考勤。")
+                    st.rerun()
+
                 st.markdown("""
                 <div class="hint-box" style="margin-bottom:12px;">
-                💡 <b>考勤核对原则（极简两方比对：水印照片 VS 总包出勤统计表）</b>：<br>
-                1. <b>真实出勤以水印照片为主</b>：防止有人没有上班也去打卡（防代打卡/防空刷）。<br>
-                2. <b>总包系统考勤严格按【有效工天】算</b>：系统考勤天数直接取自总包出勤统计表中的“有效工天”。<br>
-                3. <b>水印照片 > 系统打卡天数（出勤天数）</b>：以水印照片为主！在总包系统打卡记录容量内按有效工天走正常发放；<b>超出打卡记录的天数在系统中按【阶段性结算】做</b>，系统已为您特殊标明超出的天数与结算金额！<br>
-                4. <b>水印照片 < 系统有效工天</b>：以水印照片为主核减！系统自动依据每日真实工时由长到短排序，<b>优先保留最长工时打 ✓，自动淘汰混打卡短工时</b>。
+                💡 <b>考勤核对原则与 4 大核算选项</b>：<br>
+                1. <b>📸 按水印照片来算最终考勤</b>：以现场水印照片真实核对为主（防代打卡）；若水印超出系统打卡天数，超出部分系统自动标为<b>【阶段性结算】</b>做账。<br>
+                2. <b>⚖️ 按有效工天来算最终考勤</b>：严格取自总包出勤统计表中的“有效工天”列。<br>
+                3. <b>📅 按打卡天数来算最终考勤</b>：取自总包系统出勤统计表中的“打卡天数 / 出勤天数”，只要有打卡记录即算一天。<br>
+                4. <b>⏱️ 按总包3小时规则来算最终考勤</b>：依据总包系统打卡工时明细，<b>＜3小时不算工天，≥3小时算一天</b>，自动淘汰混打卡碎片短工时。<br>
+                <b style="color:#2563EB;">🔓 最终考勤状态绝不锁死</b>：以上选项用于快速批量核定基准考勤。<b>下方表格中的【✏ 最终核定天数】完全开放编辑</b>，如遇断电漏打卡、故障特批等情况，随时可以双击单元格人工修改！修改后点击【💾 保存核定工日与津贴并重新计算】即可。
                 </div>
                 """, unsafe_allow_html=True)
 
@@ -1879,14 +1964,14 @@ def render():
                     st.markdown(f"""
                     <div style="background:#FEF3C7; border:1px solid #F59E0B; border-radius:8px; padding:12px 16px; margin-bottom:14px; color:#92400E;">
                         <span style="font-size:16px; font-weight:bold;">🚨 阶段性结算特殊提醒</span><br>
-                        共有 <b>{stage_settle_count}</b> 名工人<b>水印照片超出系统打卡天数</b>，累计多出 <b>{stage_settle_total_days:.1f}</b> 天，涉及金额 <b>¥{stage_settle_total_amount:,.2f}</b> 元。<br>
+                        共有 <b>{stage_settle_count}</b> 名工人<b>考勤天数超出系统打卡天数</b>，累计多出 <b>{stage_settle_total_days:.1f}</b> 天，涉及金额 <b>¥{stage_settle_total_amount:,.2f}</b> 元。<br>
                         <span style="font-size:13px; color:#B45309;">※ 原因：总包系统考勤只能核减不能增加，多出的这几天在总包系统中完全没有打卡记录，无法做进正常考勤工资表，必须在总包系统中走【阶段性结算】做账补发。</span>
                     </div>
                     """, unsafe_allow_html=True)
 
                 display_cols = [
                     '姓名', '分包/所属企业', '工种', '总工时', '平均工时',
-                    '总包系统天数', '出勤天数', '水印照片天数', '阶段性结算天数', '正常打卡天数',
+                    '水印照片天数', '有效工天', '出勤天数', '3小时规则天数', '阶段性结算天数', '正常打卡天数',
                     '最终核定天数', '裁定状态',
                     '提取日薪', '正常打卡工资', '阶段性结算金额', '津贴', '应发工资', '锁定'
                 ]
@@ -1898,15 +1983,16 @@ def render():
                     '工种': st.column_config.TextColumn('工种', disabled=True),
                     '总工时': st.column_config.NumberColumn('总工时(h)', disabled=True, format='%.1f'),
                     '平均工时': st.column_config.NumberColumn('日均工时(h)', disabled=True, format='%.1f'),
-                    '总包系统天数': st.column_config.NumberColumn('系统有效工天', disabled=True, format='%.1f', help='按出勤统计表的有效工天核算'),
-                    '出勤天数': st.column_config.NumberColumn('打卡天数', disabled=True, format='%.1f', help='总包打卡有记录的天数'),
-                    '水印照片天数': st.column_config.NumberColumn('📸 水印照片天数', disabled=True, format='%.1f', help='现场水印照片真实核对天数，以此为主'),
+                    '水印照片天数': st.column_config.NumberColumn('📸 水印天数', disabled=True, format='%.1f', help='现场水印照片真实核对天数'),
+                    '有效工天': st.column_config.NumberColumn('⚖️ 有效工天', disabled=True, format='%.1f', help='总包出勤统计表中的有效工天'),
+                    '出勤天数': st.column_config.NumberColumn('📅 打卡天数', disabled=True, format='%.1f', help='总包打卡有记录的天数'),
+                    '3小时规则天数': st.column_config.NumberColumn('⏱️ 3h规则天数', disabled=True, format='%.1f', help='总包打卡每日工时中≥3小时的天数'),
                     '阶段性结算天数': st.column_config.NumberColumn('🚨 阶段性结算天数', disabled=True, format='%.1f', help='水印照片超出系统打卡天数的部分，无打卡流水记录，需在系统中走阶段性结算补发做账'),
                     '正常打卡天数': st.column_config.NumberColumn('正常打卡天数', disabled=True, format='%.1f', help='总包系统内走正常考勤发放的天数'),
                     '最终核定天数': st.column_config.NumberColumn(
                         '✏ 最终核定天数',
                         min_value=0.0, max_value=31.0, step=0.5, format='%.1f',
-                        help='最终核定总出勤天数（默认直接以水印照片天数为主；若有现场特批断电故障抢工等可双击特批修改）'
+                        help='当前生效的最终出勤天数（可随时双击直接特批修改，绝不锁死！）'
                     ),
                     '裁定状态': st.column_config.TextColumn('裁定状态', disabled=True),
                     '提取日薪': st.column_config.NumberColumn('日薪标准', min_value=0.0, format='¥%.0f'),
@@ -1948,6 +2034,7 @@ def render():
                 if editor_df.empty:
                     editor_df = working_df.copy()
 
+                dyn_editor_key = f"working_editor_{st.session_state.get('_payroll_calc_mode', 'watermark')}_{st.session_state.get('_editor_ver', 0)}"
                 with st.form("working_df_form", border=False):
                     edited_working = st.data_editor(
                         editor_df[display_cols],
@@ -1955,7 +2042,7 @@ def render():
                         use_container_width=True,
                         num_rows='fixed',
                         hide_index=True,
-                        key='working_data_editor'
+                        key=dyn_editor_key
                     )
                     submit_edits = st.form_submit_button("💾 保存核定工日与津贴并重新计算", type='primary')
 
@@ -1991,10 +2078,12 @@ def render():
                         if nm in lock_map:
                             working_df_to_reconcile.at[idx, '锁定'] = lock_map[nm]
 
+                    current_mode = st.session_state.get('_payroll_calc_mode', 'watermark')
                     re_reconciled = reconcile_attendance(
                         working_df_to_reconcile,
                         final_days_map=fin_map,
-                        allowance_map=alw_map
+                        allowance_map=alw_map,
+                        calc_mode=current_mode
                     )
                     st.session_state['_payroll_working_df'] = re_reconciled
                     st.success("✅ 已重新保存核定数据，完成智能对账与阶段性结算计算！")
@@ -2003,8 +2092,10 @@ def render():
                 current_working_df = st.session_state.get('_payroll_working_df', working_df)
 
                 total_workers = len(current_working_df)
-                sys_total_days = current_working_df['总包系统天数'].sum() if '总包系统天数' in current_working_df.columns else 0.0
+                eff_total_days = current_working_df['有效工天'].sum() if '有效工天' in current_working_df.columns else 0.0
                 watermark_total_days = current_working_df['水印照片天数'].sum() if '水印照片天数' in current_working_df.columns else 0.0
+                punch_total_days = current_working_df['出勤天数'].sum() if '出勤天数' in current_working_df.columns else 0.0
+                three_h_total_days = current_working_df['3小时规则天数'].sum() if '3小时规则天数' in current_working_df.columns else 0.0
                 final_total_days = current_working_df['最终核定天数'].sum() if '最终核定天数' in current_working_df.columns else 0.0
                 stage_settle_total_days = current_working_df['阶段性结算天数'].sum() if '阶段性结算天数' in current_working_df.columns else 0.0
                 total_allowance = current_working_df['津贴'].sum() if '津贴' in current_working_df.columns else 0.0
@@ -2013,10 +2104,12 @@ def render():
                 st.markdown(f"""
                 <div class="metric-container" style="margin-top:12px;">
                     <div class="metric-card"><div class="metric-title">核对总人数</div><div class="metric-value">{total_workers} 人</div></div>
-                    <div class="metric-card"><div class="metric-title">系统有效工天合计</div><div class="metric-value">{sys_total_days:.1f} 天</div></div>
-                    <div class="metric-card"><div class="metric-title">水印照片天数合计</div><div class="metric-value">{watermark_total_days:.1f} 天</div></div>
-                    <div class="metric-card"><div class="metric-title">最终核定天数合计</div><div class="metric-value" style="color:#059669;">{final_total_days:.1f} 天</div></div>
-                    <div class="metric-card"><div class="metric-title">阶段性结算天数合计</div><div class="metric-value" style="color:#D97706;">{stage_settle_total_days:.1f} 天</div></div>
+                    <div class="metric-card"><div class="metric-title">当前最终核定天数</div><div class="metric-value" style="color:#059669;">{final_total_days:.1f} 天</div></div>
+                    <div class="metric-card"><div class="metric-title">系统有效工天</div><div class="metric-value">{eff_total_days:.1f} 天</div></div>
+                    <div class="metric-card"><div class="metric-title">水印照片天数</div><div class="metric-value">{watermark_total_days:.1f} 天</div></div>
+                    <div class="metric-card"><div class="metric-title">打卡天数合计</div><div class="metric-value">{punch_total_days:.1f} 天</div></div>
+                    <div class="metric-card"><div class="metric-title">3h规则天数</div><div class="metric-value">{three_h_total_days:.1f} 天</div></div>
+                    <div class="metric-card"><div class="metric-title">阶段性结算天数</div><div class="metric-value" style="color:#D97706;">{stage_settle_total_days:.1f} 天</div></div>
                     <div class="metric-card"><div class="metric-title">全额应发总额</div><div class="metric-value" style="color:#2563EB;">¥{orig_salary:,.2f}</div></div>
                 </div>
                 """, unsafe_allow_html=True)
