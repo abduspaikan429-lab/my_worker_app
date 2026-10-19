@@ -527,6 +527,57 @@ class PersonnelDataService:
             df_new_inflow = pd.DataFrame(new_inflow_rows)
             df_inflow = pd.concat([df_inflow, df_new_inflow], ignore_index=True)
 
+        # 4.2 扫描【离场流水线历史归档】已办完归档人员（动态并入离场明细表 df_outflow）
+        existing_outflow_ids = {clean_id(x) for x in df_outflow["ID"] if clean_id(x)} if not df_outflow.empty else set()
+        existing_outflow_names = {str(x).strip() for x in df_outflow["Name"] if str(x).strip() and str(x) != "nan"} if not df_outflow.empty else set()
+
+        new_outflow_rows = []
+        for rec in history_off:
+            cid = clean_id(rec.get("身份证号") or rec.get("id_card"))
+            name = str(rec.get("姓名") or rec.get("name") or "").strip()
+            if not name or name in ("nan", "None"):
+                continue
+
+            # 全局查重：若工人全周期已在 df_outflow 中登记过离场，绝不重复追加
+            if (cid and cid in existing_outflow_ids) or (name in existing_outflow_names):
+                continue
+
+            t_val = str(rec.get("班组") or rec.get("team") or "").strip()
+            team_std = "江苏旭之升 (王宜强施工班组)" if ("旭之升" in t_val or "江" in t_val or "王宜强" in t_val) else "青海久昌 (汪佩沾其他班组)"
+
+            d_val = str(rec.get("离场日期") or rec.get("exit_date") or rec.get("completed_at") or "").strip()
+            m_val = _parse_month(d_val)
+            if not m_val:
+                m_val = f"{datetime.now().month}月"
+
+            matched_job = "普工"
+            if not unique_roster.empty:
+                m_roster = unique_roster[(unique_roster["ID"] == cid) | (unique_roster["Name"] == name)]
+                if not m_roster.empty:
+                    matched_job = clean_job_title(m_roster.iloc[0].get("Job") or m_roster.iloc[0].get("Job_Clean") or "普工")
+
+            new_outflow_rows.append({
+                "Month": m_val,
+                "Team": team_std,
+                "Name": name,
+                "ID": cid,
+                "Date": d_val.split()[0] if d_val else datetime.now().strftime("%Y-%m-%d"),
+                "Duration": "",
+                "Job": matched_job,
+                "Job_Clean": clean_job_title(matched_job),
+                "WageSettled": "已结算已支付",
+                "CommitmentSigned": "是",
+                "Remarks": "系统离场流水线已办完归档"
+            })
+            if cid:
+                existing_outflow_ids.add(cid)
+            if name:
+                existing_outflow_names.add(name)
+
+        if new_outflow_rows:
+            df_new_outflow = pd.DataFrame(new_outflow_rows)
+            df_outflow = pd.concat([df_outflow, df_new_outflow], ignore_index=True)
+
         # 5. 动态校准 9 月及各月份 monthly_summary 中的宏观流动与队伍分布（确保与明细名单 100% 勾稽平衡！）
         active_cnt = len(unique_roster[unique_roster["LiveStatus"].isin(["在场正常", "进场手续在办"])])
         live_status["currently_onsite"] = active_cnt
@@ -535,7 +586,7 @@ class PersonnelDataService:
 
         # 获取全周期月份序列（如 ['6月', '7月', '8月', '9月', '10月']）
         all_months_seq = generate_project_months_sequence(
-            extra_months=list(monthly_summary.keys()) + list(df_inflow["Month"].dropna().unique())
+            extra_months=list(monthly_summary.keys()) + list(df_inflow["Month"].dropna().unique()) + list(df_outflow["Month"].dropna().unique())
         )
 
         team_yi = '江苏旭之升 (王宜强施工班组)'

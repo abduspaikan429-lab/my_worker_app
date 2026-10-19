@@ -220,6 +220,29 @@ class OffboardingService:
             with open(self.history_path, "w", encoding="utf-8") as f:
                 json.dump(history, f, ensure_ascii=False, indent=2)
 
+        # 同步闭环：自动更新项目主表 (data/master_state.json) 中的在场状态与退场日期
+        master_state_path = BASE_DIR / "data" / "master_state.json"
+        if master_state_path.exists():
+            try:
+                with open(master_state_path, "r", encoding="utf-8") as f:
+                    ms_data = json.load(f)
+                rows = ms_data.get("rows", [])
+                target_id = record["身份证号"].strip()
+                target_name = record["姓名"].strip()
+                updated_master = False
+                for r in rows:
+                    r_id = str(r.get("身份证号") or "").strip()
+                    r_name = str(r.get("姓名") or "").strip()
+                    if (target_id and r_id == target_id) or (target_name and r_name == target_name):
+                        r["在场/进退场状态"] = "已退场"
+                        r["退场日期"] = record["离场日期"]
+                        updated_master = True
+                if updated_master:
+                    with open(master_state_path, "w", encoding="utf-8") as f:
+                        json.dump(ms_data, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                print(f"Sync master state on offboarding failed: {e}")
+
     def get_offboarded_identifiers(self, include_active: bool = True) -> Tuple[Set[str], Set[str]]:
         """
         获取已离场/离场结算中的人员唯一标识。

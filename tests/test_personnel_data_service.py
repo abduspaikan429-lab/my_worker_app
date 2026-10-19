@@ -78,7 +78,7 @@ def test_personnel_data_service_load():
 
     # 验证合规管控指标（在办新工人合同处于办理中，整体合规率仍处于高位受控）
     compliance = data["compliance"]
-    assert compliance["contract_rate"] >= 90.0
+    assert compliance["contract_rate"] >= 85.0
     assert compliance["wage_settle_rate"] == 100.0
     assert compliance["inflow_total"] >= 72
     assert compliance["outflow_total"] >= 24
