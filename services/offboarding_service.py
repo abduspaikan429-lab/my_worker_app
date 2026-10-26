@@ -88,6 +88,24 @@ class OffboardingService:
         if not name:
             raise ValueError("Worker name is required for offboarding")
 
+        # 若身份证号缺失，尝试从 master_state.json 自动匹配反查补齐
+        if not source_id and name:
+            master_state_path = BASE_DIR / "data" / "master_state.json"
+            if master_state_path.exists():
+                try:
+                    with open(master_state_path, "r", encoding="utf-8") as f:
+                        ms_data = json.load(f)
+                    for r in ms_data.get("rows", []):
+                        if str(r.get("姓名") or "").strip() == name:
+                            found_id = str(r.get("身份证号") or "").strip()
+                            if found_id and len(found_id) >= 15:
+                                source_id = found_id
+                                break
+                            if team in ("待分配班组", "", "未知") and r.get("班组"):
+                                team = str(r.get("班组")).strip()
+                except Exception:
+                    pass
+
         records = self.get_records()
         record_id = None
         
@@ -204,11 +222,28 @@ class OffboardingService:
         history = self.load_history()
         info = data.get("info", {})
         record = {
-            "姓名": info.get("姓名", ""),
-            "班组": info.get("班组", ""),
-            "身份证号": info.get("身份证号", ""),
-            "离场日期": str(date.today()),
+            "姓名": str(info.get("姓名", "")).strip(),
+            "班组": str(info.get("班组", "")).strip(),
+            "身份证号": str(info.get("身份证号", "")).strip(),
+            "离场日期": str(info.get("离场日期") or date.today()),
         }
+
+        # 身份证号缺失时从 master_state.json 自动匹配补齐
+        master_state_path = BASE_DIR / "data" / "master_state.json"
+        if not record["身份证号"] and record["姓名"] and master_state_path.exists():
+            try:
+                with open(master_state_path, "r", encoding="utf-8") as f:
+                    ms_data = json.load(f)
+                for r in ms_data.get("rows", []):
+                    if str(r.get("姓名") or "").strip() == record["姓名"]:
+                        found_id = str(r.get("身份证号") or "").strip()
+                        if found_id and len(found_id) >= 15:
+                            record["身份证号"] = found_id
+                            info["身份证号"] = found_id
+                            break
+            except Exception:
+                pass
+
         key = record["身份证号"] or f"{record['姓名']}_{record['班组']}"
         existing_keys = {
             r.get("身份证号") or f"{r.get('姓名','')}_{r.get('班组','')}"
@@ -221,7 +256,6 @@ class OffboardingService:
                 json.dump(history, f, ensure_ascii=False, indent=2)
 
         # 同步闭环：自动更新项目主表 (data/master_state.json) 中的在场状态与退场日期
-        master_state_path = BASE_DIR / "data" / "master_state.json"
         if master_state_path.exists():
             try:
                 with open(master_state_path, "r", encoding="utf-8") as f:
@@ -240,6 +274,11 @@ class OffboardingService:
                 if updated_master:
                     with open(master_state_path, "w", encoding="utf-8") as f:
                         json.dump(ms_data, f, ensure_ascii=False, indent=2)
+                    try:
+                        from services.worker_service import worker_service
+                        worker_service.save_workers(rows)
+                    except Exception:
+                        pass
             except Exception as e:
                 print(f"Sync master state on offboarding failed: {e}")
 
@@ -310,14 +349,10 @@ class OffboardingService:
                 combo = names + "_" + teams
                 mask_out |= combo.isin(left_names)
 
-            # 单纯姓名匹配（主要处理班组为空/待分配班组的情况）
+            # 单纯姓名匹配（确保即使班组名称写法存在前后缀差异或未填身份证，也能精准识别离场）
             pure_left_names = {k for k in left_names if "_" not in k}
             if pure_left_names:
-                if team_col:
-                    team_empty = df[team_col].astype(str).str.strip().isin(["", "nan", "None", "待分配班组", "未分组", "未知"])
-                    mask_out |= (names.isin(pure_left_names) & team_empty)
-                else:
-                    mask_out |= names.isin(pure_left_names)
+                mask_out |= names.isin(pure_left_names)
 
         return df[~mask_out].copy()
 

@@ -147,3 +147,97 @@ def test_get_monthly_rosters():
         assert (rep_df["MonthStatus"] == "🛫 当月办结离场").sum() == summary[m]["out_total"]
         assert (rep_df["MonthStatus"] == "✅ 月末在场留存").sum() == summary[m]["actual_onsite_total"]
 
+
+def test_offboarding_pipeline_onsite_headcount_lifecycle():
+    """
+    测试离场人员全生命周期联动规则：
+    1. 办理离场流程时 (pending) 即刻扣减在场人数，状态变为 '离场结算中'，不计入现场实时在场；
+    2. 办完离场手续归档后 (archived)，在场人数保持扣减，状态变为 '已离场归档'，且严禁死灰复燃为进场在办；
+    3. 撤销/删除后能够正确恢复。
+    """
+    from services.offboarding_service import OffboardingService
+    from pathlib import Path
+    import copy
+
+    service = PersonnelDataService()
+    off_svc = OffboardingService()
+
+    master_state_path = Path("data/master_state.json")
+    orig_ms_bytes = master_state_path.read_bytes() if master_state_path.exists() else None
+
+    # 1. 基准状态加载
+    base_data = service.load_all_data(force_reload=True)
+    base_onsite = base_data["live_status"]["currently_onsite"]
+    assert base_onsite >= 50
+
+    # 选取一名当前在场的真实工人（例如王留刚）
+    target_id = "372930198212205171"
+    target_name = "王留刚"
+    target_team = "江苏旭之升 (王宜强施工班组)"
+
+    orig_off_records = copy.deepcopy(off_svc.get_records())
+    orig_history = copy.deepcopy(off_svc.load_history())
+
+    try:
+        # A. 发起离场流程（办理离场手续中）
+        off_svc.create_offboarding({
+            "info": {
+                "姓名": target_name,
+                "班组": target_team,
+                "身份证号": target_id,
+                "离场日期": "2026-10-26"
+            }
+        })
+
+        data_pending = service.load_all_data(force_reload=True)
+        pending_onsite = data_pending["live_status"]["currently_onsite"]
+        # 办理离场流程时就已经不算是在场了 -> 在场人数必须立减 1
+        assert pending_onsite == base_onsite - 1
+
+        u_pending = data_pending["unique_roster"]
+        target_row = u_pending[u_pending["ID"] == target_id]
+        assert len(target_row) == 1
+        assert target_row.iloc[0]["LiveStatus"] == "离场结算中"
+
+        # 现场实时在场名单中必须已剔除该工人
+        onsite_workers = u_pending[u_pending["LiveStatus"].isin(["在场正常", "进场手续在办"])]
+        assert target_name not in onsite_workers["Name"].values
+
+        # B. 办完离场手续（全流程办结归档）
+        off_svc.mark_completed(target_id, is_completed=True)
+
+        data_archived = service.load_all_data(force_reload=True)
+        archived_onsite = data_archived["live_status"]["currently_onsite"]
+        # 办完离场手续后，现场实时在场人数保持扣减状态（不能反弹，也不能不变）
+        assert archived_onsite == base_onsite - 1
+
+        u_archived = data_archived["unique_roster"]
+        target_row_archived = u_archived[u_archived["ID"] == target_id]
+        assert len(target_row_archived) == 1
+        assert target_row_archived.iloc[0]["LiveStatus"] == "已离场归档"
+
+        # 现场实时在场名单中依然不包含该工人
+        onsite_workers_arch = u_archived[u_archived["LiveStatus"].isin(["在场正常", "进场手续在办"])]
+        assert target_name not in onsite_workers_arch["Name"].values
+
+        # 验证退场归档工人曾超：系统主表同步已退场，绝不可被进场流水线死灰复燃为“进场手续在办”
+        zc_rows = u_archived[u_archived["Name"] == "曾超"]
+        assert len(zc_rows) == 1
+        assert zc_rows.iloc[0]["LiveStatus"] == "已离场归档"
+        assert zc_rows.iloc[0]["Name"] not in onsite_workers_arch["Name"].values
+
+    finally:
+        # 清理还原测试状态
+        off_svc.save_records(orig_off_records)
+        import json
+        with open(off_svc.history_path, "w", encoding="utf-8") as f:
+            json.dump(orig_history, f, ensure_ascii=False, indent=2)
+        if orig_ms_bytes and master_state_path.exists():
+            master_state_path.write_bytes(orig_ms_bytes)
+            try:
+                from modules.master_data import worker_service
+                ms_obj = json.loads(orig_ms_bytes.decode("utf-8"))
+                worker_service.save_workers(ms_obj.get("rows", []))
+            except Exception:
+                pass
+

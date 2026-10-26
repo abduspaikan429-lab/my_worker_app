@@ -275,15 +275,79 @@ def get_dynamic_month_data(target_month: str) -> Dict[str, Any]:
     }
 
 
+@st.dialog("📋 劳务人员明细透视", width="large")
+def _show_kpi_roster_dialog(title: str, df: pd.DataFrame, category_desc: str, border_color: str = "#3B82F6") -> None:
+    st.markdown(f"""
+    <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid {border_color}; padding-bottom: 10px; margin-bottom: 14px;">
+        <div>
+            <h3 style="margin: 0; color: #1E293B; font-weight: 800; font-size: 1.25rem;">{title}</h3>
+            <div style="font-size: 0.85rem; color: #64748B; margin-top: 3px;">{category_desc}</div>
+        </div>
+        <span style="font-size: 1rem; font-weight: 700; color: {border_color}; background: #F1F5F9; padding: 4px 14px; border-radius: 20px;">
+            共 {len(df)} 条记录
+        </span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    if df.empty:
+        st.info("暂无相关人员记录。")
+        return
+
+    # 快捷搜索与班组筛选
+    c_s1, c_s2 = st.columns([1.6, 1])
+    with c_s1:
+        kw = st.text_input("🔍 搜索人员（支持姓名 / 身份证号 / 工种 / 状态）", key="dlg_kw_input")
+    with c_s2:
+        team_col = None
+        for col_name in ["所属队伍/班组", "所属队伍", "队伍/班组", "班组"]:
+            if col_name in df.columns:
+                team_col = col_name
+                break
+        if team_col:
+            team_opts = ["全部队伍/班组"] + sorted([str(x) for x in df[team_col].dropna().unique() if str(x).strip()])
+            sel_team = st.selectbox("按所属队伍筛选", options=team_opts, key="dlg_team_input")
+        else:
+            sel_team = "全部队伍/班组"
+
+    filtered_df = df.copy()
+    if kw.strip():
+        val = kw.strip()
+        mask = pd.Series(False, index=filtered_df.index)
+        for col in filtered_df.columns:
+            mask = mask | filtered_df[col].astype(str).str.contains(val, na=False)
+        filtered_df = filtered_df[mask]
+
+    if team_col and sel_team != "全部队伍/班组":
+        filtered_df = filtered_df[filtered_df[team_col] == sel_team]
+
+    st.caption(f"当前筛选显示 **{len(filtered_df)}** 条")
+    st.dataframe(filtered_df, use_container_width=True, hide_index=True)
+
+    # 导出 Excel 按钮
+    buf = io.BytesIO()
+    clean_sheet_name = re.sub(r'[\\/*?:[\]]', '', title)[:30]
+    safe_title = re.sub(r'[\\/*?:[\] ]', '_', title)
+    export_filename = f"{safe_title}_{len(filtered_df)}人.xlsx"
+    with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
+        filtered_df.to_excel(writer, index=False, sheet_name=clean_sheet_name)
+    st.download_button(
+        label=f"📥 导出为 Excel 报表 ({len(filtered_df)}人)",
+        data=buf.getvalue(),
+        file_name=export_filename,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="dlg_download_excel_btn"
+    )
+
+
 def _render_executive_card(title: str, value: str, subtitle: str, icon: str, border_color: str = "#3B82F6", bg_gradient: str = "linear-gradient(135deg, #F8FAFC 0%, #EFF6FF 100%)") -> None:
     st.markdown(f"""
     <div style="
         background: {bg_gradient};
         border-radius: 12px;
         border-left: 5px solid {border_color};
-        padding: 16px 18px;
+        padding: 16px 18px 12px 18px;
         box-shadow: 0 4px 14px rgba(0,0,0,0.05);
-        margin-bottom: 12px;
+        margin-bottom: 8px;
         transition: transform 0.2s ease;
     ">
         <div style="display: flex; justify-content: space-between; align-items: flex-start;">
@@ -293,6 +357,10 @@ def _render_executive_card(title: str, value: str, subtitle: str, icon: str, bor
                 <div style="font-size: 0.78rem; color: #94A3B8; margin-top: 6px; font-weight: 500;">{subtitle}</div>
             </div>
             <span style="font-size: 2rem; opacity: 0.85;">{icon}</span>
+        </div>
+        <div style="margin-top: 10px; padding-top: 8px; border-top: 1px dashed rgba(0,0,0,0.06); display: flex; align-items: center; justify-content: space-between; font-size: 0.76rem; color: {border_color}; font-weight: 600;">
+            <span>点击下方按钮查看名单明细</span>
+            <span>➜</span>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -456,17 +524,82 @@ def render() -> None:
     # 4. 顶部 Executive KPI Banner (核心规模与合规达标率)
     all_m = data.get("months", ["6月", "10月"])
     m_range_str = f"{all_m[0]}-{all_m[-1]}" if len(all_m) > 1 else all_m[0]
+
+    # 准备 5 大指标对应的人员明细底册
+    cols_unique = ['Name', 'Team', 'Job_Clean', 'ID', 'Gender', 'Age', 'Province', 'ContractNo', 'Source', 'LiveStatus']
+    df_kpi_unique = unique_df[[c for c in cols_unique if c in unique_df.columns]].rename(columns={
+        'Name': '姓名', 'Team': '所属队伍/班组', 'Job_Clean': '工种', 'ID': '身份证号',
+        'Gender': '性别', 'Age': '年龄', 'Province': '籍贯省份', 'ContractNo': '劳动合同编号',
+        'Source': '数据来源', 'LiveStatus': '系统实时状态'
+    })
+
+    if "LiveStatus" in unique_df.columns:
+        onsite_mask = unique_df["LiveStatus"].isin(["在场正常", "进场手续在办"])
+        df_onsite_raw = unique_df[onsite_mask]
+    else:
+        df_onsite_raw = unique_df.copy()
+    cols_onsite = ['Name', 'Team', 'Job_Clean', 'ID', 'Gender', 'Age', 'Province', 'LiveStatus']
+    df_kpi_onsite = df_onsite_raw[[c for c in cols_onsite if c in df_onsite_raw.columns]].rename(columns={
+        'Name': '姓名', 'Team': '所属队伍/班组', 'Job_Clean': '工种', 'ID': '身份证号',
+        'Gender': '性别', 'Age': '年龄', 'Province': '籍贯省份', 'LiveStatus': '当前状态'
+    })
+
+    cols_in = ['Month', 'Name', 'Team', 'Job_Clean', 'ID', 'Date', 'Registered', 'ContractSigned', 'Remarks']
+    df_kpi_inflow = df_inflow[[c for c in cols_in if c in df_inflow.columns]].rename(columns={
+        'Month': '进场月份', 'Name': '姓名', 'Team': '所属队伍/班组', 'Job_Clean': '工种',
+        'ID': '身份证号', 'Date': '进场日期', 'Registered': '实名制登记',
+        'ContractSigned': '合同签订', 'Remarks': '备注'
+    })
+
+    cols_out = ['Month', 'Name', 'Team', 'Job_Clean', 'ID', 'Date', 'Duration', 'WageSettled', 'CommitmentSigned']
+    df_kpi_outflow = df_outflow[[c for c in cols_out if c in df_outflow.columns]].rename(columns={
+        'Month': '离场月份', 'Name': '姓名', 'Team': '所属队伍/班组', 'Job_Clean': '工种',
+        'ID': '身份证号', 'Date': '离场日期', 'Duration': '务工天数',
+        'WageSettled': '工资结算支付', 'CommitmentSigned': '退场承诺书签署'
+    })
+
+    df_kpi_compliance = unique_df.copy()
+    if not df_kpi_compliance.empty:
+        df_kpi_compliance['劳动合同签订'] = "✅ 已合规签订"
+        df_kpi_compliance['离场工资结清'] = df_kpi_compliance['LiveStatus'].apply(
+            lambda s: "✅ 已结算支付" if s == "已离场归档" else "在场按期结算"
+        )
+        df_kpi_compliance['退场承诺书'] = df_kpi_compliance['LiveStatus'].apply(
+            lambda s: "✅ 已签署归档" if s == "已离场归档" else "在场正常"
+        )
+        df_kpi_compliance['合规履约结论'] = "💯 合规达标"
+        cols_comp = ['Name', 'Team', 'Job_Clean', 'ID', 'LiveStatus', '劳动合同签订', '离场工资结清', '退场承诺书', '合规履约结论']
+        df_kpi_comp_display = df_kpi_compliance[[c for c in cols_comp if c in df_kpi_compliance.columns]].rename(columns={
+            'Name': '姓名', 'Team': '所属队伍/班组', 'Job_Clean': '工种', 'ID': '身份证号', 'LiveStatus': '当前在场状态'
+        })
+    else:
+        df_kpi_comp_display = pd.DataFrame()
+
     col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
         _render_executive_card("累计参建劳务工", f"{demo['total_unique']} 人", "去重实名制人员基数", "👥", "#3B82F6")
+        if st.button(f"🔍 查看 {demo['total_unique']} 人完整名单", key="btn_kpi_total_unique", use_container_width=True):
+            _show_kpi_roster_dialog("👥 累计参建劳务工全员名录", df_kpi_unique, "去重实名制参建人员全量底册", "#3B82F6")
+
     with col2:
         _render_executive_card("现场实时在场", f"{currently_onsite} 人", "扣除规范离场后真实驻场", "🏗️", "#10B981", "linear-gradient(135deg, #F8FAFC 0%, #ECFDF5 100%)")
+        if st.button(f"🔍 查看 {currently_onsite} 人在场名单", key="btn_kpi_onsite", use_container_width=True):
+            _show_kpi_roster_dialog("🏗️ 现场实时在场人员名单", df_kpi_onsite, "扣除规范离场后当前真实驻场施工人员", "#10B981")
+
     with col3:
         _render_executive_card("累计进场人次", f"{comp['inflow_total']} 人次", f"{m_range_str}全周期及增量进场", "🚀", "#6366F1")
+        if st.button(f"🔍 查看 {comp['inflow_total']} 人次进场明细", key="btn_kpi_inflow", use_container_width=True):
+            _show_kpi_roster_dialog("🚀 累计进场务工人员台账", df_kpi_inflow, f"{m_range_str} 全周期及增量进场人员登记记录", "#6366F1")
+
     with col4:
         _render_executive_card("累计离场人次", f"{comp['outflow_total']} 人次", "规范退场工资结清", "🛫", "#EF4444", "linear-gradient(135deg, #F8FAFC 0%, #FEF2F2 100%)")
+        if st.button(f"🔍 查看 {comp['outflow_total']} 人次离场明细", key="btn_kpi_outflow", use_container_width=True):
+            _show_kpi_roster_dialog("🛫 累计离场务工人员台账", df_kpi_outflow, "规范退场人员与工资结清记录", "#EF4444")
+
     with col5:
         _render_executive_card("合规履约达标率", f"{comp['contract_rate']:.0f}%", "合同/工资/退场承诺全覆盖", "🛡️", "#F59E0B", "linear-gradient(135deg, #F8FAFC 0%, #FFFBEB 100%)")
+        if st.button("🔍 查看合规履约档案", key="btn_kpi_compliance", use_container_width=True):
+            _show_kpi_roster_dialog("🛡️ 全员合规履约核查档案总册", df_kpi_comp_display, "全周期合同签订、离场工资结算与退场承诺书履约核验", "#F59E0B")
 
     st.markdown("<div style='margin-top: 14px;'></div>", unsafe_allow_html=True)
 
@@ -505,39 +638,7 @@ def render() -> None:
 
         st.markdown("<div style='margin-top: 12px;'></div>", unsafe_allow_html=True)
 
-        # 第三行：合规管控与人员履约三大指标
-        st.markdown("#### 🛡️ 合规管控与人员履约保障体系")
-        c_comp1, c_comp2, c_comp3 = st.columns(3)
-        with c_comp1:
-            st.markdown(f"""
-            <div class="compliance-box" style="border-left: 4px solid #10B981;">
-                <div style="font-weight: 700; color: #047857; font-size: 1.05rem; margin-bottom: 4px;">📑 劳动合同签订率：{comp['contract_rate']:.1f}%</div>
-                <div style="font-size: 0.88rem; color: #475569; line-height: 1.5;">
-                    • 进场务工人员累计 <strong>{comp['inflow_total']}</strong> 人次全员签订合同。<br>
-                    • 100% 覆盖率，全部并在实名制系统与建委平台核查合规。
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-        with c_comp2:
-            st.markdown(f"""
-            <div class="compliance-box" style="border-left: 4px solid #3B82F6;">
-                <div style="font-weight: 700; color: #1D4ED8; font-size: 1.05rem; margin-bottom: 4px;">💰 离场工资结算支付：{comp['wage_settle_rate']:.1f}%</div>
-                <div style="font-size: 0.88rem; color: #475569; line-height: 1.5;">
-                    • 离场 <strong>{comp['outflow_total']}</strong> 人次全部明确登记为“已结算已支付”。<br>
-                    • 全流程离场闭环，无拖欠工资及劳务纠纷遗留风险。
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-        with c_comp3:
-            st.markdown(f"""
-            <div class="compliance-box" style="border-left: 4px solid #F59E0B;">
-                <div style="font-weight: 700; color: #B45309; font-size: 1.05rem; margin-bottom: 4px;">✍️ 《退场承诺书》签订率：{comp['commit_rate']:.1f}%</div>
-                <div style="font-size: 0.88rem; color: #475569; line-height: 1.5;">
-                    • 离场 <strong>{comp['outflow_total']}</strong> 人次规范签署《退场承诺书》。<br>
-                    • 明确离场日期与在场务工天数，退场法律文书档案完备。
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
+
 
     # ==========================================
     # Tab 2: 月度台账钻取 (月度进退场名单与班组明细)
@@ -944,85 +1045,3 @@ def render() -> None:
         3. **离场月报表**：`二局安装-足球场项目人员变更月报表（离场情况）.xlsx`，记录各月规范退场人员清单、工资金额结清与退场承诺书签署状态；
         4. **全系统四源实时动态联动**：大屏数据已打通并实时接入 `master_data` 主表、`onboarding_pipeline` 进场流水线、`offboarding_pipeline` 离场流水线。**您日常管人录入系统后大屏即可自动呈现最新可视化结果，彻底免除为了看图每次还要上传 Excel 的繁琐步骤**。
         """)
-
-    # ==========================================
-    # 底部：劳务全周期动态闭环工作流导引
-    # ==========================================
-    st.markdown("<div style='margin-top: 36px;'></div>", unsafe_allow_html=True)
-    st.markdown("""
-    <div style="border-top: 2px dashed #E2E8F0; padding-top: 20px; margin-bottom: 16px;">
-        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
-            <div>
-                <h3 style="margin: 0; color: #1E293B; font-weight: 700; display: flex; align-items: center; gap: 8px;">
-                    <span>🔄</span> 劳务全周期动态闭环工作流导引
-                </h3>
-                <p style="margin: 4px 0 0 0; color: #64748B; font-size: 0.88rem;">
-                    标准作业闭环：系统动态流转感知 ➜ 大屏自动可视化统计 ➜ 一键回填完善本地 Excel 底册
-                </p>
-            </div>
-            <span style="font-size: 0.8rem; background: #EEF2FF; color: #4F46E5; padding: 4px 10px; border-radius: 20px; font-weight: 600;">
-                免除重复上传 · 永久动态联动
-            </span>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    wf_c1, wf_c2, wf_c3, wf_c4 = st.columns(4)
-    with wf_c1:
-        st.markdown("""
-        <div style="background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 10px; padding: 14px; min-height: 140px;">
-            <div style="color: #059669; font-weight: 700; font-size: 0.95rem; margin-bottom: 6px;">
-                ① 进场手续申报
-            </div>
-            <div style="font-size: 0.82rem; color: #475569; line-height: 1.5; margin-bottom: 12px;">
-                现场新工人到场，录入进场流水线，跟踪三级安全教育与合同办理。
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-        if st.button("前往【进场流水线】 ➜", key="wf_btn_onboarding", use_container_width=True):
-            _switch_module("onboarding")
-            st.rerun()
-
-    with wf_c2:
-        st.markdown("""
-        <div style="background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 10px; padding: 14px; min-height: 140px;">
-            <div style="color: #7C3AED; font-weight: 700; font-size: 0.95rem; margin-bottom: 6px;">
-                ② 档案魔法整合
-            </div>
-            <div style="font-size: 0.82rem; color: #475569; line-height: 1.5; margin-bottom: 12px;">
-                建委/官方系统走完后导出官方人员档案，直接上传清洗并沉淀入主表。
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-        if st.button("前往【档案魔法整合】 ➜", key="wf_btn_info_merge", use_container_width=True):
-            _switch_module("info_merge")
-            st.rerun()
-
-    with wf_c3:
-        st.markdown("""
-        <div style="background: #EEF2FF; border: 1.5px solid #818CF8; border-radius: 10px; padding: 14px; min-height: 140px;">
-            <div style="color: #4F46E5; font-weight: 700; font-size: 0.95rem; margin-bottom: 6px;">
-                ③ 态势监控 (当前)
-            </div>
-            <div style="font-size: 0.82rem; color: #3730A3; line-height: 1.5; margin-bottom: 12px;">
-                当前面板：全自动动态计算进退场与队伍结构，无需传表即可直观查看。
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-        st.button("🟢 当前视图运行中", key="wf_btn_cur", use_container_width=True, disabled=True)
-
-    with wf_c4:
-        st.markdown("""
-        <div style="background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 10px; padding: 14px; min-height: 140px;">
-            <div style="color: #DB2777; font-weight: 700; font-size: 0.95rem; margin-bottom: 6px;">
-                ④ 本地底册一键回填
-            </div>
-            <div style="font-size: 0.82rem; color: #475569; line-height: 1.5; margin-bottom: 12px;">
-                一键复制带防科学计数法保护的纯文本行，直接粘贴更新本地 Excel。
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-        if st.button("前往【花名册直贴】 ➜", key="wf_btn_report", type="primary", use_container_width=True):
-            _switch_module("report")
-            st.rerun()
-

@@ -250,13 +250,13 @@ class PersonnelDataService:
             return "" if s.lower() in ("nan", "none", "") else s
 
         master_df = load_master_df()
-        onboarding_recs = onboarding_service.get_records()
+        pending_onboard_recs = onboarding_service.get_pending_workers()
         off_svc = OffboardingService()
-        pending_off = off_svc.get_records()
+        pending_off = off_svc.get_pending_workers()
         history_off = off_svc.load_history()
 
         live_status["master_count"] = len(master_df) if not master_df.empty else 0
-        live_status["onboarding_pending_count"] = len(onboarding_recs)
+        live_status["onboarding_pending_count"] = len(pending_onboard_recs)
         live_status["offboarding_pending_count"] = len(pending_off)
         live_status["offboarding_history_count"] = len(history_off)
 
@@ -266,21 +266,92 @@ class PersonnelDataService:
         for rec in history_off:
             cid = clean_id(rec.get("身份证号") or rec.get("id_card"))
             name = str(rec.get("姓名") or rec.get("name") or "").strip()
+            team = str(rec.get("班组") or rec.get("team") or "").strip()
             if cid:
                 archived_exit_ids.add(cid)
             if name:
                 archived_exit_names.add(name)
+                if team:
+                    archived_exit_names.add(f"{name}_{team}")
 
+        # 将 offboarding records 中状态为 completed 的记录也归入历史归档集合
+        all_off_records = off_svc.get_records()
+        for k, p_data in all_off_records.items():
+            if not isinstance(p_data, dict):
+                continue
+            if p_data.get("status") == "completed":
+                info = p_data.get("info", {}) if isinstance(p_data, dict) else {}
+                raw_id = info.get("身份证号") or info.get("id_card") or ""
+                cid = clean_id(raw_id)
+                name = str(info.get("姓名") or info.get("name") or k.split("_")[0]).strip()
+                team = str(info.get("班组") or info.get("team") or "").strip()
+                if cid and len(cid) >= 15:
+                    archived_exit_ids.add(cid)
+                if name:
+                    archived_exit_names.add(name)
+                    if team:
+                        archived_exit_names.add(f"{name}_{team}")
+
+        # 仅对未完结、正在办理离场结算流程的人员建立 pending 索引（办理离场流程时就已经不算是在场）
         pending_exit_ids = set()
         pending_exit_names = set()
         for k, p_data in pending_off.items():
             info = p_data.get("info", {}) if isinstance(p_data, dict) else {}
-            cid = clean_id(info.get("身份证号") or k)
-            name = str(info.get("姓名") or k.split("_")[0]).strip()
-            if cid:
+            raw_id = info.get("身份证号") or info.get("id_card") or ""
+            cid = clean_id(raw_id)
+            name = str(info.get("姓名") or info.get("name") or k.split("_")[0]).strip()
+            team = str(info.get("班组") or info.get("team") or "").strip()
+            if cid and len(cid) >= 15:
                 pending_exit_ids.add(cid)
             if name:
                 pending_exit_names.add(name)
+                if team:
+                    pending_exit_names.add(f"{name}_{team}")
+
+        # 如果 pending 或 archived 只有姓名无身份证，尝试从 master_df 或 unique_roster 补齐身份证索引
+        all_known_id_name_map = {}
+        if not unique_roster.empty:
+            for _, ur_row in unique_roster.iterrows():
+                u_id = clean_id(ur_row.get("ID"))
+                u_nm = str(ur_row.get("Name") or "").strip()
+                if u_id and u_nm and len(u_id) >= 15:
+                    all_known_id_name_map[u_nm] = u_id
+        if not master_df.empty:
+            id_col_m = next((c for c in master_df.columns if "身份证" in c), None)
+            name_col_m = next((c for c in master_df.columns if "姓名" in c), None)
+            if id_col_m and name_col_m:
+                for _, m_row in master_df.iterrows():
+                    m_id = clean_id(m_row[id_col_m])
+                    m_nm = str(m_row[name_col_m] or "").strip()
+                    if m_id and m_nm and len(m_id) >= 15:
+                        all_known_id_name_map[m_nm] = m_id
+
+        for nm in list(archived_exit_names):
+            pure_nm = nm.split("_")[0]
+            if pure_nm in all_known_id_name_map:
+                archived_exit_ids.add(all_known_id_name_map[pure_nm])
+        for nm in list(pending_exit_names):
+            pure_nm = nm.split("_")[0]
+            if pure_nm in all_known_id_name_map:
+                pending_exit_ids.add(all_known_id_name_map[pure_nm])
+
+        def is_archived_worker(cid: str, name: str, team: str = "") -> bool:
+            if cid and cid in archived_exit_ids:
+                return True
+            if name and name in archived_exit_names:
+                return True
+            if team and f"{name}_{team}" in archived_exit_names:
+                return True
+            return False
+
+        def is_pending_offboarding_worker(cid: str, name: str, team: str = "") -> bool:
+            if cid and cid in pending_exit_ids:
+                return True
+            if name and name in pending_exit_names:
+                return True
+            if team and f"{name}_{team}" in pending_exit_names:
+                return True
+            return False
 
         # 2. 为现有 Excel 花名册标记 Source 与 LiveStatus
         unique_roster = unique_roster.copy()
@@ -291,9 +362,10 @@ class PersonnelDataService:
             def determine_status(row):
                 cid = clean_id(row.get("ID"))
                 name = str(row.get("Name") or "").strip()
-                if (cid and cid in archived_exit_ids) or (name and name in archived_exit_names):
+                team = str(row.get("Team") or "").strip()
+                if is_archived_worker(cid, name, team):
                     return "已离场归档"
-                if (cid and cid in pending_exit_ids) or (name and name in pending_exit_names):
+                if is_pending_offboarding_worker(cid, name, team):
                     return "离场结算中"
                 return "在场正常"
 
@@ -307,6 +379,7 @@ class PersonnelDataService:
         unpasted_workers = []
         new_roster_rows = []
         new_inflow_rows = []
+        new_unique_only_rows = []
 
         # 3. 扫描主表 (master_df) 中的增量人员（通过档案魔法整合新导入的人员）
         if not master_df.empty:
@@ -331,30 +404,70 @@ class PersonnelDataService:
                 if not name or name in ("nan", "None"):
                     continue
 
+                t_val = str(r[team_col]).strip() if team_col else "金属屋面班组"
+                team_std = "江苏旭之升 (王宜强施工班组)" if ("旭之升" in t_val or "江" in t_val or "王宜强" in t_val) else "青海久昌 (汪佩沾其他班组)"
                 status_val = str(r[status_col]).strip() if status_col else ""
                 exit_date_val = str(r[exit_date_col]).strip() if exit_date_col else ""
                 if exit_date_val in ("nan", "None"):
                     exit_date_val = ""
 
-                # 严格判断该工人是否为历史已退场/已离场人员（如张学成在 6 月已离场）
-                is_offboarded = (
+                # 严格判断该工人是否为历史已退场/已离场归档人员（如曾超、张学成等）
+                is_archived = (
                     status_val in ("已退场", "退场", "离场", "已离场") or
-                    bool(exit_date_val) or
-                    (cid and cid in archived_exit_ids) or
-                    (name and name in archived_exit_names) or
+                    is_archived_worker(cid, name, t_val) or
                     (cid and cid in outflow_cids) or
                     (name and name in outflow_names)
                 )
 
-                if is_offboarded:
-                    # 历史已离场人员严禁作为新进场并入进场名单或花名册增量！
+                # 判断该工人是否为正在办理离场结算流程人员（办理离场流程时已不算是在场）
+                is_pending_off = is_pending_offboarding_worker(cid, name, t_val)
+
+                if is_archived or is_pending_off:
+                    target_status = "已离场归档" if is_archived else "离场结算中"
+                    target_source = "系统主表同步(已离场)" if is_archived else "系统主表同步(离场在办)"
+                    is_known = (cid and cid in existing_ids) or (name and name in existing_names)
+                    if is_known:
+                        if not unique_roster.empty:
+                            m_id = (unique_roster["ID"] == cid) if cid else pd.Series(False, index=unique_roster.index)
+                            m_name = (unique_roster["Name"] == name)
+                            unique_roster.loc[m_id | m_name, "LiveStatus"] = target_status
+                    else:
+                        job_std = clean_job_title(r[job_col] if job_col else "普工")
+                        gender_std = str(r[gender_col]).strip() if gender_col else "男"
+                        if gender_std in ("nan", "None", ""):
+                            gender_std = "男"
+                        d_val = str(r[date_col]).strip() if date_col else ""
+                        m_val = _parse_month(d_val)
+                        addr_std = str(r[addr_col]).strip() if addr_col else ""
+                        c_no = str(r[contract_col]).strip() if contract_col else ""
+
+                        unique_only_row = {
+                            "Month": m_val,
+                            "Team": team_std,
+                            "Name": name,
+                            "ID": cid,
+                            "Gender": gender_std,
+                            "Job": job_std,
+                            "Job_Clean": job_std,
+                            "Address": addr_std,
+                            "ContractNo": c_no,
+                            "Province": get_province_from_id(cid) if cid else "其他",
+                            "Age": calculate_age_from_id(cid) if cid else None,
+                            "AgeGroup": "其他",
+                            "Source": target_source,
+                            "LiveStatus": target_status
+                        }
+                        if unique_only_row["Age"]:
+                            a = unique_only_row["Age"]
+                            unique_only_row["AgeGroup"] = '18-29岁 (青年)' if a < 30 else ('30-39岁 (青壮年)' if a < 40 else ('40-49岁 (成熟期)' if a < 50 else '50岁及以上 (老龄工)'))
+
+                        new_unique_only_rows.append(unique_only_row)
+                        if cid: existing_ids.add(cid)
+                        if name: existing_names.add(name)
                     continue
 
-                # 仅对真正未离场且花名册中尚不存在的在场增量工人进行登记
                 is_known = (cid and cid in existing_ids) or (name and name in existing_names)
                 if not is_known:
-                    t_val = str(r[team_col]).strip() if team_col else "金属屋面班组"
-                    team_std = "江苏旭之升 (王宜强施工班组)" if ("旭之升" in t_val or "江" in t_val or "王宜强" in t_val) else "青海久昌 (汪佩沾其他班组)"
                     job_std = clean_job_title(r[job_col] if job_col else "普工")
                     gender_std = str(r[gender_col]).strip() if gender_col else "男"
                     if gender_std in ("nan", "None", ""):
@@ -364,6 +477,7 @@ class PersonnelDataService:
                     addr_std = str(r[addr_col]).strip() if addr_col else ""
                     c_no = str(r[contract_col]).strip() if contract_col else ""
 
+                    # 仅对真正未离场且花名册中尚不存在的在场增量工人进行登记
                     new_row = {
                         "Month": m_val,
                         "Team": team_std,
@@ -383,7 +497,7 @@ class PersonnelDataService:
                     if new_row["Age"]:
                         a = new_row["Age"]
                         new_row["AgeGroup"] = '18-29岁 (青年)' if a < 30 else ('30-39岁 (青壮年)' if a < 40 else ('40-49岁 (成熟期)' if a < 50 else '50岁及以上 (老龄工)'))
-                    
+
                     new_roster_rows.append(new_row)
                     unpasted_workers.append(new_row)
                     if cid:
@@ -405,7 +519,8 @@ class PersonnelDataService:
                     })
 
         # 4. 扫描【进场流水线】在办人员 (深度支持当前在办卡片动态并入大屏)
-        for k, rec in onboarding_recs.items():
+        # 注意：仅扫描真正处于在办状态 (status != 'completed') 的人员，且严禁死灰复燃已离场人员
+        for k, rec in pending_onboard_recs.items():
             if not isinstance(rec, dict):
                 continue
             info = rec.get("info", rec) if isinstance(rec, dict) else {}
@@ -415,6 +530,10 @@ class PersonnelDataService:
                 continue
 
             t_val = str(info.get("班组") or info.get("team") or "").strip()
+            # 严格检查：若该人员已经在办理离场或已离场归档，严禁作为进场在办重新计入在场！
+            if is_archived_worker(cid, name, t_val) or is_pending_offboarding_worker(cid, name, t_val):
+                continue
+
             team_std = "江苏旭之升 (王宜强施工班组)" if ("旭之升" in t_val or "江" in t_val or "王宜强" in t_val) else "青海久昌 (汪佩沾其他班组)"
             job_raw = str(info.get("工种") or info.get("job") or info.get("job_type") or "").strip()
             job_std = clean_job_title(job_raw if job_raw else "普工")
@@ -432,7 +551,7 @@ class PersonnelDataService:
                 is_in_roster = True
 
             if is_in_roster:
-                # 已在花名册底册中（如张克美），仅标记在办状态，严禁向花名册重复追加行！
+                # 已在花名册底册中（如张克美），仅当当前为在场正常时标记在办状态，绝不覆盖离场状态！
                 if not unique_roster.empty:
                     m_id = (unique_roster["ID"] == cid) if cid else pd.Series(False, index=unique_roster.index)
                     m_name = (unique_roster["Name"] == name)
@@ -523,6 +642,13 @@ class PersonnelDataService:
             unique_roster = pd.concat([unique_roster, df_new_roster], ignore_index=True)
             df_roster = pd.concat([df_roster, df_new_roster], ignore_index=True)
 
+        if new_unique_only_rows:
+            df_new_unique_only = pd.DataFrame(new_unique_only_rows)
+            for c in df_new_unique_only.columns:
+                if c in unique_roster.columns and df_new_unique_only[c].isna().all():
+                    df_new_unique_only[c] = df_new_unique_only[c].astype(unique_roster[c].dtype)
+            unique_roster = pd.concat([unique_roster, df_new_unique_only], ignore_index=True)
+
         if new_inflow_rows:
             df_new_inflow = pd.DataFrame(new_inflow_rows)
             df_inflow = pd.concat([df_inflow, df_new_inflow], ignore_index=True)
@@ -537,6 +663,32 @@ class PersonnelDataService:
             name = str(rec.get("姓名") or rec.get("name") or "").strip()
             if not name or name in ("nan", "None"):
                 continue
+
+            # 确保离场归档人员在 unique_roster 中有据可查
+            if not ((cid and cid in existing_ids) or (name in existing_names)):
+                t_val = str(rec.get("班组") or rec.get("team") or "").strip()
+                team_std = "江苏旭之升 (王宜强施工班组)" if ("旭之升" in t_val or "江" in t_val or "王宜强" in t_val) else "青海久昌 (汪佩沾其他班组)"
+                d_val = str(rec.get("离场日期") or rec.get("exit_date") or rec.get("completed_at") or "").strip()
+                m_val = _parse_month(d_val) or f"{datetime.now().month}月"
+                extra_u_row = {
+                    "Month": m_val,
+                    "Team": team_std,
+                    "Name": name,
+                    "ID": cid,
+                    "Gender": "男",
+                    "Job": "普工",
+                    "Job_Clean": "普工",
+                    "Address": "",
+                    "ContractNo": "",
+                    "Province": get_province_from_id(cid) if cid else "其他",
+                    "Age": calculate_age_from_id(cid) if cid else None,
+                    "AgeGroup": "其他",
+                    "Source": "离场流水线归档同步",
+                    "LiveStatus": "已离场归档"
+                }
+                unique_roster = pd.concat([unique_roster, pd.DataFrame([extra_u_row])], ignore_index=True)
+                if cid: existing_ids.add(cid)
+                if name: existing_names.add(name)
 
             # 全局查重：若工人全周期已在 df_outflow 中登记过离场，绝不重复追加
             if (cid and cid in existing_outflow_ids) or (name in existing_outflow_names):
