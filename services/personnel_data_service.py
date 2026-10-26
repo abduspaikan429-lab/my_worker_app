@@ -464,6 +464,22 @@ class PersonnelDataService:
                         new_unique_only_rows.append(unique_only_row)
                         if cid: existing_ids.add(cid)
                         if name: existing_names.add(name)
+
+                        # 若已离场人员是在当前动态月份（如 10月）进场并退场的（非历史归档月份6-9月），
+                        # 则当月进场明细必须记录其进场轨迹，确保：期初在场 + 进场 - 离场 = 实际在场 100% 勾稽平衡！
+                        if m_val not in ("6月", "7月", "8月", "9月"):
+                            new_inflow_rows.append({
+                                "Month": m_val,
+                                "Team": team_std,
+                                "Name": name,
+                                "ID": cid,
+                                "Date": d_val.split()[0] if d_val else datetime.now().strftime("%Y-%m-%d"),
+                                "Job": job_std,
+                                "Job_Clean": job_std,
+                                "Registered": "是",
+                                "ContractSigned": "是",
+                                "Remarks": "系统主表同步(当月进退场)"
+                            })
                     continue
 
                 is_known = (cid and cid in existing_ids) or (name and name in existing_names)

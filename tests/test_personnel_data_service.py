@@ -138,7 +138,7 @@ def test_get_monthly_rosters():
     data = service.load_all_data(force_reload=True)
     summary = data["monthly_summary"]
 
-    for m in ["6月", "7月", "8月", "9月"]:
+    for m in ["6月", "7月", "8月", "9月", "10月"]:
         rep_df, act_df = service.get_monthly_rosters(m, data=data)
         assert len(rep_df) == summary[m]["onsite_total"]
         assert len(act_df) == summary[m]["actual_onsite_total"]
@@ -146,6 +146,10 @@ def test_get_monthly_rosters():
         assert "LiveStatus" in rep_df.columns
         assert (rep_df["MonthStatus"] == "🛫 当月办结离场").sum() == summary[m]["out_total"]
         assert (rep_df["MonthStatus"] == "✅ 月末在场留存").sum() == summary[m]["actual_onsite_total"]
+
+    # 验证最新动态月份（10月）实际在场人数与顶部现场实时在场人数（currently_onsite）完全一致
+    _, act_10 = service.get_monthly_rosters("10月", data=data)
+    assert len(act_10) == data["live_status"]["currently_onsite"]
 
 
 def test_offboarding_pipeline_onsite_headcount_lifecycle():
